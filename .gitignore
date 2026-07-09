@@ -58,3 +58,4 @@ dkms.conf
 build/
 builddir/
 dist/
+notes/
