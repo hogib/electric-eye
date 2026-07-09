@@ -45,7 +45,6 @@ decoder_lib = static_library(
 executable(
     'live_processor',
     'src/main.c',
-    # Link both your core processing logic and your decoder module
     link_with: [decoder_lib],
     dependencies: [core_dep, ffmpeg_deps],
 )
