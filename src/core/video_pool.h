@@ -1,5 +1,4 @@
-#ifndef VIDPOOL_H
-#define VIDPOOL_H
+#pragma once
 
 #include "video_frame.h"
 
@@ -13,4 +12,4 @@ VideoFrame *vpool_acquire_frame(VideoBufferPool *pool);
 
 void vpool_release_frame(VideoBufferPool *pool, VideoFrame *frame);
 
-#endif
+

@@ -1,5 +1,4 @@
-#ifndef VIDFRAME_H
-#define VIDFRAME_H
+#pragma once
 #include <stdint.h>
 
 typedef enum {
@@ -16,4 +15,3 @@ typedef struct {
 
 } VideoFrame;
 
-#endif
