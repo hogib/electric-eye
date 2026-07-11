@@ -1,0 +1,6 @@
+CompileFlags:
+  Add: 
+    - "-xc"
+    - "-std=c11"   
+InlayHints:
+  BlockEnd: true
