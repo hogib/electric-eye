@@ -14,6 +14,10 @@ struct VideoBufferPool {
 
 VideoBufferPool *vpool_create(int num_frames, int width, int height) {
   VideoBufferPool *pool = malloc(sizeof(VideoBufferPool));
+
+  if (!pool)
+    return NULL;
+
   pool->pool_size = num_frames;
   pool->frames = malloc(sizeof(VideoFrame) * num_frames);
   pool->raw_memory = malloc(sizeof(uint8_t *) * num_frames);
