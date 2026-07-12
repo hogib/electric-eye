@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 struct FrameRingBuffer {
-  void *buffer[RING_BUFFER_SIZE];
+  void *buffer[ring_buffer_size];
   atomic_size_t head; // Written by Producer
   atomic_size_t tail; // Written by Consumer
 };
@@ -18,7 +18,7 @@ bool ring_push(FrameRingBuffer *rb, void *frame_ptr) {
   size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
   size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
 
-  size_t next_head = (head + 1) & (RING_BUFFER_SIZE - 1);
+  size_t next_head = (head + 1) & (ring_buffer_size - 1);
 
   if (next_head == tail) {
     return false; // Buffer is full (Frame drop!)
@@ -39,7 +39,7 @@ bool ring_pop(FrameRingBuffer *rb, void **frame_ptr) {
   }
 
   *frame_ptr = rb->buffer[tail];
-  size_t next_tail = (tail + 1) & (RING_BUFFER_SIZE - 1);
+  size_t next_tail = (tail + 1) & (ring_buffer_size - 1);
   atomic_store_explicit(&rb->tail, next_tail, memory_order_release);
   return true;
 }

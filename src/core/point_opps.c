@@ -16,7 +16,7 @@ void grayscale(VideoFrame *frame) {
   size_t v_size = (size_t)frame->stride[2] * frame->height;
 
   memset(frame->planes[1], 128, u_size);
-  memset(frame->planes[1], 128, v_size);
+  memset(frame->planes[2], 128, v_size);
 }
 
 void gs_contrast_normalize(VideoFrame *frame) {

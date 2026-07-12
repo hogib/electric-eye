@@ -2,7 +2,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 
-#define RING_BUFFER_SIZE 32
+constexpr unsigned int ring_buffer_size = 32;
 
 typedef struct FrameRingBuffer FrameRingBuffer;
 
