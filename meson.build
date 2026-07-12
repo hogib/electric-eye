@@ -13,8 +13,11 @@ cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
 
 core_src = [
-    'src/core/conv.c',
     'src/core/eeye.c',
+    'src/core/conv.c',
+    'src/core/frame_ring_buffer.c',
+    'src/core/video_frame.c',
+    'src/core/point_opps.c',
 ]
 # core_lib = static_library(
 #     'eeye-core',
