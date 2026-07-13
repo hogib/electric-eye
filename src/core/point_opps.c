@@ -23,12 +23,12 @@ void gs_contrast_normalize(VideoFrame *frame) {
   if (!frame || !frame->planes[0])
     return;
 
-  uint8_t r_min = 255;
-  uint8_t r_max = 0;
+  uint8_t r_min = y_plain_max_jpeg;
+  uint8_t r_max = y_plain_min_jpeg;
 
   uint8_t lut[256];
 
-  #pragma omp parallel for reduction(min : r_min) reduction(max : r_max)
+#pragma omp parallel for reduction(min : r_min) reduction(max : r_max)
   for (uint32_t y = 0; y < frame->height; ++y) {
     uint8_t *row = frame->planes[0] + (y * frame->stride[0]);
 
@@ -43,16 +43,16 @@ void gs_contrast_normalize(VideoFrame *frame) {
   if (r_max == r_min)
     return;
 
-  float scale = 255.0f / (r_max - r_min);
+  float scale = (float)y_plain_max_jpeg / (r_max - r_min);
 
-  #pragma omp parallel for
-  for (int i = 0; i <= 255; ++i) {
+#pragma omp parallel for
+  for (int i = 0; i <= y_plain_max_jpeg; ++i) {
     float val = (i - r_min) * scale;
 
-    if (val > 255.0f)
-      val = 255.0f;
-    if (val < 0.0f)
-      val = 0.0f;
+    if (val > (float)y_plain_max_jpeg)
+      val = (float)y_plain_max_jpeg;
+    if (val < (float)y_plain_min_jpeg)
+      val = (float)y_plain_min_jpeg;
 
     lut[i] = (uint8_t)(val + 0.5f);
   }
@@ -62,6 +62,25 @@ void gs_contrast_normalize(VideoFrame *frame) {
 
     for (uint32_t x = 0; x < frame->width; ++x) {
       row[x] = lut[row[x]];
+    }
+  }
+}
+
+void gs_threshold_by_value(VideoFrame *frame, uint8_t tval) {
+  if (!frame || !frame->planes[1] || !frame->planes[2])
+    return;
+
+  if (!frame->planes[0])
+    return;
+
+  for (int32_t y = 0; y < frame->height; ++y) {
+    uint8_t *row = frame->planes[0] + (y * frame->stride[0]);
+
+    for (uint32_t x = 0; x < frame->width; ++x) {
+      if (row[x] < tval)
+        row[x] = y_plain_min_jpeg;
+      else
+        row[x] = y_plain_max_jpeg;
     }
   }
 }

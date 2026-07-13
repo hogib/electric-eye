@@ -4,10 +4,10 @@
  *@params:
  *  planes: Pointer to stream data. I422 Input stream expected.
  *  stride: Plane stride, refer to YUV I422 format.
- *  height: Height
- *  width: Width
- *  pts: planar time stamp.
- *  */
+ *  height: Height of video frame.
+ *  width: Width of video frame.
+ *  pts: Presentation time stamp. Feed to consumer to properly decode video.
+ **/
 
 /*
  * Constructor for an I422 VideoFrame.
