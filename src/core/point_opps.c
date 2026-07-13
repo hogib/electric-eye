@@ -1,7 +1,6 @@
 #include "point_opps.h"
 #include "video_frame.h"
 #include <stddef.h>
-#include <stdint.h>
 #include <string.h>
 
 inline uint32_t calc_frame_size(uint32_t height, uint32_t width) {

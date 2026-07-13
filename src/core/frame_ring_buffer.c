@@ -1,5 +1,4 @@
 #include "frame_ring_buffer.h"
-#include <stdbool.h>
 #include <stdlib.h>
 
 struct FrameRingBuffer {
