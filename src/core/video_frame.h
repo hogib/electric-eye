@@ -1,17 +1,16 @@
 #pragma once
 #include <stdint.h>
+#include <stdlib.h>
 
-typedef enum {
-  FORMAT_NV12,
-  FORMAT_I420,
-} VideoFormat;
+/* Constants */ 
+constexpr uint32_t max_planes = 3;
+constexpr uint32_t max_stride = 3;
 
 typedef struct {
-  VideoFormat format;
-  int height;
-  int width;
-  uint8_t *planes[3];
-  int stride[3];
-
+  uint32_t height;
+  uint32_t width;
+  uint8_t *pixel_data;
+  uint8_t *planes[max_planes];
+  size_t stride[max_stride];
+  int64_t pts; // Presentation time stamp
 } VideoFrame;
-
