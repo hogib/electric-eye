@@ -1,6 +1,7 @@
 #include "point_opps.h"
 #include "video_frame.h"
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 inline uint32_t calc_frame_size(uint32_t height, uint32_t width) {
@@ -80,6 +81,25 @@ void gs_threshold_by_value(VideoFrame *frame, uint8_t tval) {
         row[x] = y_plain_min_jpeg;
       else
         row[x] = y_plain_max_jpeg;
+    }
+  }
+}
+
+void gs_invert(VideoFrame *frame) {
+  if (!frame || !frame->planes[0])
+    return;
+
+  uint8_t lut[y_plain_max_jpeg];
+
+  for (int i = 0; i < y_plain_max_jpeg; ++i) {
+    uint8_t val = y_plain_max_jpeg - i;
+    lut[i] = val;
+  }
+  for (int32_t y = 0; y < frame->height; ++y) {
+    uint8_t *row = frame->planes[0] + (y * frame->stride[0]);
+
+    for (uint32_t x = 0; x < frame->width; ++x) {
+      row[x] = lut[row[x]];
     }
   }
 }
