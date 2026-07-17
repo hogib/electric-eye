@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
-inline uint32_t calc_frame_size(uint32_t height, uint32_t width) {
+inline uint32_t calc_y_plane_size(uint32_t height, uint32_t width) {
   return height * width;
 }
 
@@ -89,9 +89,9 @@ void gs_invert(VideoFrame *frame) {
   if (!frame || !frame->planes[0])
     return;
 
-  uint8_t lut[y_plain_max_jpeg];
+  uint8_t lut[y_plain_max_jpeg + 1];
 
-  for (int i = 0; i < y_plain_max_jpeg; ++i) {
+  for (int i = 0; i <= y_plain_max_jpeg; ++i) {
     uint8_t val = y_plain_max_jpeg - i;
     lut[i] = val;
   }

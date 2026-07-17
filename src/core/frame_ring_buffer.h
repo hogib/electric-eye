@@ -4,6 +4,10 @@
 
 constexpr unsigned int ring_buffer_size = 32;
 
+#if (ring_buffer_size & (ring_buffer_size - 1)) != 0
+#error "ring_buffer_size must be a power of two!"
+#endif
+
 typedef struct FrameRingBuffer FrameRingBuffer;
 
 void ring_init(FrameRingBuffer *rb);
