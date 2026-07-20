@@ -10,7 +10,7 @@ FrameRingBuffer ring_buffer_out;
 
 atomic_bool is_running = true;
 
-const char *input_filename = "input_1920x1080_i422.yuv";
+const char *input_filename = "test/input_1920x1080_i422.yuv";
 uint32_t frame_width = 1920;
 uint32_t frame_height = 1080;
 
@@ -76,7 +76,7 @@ void *effects_loop(void *arg) {
     }
 
     grayscale(frame);
-    // gs_invert(frame);
+    gs_invert(frame);
 
     while (!ring_push(&ring_buffer_out, frame)) {
       sleep_us(100);
@@ -85,7 +85,7 @@ void *effects_loop(void *arg) {
   return NULL;
 }
 
-const char *output_filename = "output_1920x1080_i422.yuv";
+const char *output_filename = "test/output_1920x1080_i422.yuv";
 
 void *consumer_loop(void *arg) {
   FILE *outfile = fopen(output_filename, "wb");
