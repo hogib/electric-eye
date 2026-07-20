@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* Constants */ 
+/* Constants */
 constexpr uint32_t max_planes = 3;
 constexpr uint32_t max_stride = 3;
 
@@ -14,3 +14,7 @@ typedef struct {
   size_t stride[max_stride];
   int64_t pts; // Presentation time stamp
 } VideoFrame;
+VideoFrame *video_frame_create_i422(uint32_t width, uint32_t height,
+                                    int64_t pts);
+
+void video_frame_free(VideoFrame *frame);
