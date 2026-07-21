@@ -20,11 +20,17 @@ void *producer_loop(void *arg) {
   int64_t pts = 0;
 
   while (atomic_load(args->is_running)) {
-    VideoFrame *frame =
-        video_frame_create_i422(args->frame_width, args->frame_height, pts++);
-    if (!frame)
-      continue;
+    VideoFrame *frame = NULL;
 
+    while (!ring_pop(args->ring_buffer_free, (void **)&frame) &&
+           atomic_load(args->is_running)) {
+      sleep_us(100);
+    }
+
+    if (!frame)
+      break;
+
+    frame->pts = pts++;
     size_t y_size = (size_t)frame->stride[0] * frame->height;
     size_t u_size = (size_t)frame->stride[1] * frame->height;
     size_t v_size = (size_t)frame->stride[2] * frame->height;
@@ -36,7 +42,8 @@ void *producer_loop(void *arg) {
 
     if (bytes_read < (y_size + u_size + v_size)) {
       printf("End of file reached.\n");
-      video_frame_free(frame);
+      while (!ring_push(args->ring_buffer_free, frame))
+        sleep_us(10);
       atomic_store(args->is_running, false);
       break;
     }
@@ -105,9 +112,11 @@ void *consumer_loop(void *arg) {
     fwrite(frame->planes[1], 1, u_size, outfile);
     fwrite(frame->planes[2], 1, v_size, outfile);
 
-    printf("Saved processed frame %lld\n", frame->pts);
+    printf("Saved processed frame %lld\n", (long long)frame->pts);
 
-    video_frame_free(frame);
+    while (!ring_push(args->ring_buffer_free, frame)) {
+      sleep_us(100);
+    }
   }
 
   fclose(outfile);

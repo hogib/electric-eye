@@ -16,6 +16,7 @@ typedef struct {
   const char *filename;
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_in;
+  FrameRingBuffer *ring_buffer_free;
   uint32_t frame_width;
   uint32_t frame_height;
 } ProducerArgs;
@@ -32,6 +33,7 @@ typedef struct {
   const char *outpath;
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_out;
+  FrameRingBuffer *ring_buffer_free;
   uint32_t frame_width;
   uint32_t frame_height;
 } ConsumerArgs;
