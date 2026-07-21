@@ -1,4 +1,7 @@
 #include "video_frame.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 /*
  *@params:
@@ -13,8 +16,7 @@
  * Constructor for an I422 VideoFrame.
  * Returns a pointer to the allocated frame, or NULL on failure.
  */
-VideoFrame *video_frame_create_i422(uint32_t width, uint32_t height,
-                                    int64_t pts) {
+VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts) {
   if (width == 0 || height == 0) {
     return NULL;
   }
@@ -54,10 +56,7 @@ VideoFrame *video_frame_create_i422(uint32_t width, uint32_t height,
   return frame;
 }
 
-/*
- * Destructor for the VideoFrame
- */
-void video_frame_free(VideoFrame *frame) {
+void vf_free(VideoFrame *frame) {
   if (!frame)
     return;
 
@@ -66,4 +65,37 @@ void video_frame_free(VideoFrame *frame) {
   }
 
   free(frame);
+}
+
+void vf_pool_free(VideoFrame **pool, unsigned int allocated_size) {
+  if (!pool) {
+    return;
+  }
+
+  for (unsigned int i = 0; i < allocated_size; ++i) {
+    if (pool[i]) {
+      vf_free(pool[i]);
+    }
+  }
+
+  free(pool);
+}
+
+VideoFrame **vf_pool_create(unsigned int pool_size, uint32_t width,
+                            uint32_t height) {
+  VideoFrame **pool = (VideoFrame **)malloc(pool_size * sizeof(VideoFrame *));
+  if (!pool) {
+    return NULL;
+  }
+
+  for (unsigned int i = 0; i < pool_size; ++i) {
+    pool[i] = vf_create(width, height, 0);
+
+    if (!pool[i]) {
+      vf_pool_free(pool, i);
+      return NULL;
+    }
+  }
+
+  return pool;
 }
