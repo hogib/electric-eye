@@ -18,6 +18,7 @@ core_src = [
     'src/core/frame_ring_buffer.c',
     'src/core/video_frame.c',
     'src/core/point_opps.c',
+    'src/core/video_threads.c',
 ]
 # core_lib = static_library(
 #     'eeye-core',

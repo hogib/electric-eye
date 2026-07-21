@@ -13,3 +13,5 @@ void grayscale(VideoFrame *frame);
 void gs_contrast_normalize(VideoFrame *frame);
 
 void gs_threshold_by_value(VideoFrame *frame, uint8_t tval);
+
+void gs_invert(VideoFrame *frame);

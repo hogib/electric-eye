@@ -4,3 +4,9 @@ CompileFlags:
     - "-std=c23"   
 InlayHints:
   BlockEnd: true
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add: 
+      - readability-duplicate-include
+      - misc-include-cleaner

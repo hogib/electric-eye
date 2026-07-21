@@ -15,7 +15,12 @@
  */
 VideoFrame *video_frame_create_i422(uint32_t width, uint32_t height,
                                     int64_t pts) {
+  if (width == 0 || height == 0) {
+    return NULL;
+  }
+
   VideoFrame *frame = (VideoFrame *)calloc(1, sizeof(VideoFrame));
+
   if (!frame) {
     return NULL;
   }
