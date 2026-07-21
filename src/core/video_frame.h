@@ -14,7 +14,10 @@ typedef struct {
   size_t stride[max_stride];
   int64_t pts; // Presentation time stamp
 } VideoFrame;
-VideoFrame *video_frame_create_i422(uint32_t width, uint32_t height,
-                                    int64_t pts);
 
-void video_frame_free(VideoFrame *frame);
+VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts);
+void vf_free(VideoFrame *frame);
+
+void vf_pool_free(VideoFrame **pool, unsigned int allocated_size);
+VideoFrame **vf_pool_create(unsigned int pool_size, uint32_t width,
+                            uint32_t height);

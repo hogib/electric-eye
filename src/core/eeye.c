@@ -1,4 +1,5 @@
 #include "frame_ring_buffer.h"
+#include "video_frame.h"
 #include "video_threads.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@ constexpr uint32_t frame_height = 1080;
 
 FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
+
 
 atomic_bool is_running = true;
 
