@@ -11,44 +11,27 @@ project(
 
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
-
-core_src = [
-    'src/core/eeye.c',
-    'src/core/conv.c',
-    'src/core/frame_ring_buffer.c',
-    'src/core/video_frame.c',
-    'src/core/point_opps.c',
-    'src/core/video_threads.c',
-]
-# core_lib = static_library(
-#     'eeye-core',
-#     #dependencies: [dependency(libyuv)]
-# )
-#
-core_dep = declare_dependency(
-    # link_with: core_lib,
-    include_directories: include_directories('src/core'),
-)
-
-executable('eeye', sources: core_src, dependencies: m_dep)
-
-decoder_src = ['src/decoder/decoder.c']
 ffmpeg_deps = [
-    dependency('libavcodec'),
-    dependency('libavformat'),
-    dependency('libavutil'),
+    dependency('libavcodec', required: false),
+    dependency('libavformat', required: false),
+    dependency('libavutil', required: false),
 ]
 
-decoder_lib = static_library(
-    'videodecoder',
-    decoder_src,
-    dependencies: ffmpeg_deps,
-    include_directories: include_directories('src/decoder'),
+src = [
+    'src/eeye.c',
+    'src/conv.c',
+    'src/frame_ring_buffer.c',
+    'src/video_frame.c',
+    'src/point_opps.c',
+    'src/video_threads.c',
+]
+
+dep = declare_dependency(
+    include_directories: include_directories('src/'),
 )
 
-executable(
-    'live_processor',
-    'src/main.c',
-    link_with: [decoder_lib],
-    dependencies: [core_dep, ffmpeg_deps],
-)
+executable('eeye', sources: src, dependencies: [m_dep, ffmpeg_deps])
+
+
+
+

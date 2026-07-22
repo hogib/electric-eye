@@ -60,3 +60,5 @@ builddir/
 dist/
 notes/
 test/
+build-dbg/
+build-rel/
