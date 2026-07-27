@@ -17,6 +17,17 @@ ffmpeg_deps = [
     dependency('libavutil', required: false),
 ]
 
+exe_name = 'eeye'
+
+if get_option('buildtype') == 'debug'
+    exe_name = 'eeye-d'
+endif
+
+if get_option('buildtype') == 'release'
+    exe_name = 'eeye-r'
+endif
+
+
 src = [
     'src/eeye.c',
     'src/conv.c',
@@ -30,7 +41,7 @@ dep = declare_dependency(
     include_directories: include_directories('src/'),
 )
 
-executable('eeye', sources: src, dependencies: [m_dep, ffmpeg_deps])
+executable(exe_name, sources: src, dependencies: [m_dep, ffmpeg_deps])
 
 
 

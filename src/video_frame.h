@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -11,6 +12,7 @@ typedef struct {
   uint32_t width;
   uint8_t *pixel_data;
   uint8_t *planes[max_planes];
+  size_t plane_sizes[max_planes];
   size_t stride[max_stride];
   int64_t pts; // Presentation time stamp
 } VideoFrame;

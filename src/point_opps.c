@@ -16,11 +16,8 @@ void grayscale(VideoFrame *frame) {
   if (!frame || !frame->planes[1] || !frame->planes[2])
     return;
 
-  size_t u_size = (size_t)frame->stride[1] * frame->height;
-  size_t v_size = (size_t)frame->stride[2] * frame->height;
-
-  memset(frame->planes[1], 128, u_size);
-  memset(frame->planes[2], 128, v_size);
+  memset(frame->planes[1], 128, frame->plane_sizes[1]);
+  memset(frame->planes[2], 128, frame->plane_sizes[2]);
 }
 
 void gs_contrast_normalize(VideoFrame *frame) {
@@ -116,8 +113,6 @@ void gs_threshold_by_value(VideoFrame *frame, uint8_t tval) {
 
     for (; x + 15 < frame->width; x += 16) {
       uint8x16_t v = vld1q_u8(&row[x]);
-      // vcgeq_u8 returns 0xFF (255) if >= tval, and 0x00 (0) if < tval.
-      // This maps perfectly to y_plain_max_jpeg and y_plain_min_jpeg!
       uint8x16_t mask = vcgeq_u8(v, v_tval);
       vst1q_u8(&row[x], mask);
     }

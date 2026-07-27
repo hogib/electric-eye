@@ -42,6 +42,10 @@ VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts) {
   size_t u_size = (size_t)frame->stride[1] * height;
   size_t v_size = (size_t)frame->stride[2] * height;
 
+  frame->plane_sizes[0] = y_size;
+  frame->plane_sizes[1] = u_size;
+  frame->plane_sizes[2] = v_size;
+
   frame->pixel_data = (uint8_t *)malloc(y_size + u_size + v_size);
   if (!frame->pixel_data) {
     free(frame);

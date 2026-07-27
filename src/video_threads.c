@@ -3,6 +3,7 @@
 #include "point_opps.h"
 #include "video_frame.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <threads.h>
@@ -31,16 +32,14 @@ void *producer_loop(void *arg) {
       break;
 
     frame->pts = pts++;
-    size_t y_size = (size_t)frame->stride[0] * frame->height;
-    size_t u_size = (size_t)frame->stride[1] * frame->height;
-    size_t v_size = (size_t)frame->stride[2] * frame->height;
 
     size_t bytes_read = 0;
-    bytes_read += fread(frame->planes[0], 1, y_size, infile);
-    bytes_read += fread(frame->planes[1], 1, u_size, infile);
-    bytes_read += fread(frame->planes[2], 1, v_size, infile);
+    bytes_read += fread(frame->planes[0], 1, frame->plane_sizes[0], infile);
+    bytes_read += fread(frame->planes[1], 1, frame->plane_sizes[1], infile);
+    bytes_read += fread(frame->planes[2], 1, frame->plane_sizes[2], infile);
 
-    if (bytes_read < (y_size + u_size + v_size)) {
+    if (bytes_read < (frame->plane_sizes[0] + frame->plane_sizes[1] +
+                      frame->plane_sizes[2])) {
       printf("End of file reached.\n");
       while (!ring_push(args->ring_buffer_free, frame))
         sleep_us(10);
@@ -104,13 +103,9 @@ void *consumer_loop(void *arg) {
       continue;
     }
 
-    size_t y_size = (size_t)frame->stride[0] * frame->height;
-    size_t u_size = (size_t)frame->stride[1] * frame->height;
-    size_t v_size = (size_t)frame->stride[2] * frame->height;
-
-    fwrite(frame->planes[0], 1, y_size, outfile);
-    fwrite(frame->planes[1], 1, u_size, outfile);
-    fwrite(frame->planes[2], 1, v_size, outfile);
+    fwrite(frame->planes[0], 1, frame->plane_sizes[0], outfile);
+    fwrite(frame->planes[1], 1, frame->plane_sizes[1], outfile);
+    fwrite(frame->planes[2], 1, frame->plane_sizes[2], outfile);
 
     printf("Saved processed frame %lld\n", (long long)frame->pts);
 
