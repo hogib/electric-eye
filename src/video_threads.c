@@ -8,12 +8,40 @@
 #include <stdio.h>
 #include <threads.h>
 
+/*
+ * Camera capture / virtual-cam output are done by shelling out to ffmpeg via
+ * popen(). This keeps producer_loop/consumer_loop nearly unchanged: fread()
+ * and fwrite() work identically whether the FILE* came from fopen() or
+ * popen(), since popen() just hands back one end of a pipe to the child
+ * process's stdout/stdin.
+ *
+ * args->filename (ProducerArgs) is now the camera device, e.g. "/dev/video0"
+ * args->outpath   (ConsumerArgs) is now the loopback device, e.g. "/dev/video10"
+ *
+ * Tune these two to match your webcam's supported capture mode:
+ *   - Most USB webcams can do 1080p only via MJPEG; raw yuyv422 is often
+ *     capped at lower resolutions/framerates. If the capture ffmpeg fails,
+ *     try switching CAMERA_INPUT_FORMAT to "yuyv422" and/or lowering
+ *     CAMERA_FRAMERATE, or check `ffmpeg -f v4l2 -list_formats all -i
+ *     /dev/video0` for what your device actually supports.
+ */
+#define CAMERA_INPUT_FORMAT "mjpeg"
+#define CAMERA_FRAMERATE 30
+
 void *producer_loop(void *arg) {
   ProducerArgs *args = (ProducerArgs *)arg;
 
-  FILE *infile = fopen(args->filename, "rb");
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd),
+           "ffmpeg -hide_banner -loglevel error "
+           "-f v4l2 -input_format %s -framerate %d -video_size %ux%u -i %s "
+           "-pix_fmt yuv422p -f rawvideo -",
+           CAMERA_INPUT_FORMAT, CAMERA_FRAMERATE, args->frame_width,
+           args->frame_height, args->filename);
+
+  FILE *infile = popen(cmd, "r");
   if (!infile) {
-    printf("Failed to open input file.\n");
+    printf("Failed to start camera capture (ffmpeg): %s\n", cmd);
     atomic_store(args->is_running, false);
     return NULL;
   }
@@ -40,7 +68,7 @@ void *producer_loop(void *arg) {
 
     if (bytes_read < (frame->plane_sizes[0] + frame->plane_sizes[1] +
                       frame->plane_sizes[2])) {
-      printf("End of file reached.\n");
+      printf("Camera stream ended or ffmpeg capture died.\n");
       while (!ring_push(args->ring_buffer_free, frame))
         sleep_us(10);
       atomic_store(args->is_running, false);
@@ -53,7 +81,7 @@ void *producer_loop(void *arg) {
     }
   }
 
-  fclose(infile);
+  pclose(infile);
   return NULL;
 }
 
@@ -84,9 +112,18 @@ void *effects_loop(void *arg) {
 
 void *consumer_loop(void *arg) {
   ConsumerArgs *args = (ConsumerArgs *)arg;
-  FILE *outfile = fopen(args->outpath, "wb");
+
+  char cmd[512];
+  snprintf(cmd, sizeof(cmd),
+           "ffmpeg -hide_banner -loglevel error "
+           "-f rawvideo -pix_fmt yuv422p -s %ux%u -r %d -i - "
+           "-f v4l2 %s",
+           args->frame_width, args->frame_height, CAMERA_FRAMERATE,
+           args->outpath);
+
+  FILE *outfile = popen(cmd, "w");
   if (!outfile) {
-    printf("Failed to open output file.\n");
+    printf("Failed to start virtual camera output (ffmpeg): %s\n", cmd);
     return NULL;
   }
 
@@ -107,13 +144,24 @@ void *consumer_loop(void *arg) {
     fwrite(frame->planes[1], 1, frame->plane_sizes[1], outfile);
     fwrite(frame->planes[2], 1, frame->plane_sizes[2], outfile);
 
-    printf("Saved processed frame %lld\n", (long long)frame->pts);
+    if (ferror(outfile)) {
+      // The output ffmpeg died (e.g. loopback device went away). Stop the
+      // whole pipeline rather than spinning on a broken pipe.
+      printf("Virtual camera output pipe broke; shutting down.\n");
+      while (!ring_push(args->ring_buffer_free, frame))
+        sleep_us(10);
+      atomic_store(args->is_running, false);
+      break;
+    }
+
+    printf("Sent processed frame %lld to virtual camera\n",
+           (long long)frame->pts);
 
     while (!ring_push(args->ring_buffer_free, frame)) {
       sleep_us(100);
     }
   }
 
-  fclose(outfile);
+  pclose(outfile);
   return NULL;
 }
