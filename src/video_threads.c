@@ -1,3 +1,8 @@
+// Must come before any header include: -std=c23 puts glibc in strict ISO
+// mode, which hides POSIX extensions like popen()/pclose() from <stdio.h>
+// unless a feature-test macro asks for them explicitly.
+#define _POSIX_C_SOURCE 200809L
+
 #include "video_threads.h"
 #include "frame_ring_buffer.h"
 #include "point_opps.h"
@@ -85,6 +90,10 @@ void *producer_loop(void *arg) {
   return NULL;
 }
 
+#define TINT_SEPIA_U 90
+#define TINT_SEPIA_V 0
+#define TINT_SEPIA_STRENGTH 255
+
 void *effects_loop(void *arg) {
   WorkerArgs *args = (WorkerArgs *)arg;
   while (
@@ -100,8 +109,7 @@ void *effects_loop(void *arg) {
       continue;
     }
 
-    grayscale(frame);
-    gs_invert(frame);
+    color_tint(frame, TINT_SEPIA_U, TINT_SEPIA_V, TINT_SEPIA_STRENGTH);
 
     while (!ring_push(args->ring_buffer_out, frame)) {
       sleep_us(100);
