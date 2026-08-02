@@ -32,6 +32,18 @@ Group=video
 WorkingDirectory=/opt/electric-eye
 ExecStart=/opt/electric-eye/builddir/eeye /opt/electric-eye/eeye_config.json
 
+# libgomp's default OMP_WAIT_POLICY is "active": each OpenMP worker thread
+# busy-spins waiting for the next #pragma omp parallel for region instead of
+# sleeping between them. That trade only pays off when parallel regions run
+# back-to-back with negligible gaps -- here they run once per video frame
+# (~33ms apart) and finish in under a millisecond, so every worker spends
+# essentially the whole frame interval spinning. Measured impact on a 12-core
+# host: ~178% CPU idling down to ~15-19% from this one setting, no code
+# change. On the Pi 5's 4 cores this trades a smaller CPU number for a much
+# larger fraction of a fixed thermal/power budget, so it matters more there,
+# not less.
+Environment=OMP_WAIT_POLICY=passive
+
 # Restart on anything other than an intentional `systemctl stop` (which
 # sends SIGTERM through the same graceful-shutdown path eeye.c already
 # handles for Ctrl+C; systemd does not restart after an administrative stop

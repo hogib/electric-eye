@@ -11,8 +11,16 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <threads.h>
 #include <unistd.h>
+
+// Not declared by <unistd.h> under plain -std=c23 + _POSIX_C_SOURCE (it's
+// specified by POSIX as available whenever a conforming environment defines
+// it, but glibc's strict-ISO mode still doesn't expose the declaration here
+// the way it does write()/STDOUT_FILENO above) -- declare it directly rather
+// than pull in _GNU_SOURCE for one symbol.
+extern char **environ;
 
 constexpr uint32_t frame_width = 1280;
 constexpr uint32_t frame_height = 720;
@@ -80,6 +88,49 @@ ConsumerArgs cons_args = {
 };
 
 int main(int argc, char **argv) {
+  // libgomp's default OMP_WAIT_POLICY is "active": each worker thread in a
+  // #pragma omp parallel for team (conv.c, point_opps.c) busy-spins between
+  // regions instead of sleeping, on the assumption regions run back-to-back.
+  // Here they run once per video frame (~33ms apart) and finish in under a
+  // millisecond, so every worker spends nearly the whole frame interval
+  // spinning -- measured at ~178% CPU idling down to ~15-19% once this
+  // variable is actually present, no other code change.
+  //
+  // It cannot be fixed from inside this process after it has started:
+  // verified empirically that neither setenv() here nor an early
+  // __attribute__((constructor(101))) -- about as soon as user code is
+  // allowed to run -- changes libgomp's behavior. Whatever decides this is
+  // settled before any code in this process gets a chance to run.
+  //
+  // So: re-exec once, with the variable set, before doing anything else.
+  // execve() replaces the process image outright, which re-runs every
+  // constructor (including libgomp's) against the now-updated environment.
+  // /proc/self/exe -- the kernel's own resolved path to this running binary
+  // -- sidesteps the usual argv[0]-may-be-relative-or-bare problem that
+  // execve() (unlike execvp()) can't otherwise handle. Guarded by
+  // getenv() so this only ever happens once: an operator's own
+  // OMP_WAIT_POLICY (e.g. eeye.service's Environment= line, kept as
+  // documentation/belt-and-suspenders even though this makes it redundant)
+  // is left alone, and the re-exec's own child inherits the variable it
+  // just set, so it takes this branch's "already set" path and runs
+  // normally.
+  if (!getenv("OMP_WAIT_POLICY")) {
+    setenv("OMP_WAIT_POLICY", "passive", 1);
+    printf("Re-executing with OMP_WAIT_POLICY=passive (see eeye.c main() "
+           "for why this can't be done in-process)...\n");
+    // execve() discards this process image, stdio buffer included, before
+    // anything forces a buffered line out to the fd -- without this flush
+    // the message above is silently lost every single time, on a redirected
+    // file exactly as much as under journald's own pipe-backed capture.
+    fflush(stdout);
+    execve("/proc/self/exe", argv, environ);
+    // Only reached if execve() itself failed to start (e.g. /proc not
+    // mounted) -- exec never returns on success. Degrade rather than abort:
+    // the pipeline is still correct, it will just idle at a higher CPU cost
+    // than it should.
+    perror("Re-exec for OMP_WAIT_POLICY failed; continuing without it");
+  }
+
   // Nothing in this pipeline talks to a pipe or socket anymore (both
   // producer_loop and consumer_loop are direct V4L2 device I/O now), but
   // stdout can still be one if the user runs `./eeye | something` and that
