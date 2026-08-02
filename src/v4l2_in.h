@@ -17,13 +17,15 @@
  * Scope, deliberately: requires the camera's actual JPEG stream to be 4:2:2
  * subsampled (matching VideoFrame's I422 layout) and fails clearly at open
  * time if it isn't, rather than carrying a general-purpose chroma
- * resampling fallback for every possible subsampling. Also does not inject
- * a missing Huffman table (DHT) for cameras that omit one from their MJPEG
- * stream -- a real, documented quirk on some UVC webcams, left out here
- * because doing it right means embedding ~420 bytes of exact standard
- * table data. If every frame fails to decode with a libjpeg-turbo error
- * about a missing Huffman table, that's the symptom -- the fix is a
- * contained addition to v4l2_in.c, not an architecture change.
+ * resampling fallback for every possible subsampling.
+ *
+ * MJPEG frames missing a DHT (Huffman table) marker -- a real, documented
+ * quirk on some UVC webcams that rely on the decoder already knowing the
+ * standard JPEG tables -- are handled transparently: each frame is scanned
+ * for an existing DHT before decode, and the standard tables are spliced
+ * in only when one is actually missing (see jpeg_has_dht()/ensure_dht() in
+ * v4l2_in.c), so a camera that already emits its own DHT pays only the
+ * cost of that scan.
  */
 
 typedef struct V4l2In V4l2In;
