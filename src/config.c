@@ -40,11 +40,9 @@ struct ConfigWatcher {
 };
 
 static const Config config_defaults = {
-    .effect = EFFECT_SOBEL,
-    .threshold_value = 128,
-    .tint_u = 90,
-    .tint_v = 150,
-    .tint_strength = 180,
+    .stages = {{.effect = EFFECT_SOBEL}},
+    .stage_count = 1,
+    .record_path = "",
 };
 
 // path="/a/b/c.json" -> dir="/a/b", name="c.json". path="c.json" (no
@@ -178,8 +176,145 @@ static bool effect_from_string(const char *s, EffectType *out) {
     *out = EFFECT_TINT;
   else if (strcmp(s, "sobel") == 0)
     *out = EFFECT_SOBEL;
+  else if (strcmp(s, "blur") == 0)
+    *out = EFFECT_BLUR;
   else
     return false;
+  return true;
+}
+
+// Parses one {"effect": "...", ...} chain-stage object. Mirrors
+// parse_config's own key loop and its "unknown key is a hard error"
+// policy (a stage carrying a key its effect doesn't use, e.g. tint_u on a
+// blur stage, is rejected rather than silently ignored).
+static bool parse_effect_stage(Cursor *c, EffectStage *out) {
+  EffectStage parsed = {0};
+  bool have_effect = false;
+
+  if (!cur_expect(c, '{')) {
+    printf("Config: expected '{' to start a chain stage\n");
+    return false;
+  }
+  skip_ws(c);
+
+  char ch;
+  if (cur_peek(c, &ch) && ch == '}') {
+    c->pos++;
+  } else {
+    for (;;) {
+      char key[32];
+      skip_ws(c);
+      if (!parse_string(c, key, sizeof key)) {
+        printf("Config: expected a quoted key in a chain stage\n");
+        return false;
+      }
+      skip_ws(c);
+      if (!cur_expect(c, ':')) {
+        printf("Config: expected ':' after key \"%s\" in a chain stage\n",
+               key);
+        return false;
+      }
+      skip_ws(c);
+
+      bool ok;
+      if (strcmp(key, "effect") == 0) {
+        char val[32];
+        ok = parse_string(c, val, sizeof val) &&
+             effect_from_string(val, &parsed.effect);
+        have_effect = ok;
+      } else if (strcmp(key, "threshold_value") == 0) {
+        ok = parse_u8(c, &parsed.threshold_value);
+      } else if (strcmp(key, "tint_u") == 0) {
+        ok = parse_u8(c, &parsed.tint_u);
+      } else if (strcmp(key, "tint_v") == 0) {
+        ok = parse_u8(c, &parsed.tint_v);
+      } else if (strcmp(key, "tint_strength") == 0) {
+        ok = parse_u8(c, &parsed.tint_strength);
+      } else {
+        printf("Config: unknown key \"%s\" in a chain stage\n", key);
+        return false;
+      }
+      if (!ok) {
+        printf("Config: invalid value for \"%s\" in a chain stage\n", key);
+        return false;
+      }
+
+      skip_ws(c);
+      if (!cur_peek(c, &ch)) {
+        printf("Config: unterminated chain stage object\n");
+        return false;
+      }
+      if (ch == ',') {
+        c->pos++;
+        continue;
+      }
+      if (ch == '}') {
+        c->pos++;
+        break;
+      }
+      printf("Config: expected ',' or '}' after value for \"%s\" in a "
+             "chain stage\n",
+             key);
+      return false;
+    }
+  }
+
+  if (!have_effect) {
+    printf("Config: chain stage missing required \"effect\" key\n");
+    return false;
+  }
+
+  *out = parsed;
+  return true;
+}
+
+// Parses the "chain" array: zero or more stage objects, capped at
+// max_chain_stages (a hard error past that, not silent truncation -- a
+// chain quietly losing its last stages would be a confusing way to find
+// out the limit exists).
+static bool parse_chain(Cursor *c, EffectStage *stages, size_t *stage_count) {
+  if (!cur_expect(c, '[')) {
+    printf("Config: expected '[' for \"chain\"\n");
+    return false;
+  }
+  skip_ws(c);
+
+  size_t count = 0;
+  char ch;
+  if (cur_peek(c, &ch) && ch == ']') {
+    c->pos++; // empty chain: a valid pass-through
+  } else {
+    for (;;) {
+      skip_ws(c);
+      if (count >= max_chain_stages) {
+        printf("Config: \"chain\" has more than %zu stages\n",
+               max_chain_stages);
+        return false;
+      }
+      if (!parse_effect_stage(c, &stages[count])) {
+        return false; // parse_effect_stage already explained why
+      }
+      count++;
+
+      skip_ws(c);
+      if (!cur_peek(c, &ch)) {
+        printf("Config: unterminated \"chain\" array\n");
+        return false;
+      }
+      if (ch == ',') {
+        c->pos++;
+        continue;
+      }
+      if (ch == ']') {
+        c->pos++;
+        break;
+      }
+      printf("Config: expected ',' or ']' in \"chain\"\n");
+      return false;
+    }
+  }
+
+  *stage_count = count;
   return true;
 }
 
@@ -216,25 +351,16 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
       }
       skip_ws(&c);
 
-      bool ok;
-      if (strcmp(key, "effect") == 0) {
-        char val[32];
-        ok = parse_string(&c, val, sizeof val) &&
-             effect_from_string(val, &parsed.effect);
-      } else if (strcmp(key, "threshold_value") == 0) {
-        ok = parse_u8(&c, &parsed.threshold_value);
-      } else if (strcmp(key, "tint_u") == 0) {
-        ok = parse_u8(&c, &parsed.tint_u);
-      } else if (strcmp(key, "tint_v") == 0) {
-        ok = parse_u8(&c, &parsed.tint_v);
-      } else if (strcmp(key, "tint_strength") == 0) {
-        ok = parse_u8(&c, &parsed.tint_strength);
+      if (strcmp(key, "chain") == 0) {
+        if (!parse_chain(&c, parsed.stages, &parsed.stage_count))
+          return false; // parse_chain/parse_effect_stage already explained why
+      } else if (strcmp(key, "record_path") == 0) {
+        if (!parse_string(&c, parsed.record_path, sizeof parsed.record_path)) {
+          printf("Config: invalid value for \"record_path\"\n");
+          return false;
+        }
       } else {
         printf("Config: unknown key \"%s\"\n", key);
-        return false;
-      }
-      if (!ok) {
-        printf("Config: invalid value for \"%s\"\n", key);
         return false;
       }
 

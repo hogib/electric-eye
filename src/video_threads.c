@@ -1,10 +1,10 @@
 #include "video_threads.h"
-#include "conv.h"
+#include "effect_chain.h"
 #include "frame_ring_buffer.h"
-#include "point_opps.h"
 #include "v4l2_in.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
+#include <errno.h>
 #include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -119,40 +119,7 @@ void *effects_loop(void *arg) {
     // landing mid-processing can't split a single output frame between old
     // and new parameters.
     const Config *cfg = config_current(args->config);
-
-    if (cfg->effect == EFFECT_SOBEL) {
-      // Sobel overwrites every byte of the work buffer itself (see
-      // conv.c), so unlike the point ops below it needs no fresh copy from
-      // raw first.
-      sobel_edges(frame);
-    } else {
-      // Every other effect here is a point op inherited from before the
-      // raw/work split: it mutates frame->planes in place, assuming that
-      // buffer already holds the current frame. Now that raw and work are
-      // separate allocations, nothing else keeps work fresh, so refresh it
-      // here before handing off.
-      size_t total = frame->plane_sizes[0] + frame->plane_sizes[1] +
-                     frame->plane_sizes[2];
-      memcpy(frame->pixel_data, frame->raw_data, total);
-
-      switch (cfg->effect) {
-      case EFFECT_GRAYSCALE:
-        grayscale(frame);
-        break;
-      case EFFECT_INVERT:
-        gs_invert(frame);
-        break;
-      case EFFECT_THRESHOLD:
-        gs_threshold_by_value(frame, cfg->threshold_value);
-        break;
-      case EFFECT_TINT:
-        color_tint(frame, cfg->tint_u, cfg->tint_v, cfg->tint_strength);
-        break;
-      case EFFECT_NONE:
-      case EFFECT_SOBEL: // unreachable, handled in the branch above
-        break;
-      }
-    }
+    apply_effect_chain(frame, cfg);
 
     // NULL: a fully-processed frame must reach the consumer regardless of
     // is_running -- abandoning it here would leak it out of the pool.
@@ -171,6 +138,20 @@ void *consumer_loop(void *arg) {
     return NULL;
   }
 
+  // Recording tap: writes frame->raw_data -- the untouched camera frame,
+  // independent of whatever the effect chain does to the copy sent to the
+  // virtual camera -- to record_path whenever the config specifies a
+  // non-empty one. No container, just raw I422 bytes back to back; play
+  // back with (matching this frame's width/height and CAMERA_FRAMERATE
+  // above):
+  //   ffplay -f rawvideo -pix_fmt yuv422p -s <width>x<height> -r 30 -i FILE
+  //
+  // This is genuinely large -- ~53MB/s, ~190GB/hour at 1280x720 -- with no
+  // compression. Fine for short clips; anything longer wants an encoder,
+  // which is a real follow-up, not this.
+  FILE *record_file = NULL;
+  char record_path[max_record_path_len] = "";
+
   while (atomic_load(args->is_running) ||
          atomic_load_explicit(&args->ring_buffer_out->head,
                               memory_order_relaxed) !=
@@ -182,6 +163,47 @@ void *consumer_loop(void *arg) {
     if (!ring_pop_wait(args->ring_buffer_out, (void **)&frame,
                       args->is_running)) {
       continue;
+    }
+
+    // Independent config read from effects_loop's -- this frame's chain
+    // was already decided by the time it got here, but the recording
+    // decision is consumer_loop's own to make. Same once-per-frame
+    // snapshot discipline: whatever record_path this frame observes is
+    // the one it's judged against for its entire trip through this loop.
+    const Config *cfg = config_current(args->config);
+    if (strcmp(cfg->record_path, record_path) != 0) {
+      if (record_file) {
+        fclose(record_file);
+        record_file = NULL;
+        printf("Recording stopped: %s\n", record_path);
+      }
+      snprintf(record_path, sizeof record_path, "%s", cfg->record_path);
+      if (record_path[0] != '\0') {
+        record_file = fopen(record_path, "wb");
+        if (record_file) {
+          printf("Recording started: %s (raw I422 %ux%u -- play back with: "
+                 "ffplay -f rawvideo -pix_fmt yuv422p -s %ux%u -r %d -i %s)\n",
+                 record_path, args->frame_width, args->frame_height,
+                 args->frame_width, args->frame_height, CAMERA_FRAMERATE,
+                 record_path);
+        } else {
+          printf("Recording failed to start: could not open %s: %s\n",
+                 record_path, strerror(errno));
+          record_path[0] = '\0'; // don't retry the same failing path every frame
+        }
+      }
+    }
+
+    if (record_file) {
+      size_t total = frame->plane_sizes[0] + frame->plane_sizes[1] +
+                     frame->plane_sizes[2];
+      if (fwrite(frame->raw_data, 1, total, record_file) != total) {
+        printf("Recording write failed (%s); stopping recording.\n",
+               strerror(errno));
+        fclose(record_file);
+        record_file = NULL;
+        record_path[0] = '\0';
+      }
     }
 
     if (!v4l2_out_write(out, frame)) {
@@ -200,6 +222,9 @@ void *consumer_loop(void *arg) {
     // the hot path: every single processed frame returns to the pool here.
     ring_push_wait(args->ring_buffer_free, frame, NULL);
   }
+
+  if (record_file)
+    fclose(record_file);
 
   v4l2_out_close(out);
   return NULL;

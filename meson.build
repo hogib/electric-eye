@@ -56,6 +56,7 @@ src = [
     'src/eeye.c',
     'src/config.c',
     'src/conv.c',
+    'src/effect_chain.c',
     'src/frame_ring_buffer.c',
     'src/video_frame.c',
     'src/point_opps.c',

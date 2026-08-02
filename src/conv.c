@@ -1,5 +1,6 @@
 #include "conv.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Same architecture detection as point_opps.c (duplicated rather than
@@ -127,15 +128,14 @@ static inline uint8_t sobel_at_clamped(const uint8_t *y_plane, size_t stride,
       clamped_sample(y_plane, stride, width, height, x + 1, y + 1));
 }
 
-void sobel_edges(VideoFrame *frame) {
-  if (!frame || !frame->raw_planes[0] || !frame->planes[0])
+void sobel_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
+                 uint32_t width, uint32_t height, const size_t stride_arr[3]) {
+  if (!src_planes[0] || !dst_planes[0])
     return;
 
-  const uint8_t *raw_y = frame->raw_planes[0];
-  uint8_t *out_y = frame->planes[0];
-  uint32_t width = frame->width;
-  uint32_t height = frame->height;
-  size_t stride = frame->stride[0];
+  const uint8_t *raw_y = src_planes[0];
+  uint8_t *out_y = dst_planes[0];
+  size_t stride = stride_arr[0];
 
   // Interior: every pixel here has a full 3x3 neighborhood, so read directly
   // through pointers instead of through clamped_sample's bounds checks. This
@@ -205,6 +205,118 @@ void sobel_edges(VideoFrame *frame) {
         raw_y, stride, width, height, (int32_t)width - 1, (int32_t)y);
   }
 
-  memset(frame->planes[1], 128, frame->plane_sizes[1]);
-  memset(frame->planes[2], 128, frame->plane_sizes[2]);
+  // plane_sizes[1]/[2] aren't available without a VideoFrame -- both equal
+  // stride*height, exactly how vf_create derives them in the first place.
+  memset(dst_planes[1], 128, stride_arr[1] * height);
+  memset(dst_planes[2], 128, stride_arr[2] * height);
+}
+
+// 5-tap binomial approximation to a Gaussian ([1,4,6,4,1]/16): separable
+// (apply horizontally then vertically, 2*5=10 taps/pixel instead of a 2D
+// kernel's 25), and integer-exact -- the weights sum to a power of two, so
+// normalizing is a plain rounded right-shift, no float, no accumulated
+// rounding error. The same kind of stand-in for a true Gaussian that
+// sobel_magnitude's L1 norm is for a true gradient magnitude: visually
+// indistinguishable, far cheaper.
+static inline uint8_t blur5(int32_t p0, int32_t p1, int32_t p2, int32_t p3,
+                           int32_t p4) {
+  return (uint8_t)((p0 + 4 * p1 + 6 * p2 + 4 * p3 + p4 + 8) >> 4);
+}
+
+// Scratch for blur_plane's horizontal pass, grown lazily to the largest
+// plane a caller has asked for so far and reused across the Y/U/V calls
+// within one gaussian_blur() invocation (sequential, never concurrent, so
+// one shared buffer is safe) and across frames (never freed until process
+// exit -- like v4l2_in.c's dht_scratch, this trades a small, bounded,
+// one-time cost for not touching the allocator on the hot path).
+static uint8_t *blur_scratch;
+static size_t blur_scratch_cap;
+
+// One plane, two passes. Needs a private intermediate for the horizontal
+// pass's output rather than writing straight into dst: the vertical pass
+// reads a column spanning 5 rows of that output, so those rows can't
+// already be sitting in a buffer being overwritten as they're read -- the
+// same reason Sobel needs raw and work to be separate buffers, just
+// recurring a second time within this one function's two internal passes.
+//
+// Border (2px on every edge -- a 5-tap kernel spans x-2..x+2): clamp-to-
+// edge, matching Sobel's replicate-rather-than-zero-pad reasoning --
+// zero-padding would read as a false soft vignette at the frame boundary
+// that has nothing to do with the actual scene.
+static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
+                      uint32_t height, size_t stride) {
+  size_t needed = (size_t)width * height;
+  if (blur_scratch_cap < needed) {
+    uint8_t *grown = realloc(blur_scratch, needed);
+    if (!grown)
+      return; // Leave dst untouched rather than crash; gaussian_blur's
+             // other plane(s) still produced valid output.
+    blur_scratch = grown;
+    blur_scratch_cap = needed;
+  }
+
+  // Horizontal: src (stride-spaced rows) -> blur_scratch (tightly packed,
+  // width-spaced -- no stride padding to carry, since this buffer never
+  // exists outside this one function call).
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t *row = src + (size_t)y * stride;
+    uint8_t *out_row = blur_scratch + (size_t)y * width;
+    for (uint32_t x = 0; x < width; ++x) {
+      int32_t xm2 = (int32_t)x < 2 ? 0 : (int32_t)x - 2;
+      int32_t xm1 = (int32_t)x < 1 ? 0 : (int32_t)x - 1;
+      int32_t xp1 =
+          (int32_t)x + 1 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 1;
+      int32_t xp2 =
+          (int32_t)x + 2 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 2;
+      out_row[x] = blur5(row[xm2], row[xm1], row[x], row[xp1], row[xp2]);
+    }
+  }
+
+  // Vertical: blur_scratch -> dst.
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    int32_t ym2 = (int32_t)y < 2 ? 0 : (int32_t)y - 2;
+    int32_t ym1 = (int32_t)y < 1 ? 0 : (int32_t)y - 1;
+    int32_t yp1 =
+        (int32_t)y + 1 >= (int32_t)height ? (int32_t)height - 1 : (int32_t)y + 1;
+    int32_t yp2 =
+        (int32_t)y + 2 >= (int32_t)height ? (int32_t)height - 1 : (int32_t)y + 2;
+
+    const uint8_t *r_m2 = blur_scratch + (size_t)ym2 * width;
+    const uint8_t *r_m1 = blur_scratch + (size_t)ym1 * width;
+    const uint8_t *r_0 = blur_scratch + (size_t)y * width;
+    const uint8_t *r_p1 = blur_scratch + (size_t)yp1 * width;
+    const uint8_t *r_p2 = blur_scratch + (size_t)yp2 * width;
+    uint8_t *out_row = dst + (size_t)y * stride;
+
+    for (uint32_t x = 0; x < width; ++x) {
+      out_row[x] = blur5(r_m2[x], r_m1[x], r_0[x], r_p1[x], r_p2[x]);
+    }
+  }
+}
+
+// Unlike sobel_edges (luma only, chroma reset to neutral -- an edge map
+// has no meaningful color), blur touches all three planes: it's meant to
+// work as a standalone soft-focus effect on its own, not only as Sobel
+// preprocessing, and blurring luma while leaving chroma sharp would look
+// visually inconsistent (fine detail in color, none in brightness).
+//
+// No NEON path yet -- scalar with the same OpenMP row-parallelism as
+// everything else in this file. A real candidate for a follow-up, but this
+// change was already large enough without a second cross-compiled/
+// QEMU-verified kernel in the same sweep.
+void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
+                   uint32_t width, uint32_t height, const size_t stride[3]) {
+  if (!src_planes[0] || !dst_planes[0])
+    return;
+
+  blur_plane(src_planes[0], dst_planes[0], width, height, stride[0]);
+
+  // stride[1]/[2] are exactly the chroma width with no padding (see
+  // vf_create), matching how color_tint already uses them as its own loop
+  // bound.
+  uint32_t chroma_width = (uint32_t)stride[1];
+  blur_plane(src_planes[1], dst_planes[1], chroma_width, height, stride[1]);
+  blur_plane(src_planes[2], dst_planes[2], chroma_width, height, stride[2]);
 }

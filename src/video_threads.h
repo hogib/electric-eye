@@ -36,6 +36,7 @@ typedef struct {
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_out;
   FrameRingBuffer *ring_buffer_free;
+  const ConfigWatcher *config; // for the recording tap's record_path
   uint32_t frame_width;
   uint32_t frame_height;
 } ConsumerArgs;

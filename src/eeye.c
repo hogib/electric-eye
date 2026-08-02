@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   work_args.config = config_watcher;
+  cons_args.config = config_watcher;
 
   pthread_t producer, worker, consumer;
   if (pthread_create(&producer, NULL, producer_loop, &prod_args) != 0) {

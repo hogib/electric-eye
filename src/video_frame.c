@@ -71,6 +71,21 @@ VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts) {
   frame->raw_planes[1] = frame->raw_data + y_size;
   frame->raw_planes[2] = frame->raw_data + y_size + u_size;
 
+  // Third, separate allocation for the same reason raw_data is: a chain's
+  // ping-pong target must not alias any buffer another stage in the same
+  // frame is still reading.
+  frame->spare_data = (uint8_t *)malloc(y_size + u_size + v_size);
+  if (!frame->spare_data) {
+    free(frame->raw_data);
+    free(frame->pixel_data);
+    free(frame);
+    return NULL;
+  }
+
+  frame->spare_planes[0] = frame->spare_data;
+  frame->spare_planes[1] = frame->spare_data + y_size;
+  frame->spare_planes[2] = frame->spare_data + y_size + u_size;
+
   return frame;
 }
 
@@ -84,6 +99,10 @@ void vf_free(VideoFrame *frame) {
 
   if (frame->raw_data) {
     free(frame->raw_data);
+  }
+
+  if (frame->spare_data) {
+    free(frame->spare_data);
   }
 
   free(frame);

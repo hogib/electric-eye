@@ -1,13 +1,19 @@
 #pragma once
-#include "video_frame.h"
+#include <stddef.h>
+#include <stdint.h>
 
 /*
- * Sobel edge magnitude. Reads frame->raw_planes (the untouched camera
- * frame), writes frame->planes (the work buffer the consumer sends out).
- *
- * Source and destination are disjoint buffers, so unlike an in-place
- * neighborhood op there is no risk of a stage reading pixels it already
- * overwrote -- and no ordering constraint that would block parallelizing
- * the row loop.
+ * Both functions below share one shape so effect_chain.c can invoke either
+ * uniformly as "a neighborhood op": 3 source planes, 3 destination planes,
+ * frame dimensions, and per-plane stride. src and dst must not alias --
+ * each reads a neighborhood of src while writing dst, so a stage that
+ * targeted its own source would risk reading pixels it already overwrote.
+ * (Point ops don't have this restriction and don't take this shape --
+ * see point_opps.h.)
  */
-void sobel_edges(VideoFrame *frame);
+
+void sobel_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
+                 uint32_t width, uint32_t height, const size_t stride[3]);
+
+void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
+                   uint32_t width, uint32_t height, const size_t stride[3]);
