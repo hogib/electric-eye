@@ -1,4 +1,5 @@
 #include "v4l2_out.h"
+#include "v4l2_ioctl.h"
 #include "video_frame.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -7,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 
 struct V4l2Out {
@@ -16,19 +16,6 @@ struct V4l2Out {
   uint32_t width;
   uint32_t height;
 };
-
-/*
- * ioctl() restarts are not automatic: a signal arriving mid-call surfaces as
- * EINTR and the request never reached the driver. Every ioctl here goes
- * through this wrapper so a stray signal can't be mistaken for a device error.
- */
-static int xioctl(int fd, unsigned long request, void *arg) {
-  int r;
-  do {
-    r = ioctl(fd, request, arg);
-  } while (r == -1 && errno == EINTR);
-  return r;
-}
 
 V4l2Out *v4l2_out_open(const char *path, uint32_t width, uint32_t height,
                        uint32_t fourcc) {

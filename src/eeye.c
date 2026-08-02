@@ -40,11 +40,14 @@ static void handle_shutdown_signal(int sig) {
 }
 
 /*
- * .filename now holds the v4l2 camera device instead of an input file path.
- * .outpath now holds the v4l2loopback virtual camera device.
+ * .filename is the V4L2 camera device (MJPEG capture -- see v4l2_in.h).
+ * .outpath is the v4l2loopback virtual camera device.
+ *
+ * ffmpeg is no longer required at build or run time; both ends of the
+ * pipeline talk directly to their /dev/videoN devices now.
  *
  * One-time host setup required:
- *   sudo apt install v4l2loopback-dkms ffmpeg
+ *   sudo apt install v4l2loopback-dkms libturbojpeg0-dev
  *   sudo modprobe v4l2loopback video_nr=10 card_label="VirtualCam" exclusive_caps=1
  *
  * Confirm your real camera's device number with:
@@ -77,9 +80,12 @@ ConsumerArgs cons_args = {
 };
 
 int main(int argc, char **argv) {
-  // If the output ffmpeg (virtual cam) process dies/exits, writes to its pipe
-  // would otherwise raise SIGPIPE and kill this whole process. Ignore it and
-  // let consumer_loop's ferror(outfile) check handle shutdown gracefully.
+  // Nothing in this pipeline talks to a pipe or socket anymore (both
+  // producer_loop and consumer_loop are direct V4L2 device I/O now), but
+  // stdout can still be one if the user runs `./eeye | something` and that
+  // reader exits -- including the signal handler's own write() below.
+  // Ignoring SIGPIPE means that shows up as a normal write() failure
+  // instead of killing the process outright.
   signal(SIGPIPE, SIG_IGN);
 
   // SIGINT: Ctrl+C from an interactive terminal. SIGTERM: what a service

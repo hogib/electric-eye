@@ -1,12 +1,8 @@
-// Must come before any header include: -std=c23 puts glibc in strict ISO
-// mode, which hides POSIX extensions like popen()/pclose() from <stdio.h>
-// unless a feature-test macro asks for them explicitly.
-#define _POSIX_C_SOURCE 200809L
-
 #include "video_threads.h"
 #include "conv.h"
 #include "frame_ring_buffer.h"
 #include "point_opps.h"
+#include "v4l2_in.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
 #include <linux/videodev2.h>
@@ -17,40 +13,17 @@
 #include <string.h>
 #include <threads.h>
 
-/*
- * Camera capture / virtual-cam output are done by shelling out to ffmpeg via
- * popen(). This keeps producer_loop/consumer_loop nearly unchanged: fread()
- * and fwrite() work identically whether the FILE* came from fopen() or
- * popen(), since popen() just hands back one end of a pipe to the child
- * process's stdout/stdin.
- *
- * args->filename (ProducerArgs) is now the camera device, e.g. "/dev/video0"
- * args->outpath   (ConsumerArgs) is now the loopback device, e.g. "/dev/video10"
- *
- * Tune these two to match your webcam's supported capture mode:
- *   - Most USB webcams can do 1080p only via MJPEG; raw yuyv422 is often
- *     capped at lower resolutions/framerates. If the capture ffmpeg fails,
- *     try switching CAMERA_INPUT_FORMAT to "yuyv422" and/or lowering
- *     CAMERA_FRAMERATE, or check `ffmpeg -f v4l2 -list_formats all -i
- *     /dev/video0` for what your device actually supports.
- */
-#define CAMERA_INPUT_FORMAT "mjpeg"
+// Best-effort request passed to v4l2_in_open(); V4L2 does not guarantee a
+// driver honors an exact framerate. args->filename (ProducerArgs) is the
+// camera device, e.g. "/dev/video0".
 #define CAMERA_FRAMERATE 30
 
 void *producer_loop(void *arg) {
   ProducerArgs *args = (ProducerArgs *)arg;
 
-  char cmd[512];
-  snprintf(cmd, sizeof(cmd),
-           "ffmpeg -hide_banner -loglevel error "
-           "-f v4l2 -input_format %s -framerate %d -video_size %ux%u -i %s "
-           "-pix_fmt yuv422p -f rawvideo -",
-           CAMERA_INPUT_FORMAT, CAMERA_FRAMERATE, args->frame_width,
-           args->frame_height, args->filename);
-
-  FILE *infile = popen(cmd, "r");
-  if (!infile) {
-    printf("Failed to start camera capture (ffmpeg): %s\n", cmd);
+  V4l2In *in = v4l2_in_open(args->filename, args->frame_width,
+                            args->frame_height, CAMERA_FRAMERATE);
+  if (!in) {
     atomic_store(args->is_running, false);
     return NULL;
   }
@@ -70,17 +43,10 @@ void *producer_loop(void *arg) {
 
     frame->pts = pts++;
 
-    size_t bytes_read = 0;
-    bytes_read +=
-        fread(frame->raw_planes[0], 1, frame->plane_sizes[0], infile);
-    bytes_read +=
-        fread(frame->raw_planes[1], 1, frame->plane_sizes[1], infile);
-    bytes_read +=
-        fread(frame->raw_planes[2], 1, frame->plane_sizes[2], infile);
-
-    if (bytes_read < (frame->plane_sizes[0] + frame->plane_sizes[1] +
-                      frame->plane_sizes[2])) {
-      printf("Camera stream ended or ffmpeg capture died.\n");
+    if (!v4l2_in_capture(in, frame)) {
+      // A device-level failure or a persistent format mismatch -- either
+      // way, not something producer_loop can recover from on its own.
+      printf("Camera capture failed; shutting down.\n");
       while (!ring_push(args->ring_buffer_free, frame))
         sleep_us(10);
       atomic_store(args->is_running, false);
@@ -93,7 +59,7 @@ void *producer_loop(void *arg) {
     }
   }
 
-  pclose(infile);
+  v4l2_in_close(in);
   return NULL;
 }
 

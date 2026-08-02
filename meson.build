@@ -11,11 +11,14 @@ project(
 
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
-ffmpeg_deps = [
-    dependency('libavcodec', required: false),
-    dependency('libavformat', required: false),
-    dependency('libavutil', required: false),
-]
+
+# Both the capture side (v4l2_in.c) and the output side (v4l2_out.c) now
+# talk to /dev/videoN directly via V4L2 ioctls and MMAP streaming -- the
+# ffmpeg CLI subprocess this project used to shell out to for both ends is
+# gone. Nothing in src/ has ever linked against libavcodec/libavformat/
+# libavutil directly (grep confirms it), so the dependency that used to be
+# declared here for them is dropped rather than kept around unused.
+turbojpeg_dep = dependency('libturbojpeg')
 
 # point_opps.c and conv.c already carry #pragma omp parallel for on every
 # hot loop -- those loops were written to be race-free specifically so this
@@ -48,6 +51,7 @@ src = [
     'src/frame_ring_buffer.c',
     'src/video_frame.c',
     'src/point_opps.c',
+    'src/v4l2_in.c',
     'src/v4l2_out.c',
     'src/video_threads.c',
 ]
@@ -56,7 +60,7 @@ dep = declare_dependency(
     include_directories: include_directories('src/'),
 )
 
-executable(exe_name, sources: src, dependencies: [m_dep, ffmpeg_deps, omp_dep])
+executable(exe_name, sources: src, dependencies: [m_dep, turbojpeg_dep, omp_dep])
 
 
 
