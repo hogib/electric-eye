@@ -275,7 +275,19 @@ static bool config_try_load(const char *path, Config *out) {
 
   char buf[4096];
   size_t n = fread(buf, 1, sizeof buf, f);
-  bool hit_limit = (n == sizeof buf) && !feof(f);
+
+  // fread() filling the buffer exactly doesn't by itself mean the file is
+  // truncated -- a file of precisely sizeof(buf) bytes reads fully without
+  // ever setting feof() (that only happens once a read attempts to go past
+  // the end and comes up short). So a full read is ambiguous on its own;
+  // resolve it with one more byte: EOF here means the file was exactly
+  // sizeof(buf), not truncated, and fgetc() is cheap enough that doing this
+  // unconditionally would be fine too -- it's guarded here only to skip it
+  // on the far more common case of a small config file.
+  bool hit_limit = false;
+  if (n == sizeof buf) {
+    hit_limit = fgetc(f) != EOF;
+  }
   fclose(f);
 
   if (hit_limit) {
