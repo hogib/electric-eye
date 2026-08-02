@@ -233,8 +233,20 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
   if (fmt.fmt.pix.width != width || fmt.fmt.pix.height != height) {
-    printf("Driver adjusted capture geometry: asked %ux%u, got %ux%u\n",
-           width, height, fmt.fmt.pix.width, fmt.fmt.pix.height);
+    // Unlike v4l2_out.c's identical-looking check, this one has to be
+    // fatal: the frame pool is sized from the width/height the caller
+    // asked for (eeye.c's compile-time constants), not from whatever got
+    // negotiated here. If those disagree, decode_mjpeg_frame's dimension
+    // check will reject every real capture as DECODE_FORMAT_MISMATCH, and
+    // producer_loop's reconnect loop will just renegotiate this exact same
+    // mismatch forever -- an infinite retry loop instead of one clear
+    // error at open time.
+    printf("%s only offers %ux%u for MJPEG, not the requested %ux%u; "
+           "reconnecting will not fix this -- pick a resolution this "
+           "camera actually supports\n",
+           path, fmt.fmt.pix.width, fmt.fmt.pix.height, width, height);
+    close(fd);
+    return NULL;
   }
 
   // Best-effort: V4L2 does not require a driver to honor an exact
