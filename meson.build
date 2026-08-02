@@ -30,7 +30,9 @@ turbojpeg_dep = dependency('libturbojpeg')
 # runtime, just without the parallelism.
 omp_dep = dependency('openmp', required: false)
 if not omp_dep.found()
-    warning('OpenMP not found: point_opps.c/conv.c will build but their #pragma omp loops will run single-threaded.')
+    warning(
+        'OpenMP not found: point_opps.c/conv.c will build but their #pragma omp loops will run single-threaded.',
+    )
 endif
 
 exe_name = 'eeye'
@@ -40,7 +42,7 @@ if get_option('buildtype') == 'debug'
 endif
 
 if get_option('buildtype') == 'release'
-    exe_name = 'eeye-r'
+    exe_name = 'eeye'
 endif
 
 
