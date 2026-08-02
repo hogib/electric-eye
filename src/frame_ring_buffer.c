@@ -1,11 +1,5 @@
 #include "frame_ring_buffer.h"
-#include <stdlib.h>
-
-struct FrameRingBuffer {
-  void *buffer[ring_buffer_size];
-  atomic_size_t head; // Written by Producer
-  atomic_size_t tail; // Written by Consumer
-};
+#include <stddef.h>
 
 void ring_init(FrameRingBuffer *rb) {
   atomic_init(&rb->head, 0);

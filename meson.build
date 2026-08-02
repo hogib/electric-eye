@@ -34,6 +34,7 @@ src = [
     'src/frame_ring_buffer.c',
     'src/video_frame.c',
     'src/point_opps.c',
+    'src/v4l2_out.c',
     'src/video_threads.c',
 ]
 

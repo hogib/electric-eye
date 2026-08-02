@@ -6,7 +6,9 @@
 #include "video_threads.h"
 #include "frame_ring_buffer.h"
 #include "point_opps.h"
+#include "v4l2_out.h"
 #include "video_frame.h"
+#include <linux/videodev2.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -121,17 +123,10 @@ void *effects_loop(void *arg) {
 void *consumer_loop(void *arg) {
   ConsumerArgs *args = (ConsumerArgs *)arg;
 
-  char cmd[512];
-  snprintf(cmd, sizeof(cmd),
-           "ffmpeg -hide_banner -loglevel error "
-           "-f rawvideo -pix_fmt yuv422p -s %ux%u -r %d -i - "
-           "-f v4l2 %s",
-           args->frame_width, args->frame_height, CAMERA_FRAMERATE,
-           args->outpath);
-
-  FILE *outfile = popen(cmd, "w");
-  if (!outfile) {
-    printf("Failed to start virtual camera output (ffmpeg): %s\n", cmd);
+  V4l2Out *out = v4l2_out_open(args->outpath, args->frame_width,
+                               args->frame_height, V4L2_PIX_FMT_YUV422P);
+  if (!out) {
+    atomic_store(args->is_running, false);
     return NULL;
   }
 
@@ -148,28 +143,21 @@ void *consumer_loop(void *arg) {
       continue;
     }
 
-    fwrite(frame->planes[0], 1, frame->plane_sizes[0], outfile);
-    fwrite(frame->planes[1], 1, frame->plane_sizes[1], outfile);
-    fwrite(frame->planes[2], 1, frame->plane_sizes[2], outfile);
-
-    if (ferror(outfile)) {
-      // The output ffmpeg died (e.g. loopback device went away). Stop the
-      // whole pipeline rather than spinning on a broken pipe.
-      printf("Virtual camera output pipe broke; shutting down.\n");
+    if (!v4l2_out_write(out, frame)) {
+      // The loopback device went away or rejected the frame. Stop the whole
+      // pipeline rather than spinning on a dead device.
+      printf("Virtual camera write failed; shutting down.\n");
       while (!ring_push(args->ring_buffer_free, frame))
         sleep_us(10);
       atomic_store(args->is_running, false);
       break;
     }
 
-    printf("Sent processed frame %lld to virtual camera\n",
-           (long long)frame->pts);
-
     while (!ring_push(args->ring_buffer_free, frame)) {
       sleep_us(100);
     }
   }
 
-  pclose(outfile);
+  v4l2_out_close(out);
   return NULL;
 }
