@@ -1,0 +1,50 @@
+# Electric Eye systemd service.
+#
+# Install:
+#   sudo cp eeye.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now eeye
+#
+# Adjust WorkingDirectory/ExecStart below to your install path, and
+# User/Group to a user in the 'video' group (needed for both the camera
+# device and the v4l2loopback output device):
+#   sudo usermod -aG video <user>
+#
+# Logs:   journalctl -u eeye -f
+# Status: systemctl status eeye
+
+[Unit]
+Description=Electric Eye - realtime webcam effects pipeline
+After=network.target systemd-udevd.service
+
+# Give up escalating restarts, rather than retrying forever, after 5
+# failures within 60 seconds. A persistent problem (e.g. v4l2loopback
+# genuinely not loaded) should surface as a failed service an admin
+# notices via `systemctl status eeye`, not an infinite silent restart loop.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pi
+Group=video
+
+WorkingDirectory=/opt/electric-eye
+ExecStart=/opt/electric-eye/builddir/eeye /opt/electric-eye/eeye_config.json
+
+# Restart on anything other than an intentional `systemctl stop` (which
+# sends SIGTERM through the same graceful-shutdown path eeye.c already
+# handles for Ctrl+C; systemd does not restart after an administrative stop
+# regardless of this setting). This is specifically the recovery layer for
+# setup-class failures -- e.g. v4l2loopback not loaded -- that no amount of
+# retrying open() in-process can fix on its own. A genuinely missing
+# *camera* is already handled without needing a restart at all:
+# producer_loop retries that internally (see video_threads.c).
+Restart=always
+RestartSec=5
+
+# journald captures stdout/stderr automatically -- no separate log
+# configuration needed.
+
+[Install]
+WantedBy=multi-user.target
