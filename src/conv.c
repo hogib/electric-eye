@@ -76,8 +76,14 @@ void sobel_edges(VideoFrame *frame) {
   // adjacent thread chunks -- row y+1 is both "row_below" for chunk N and
   // "row_above" for chunk N+1 -- are safe with no synchronization. That is
   // the property the raw/work split exists to buy.
+  // OpenMP requires the loop directly under #pragma omp parallel for to be
+  // in canonical form: `var < loop-invariant`. `y + 1 < height`, though
+  // equivalent, puts the loop variable inside an expression on the
+  // left-hand side and is rejected at compile time once OpenMP is actually
+  // parsing it (as opposed to silently ignoring the pragma, which is what
+  // let this slip through before OpenMP was wired into the build).
 #pragma omp parallel for
-  for (uint32_t y = 1; y + 1 < height; ++y) {
+  for (uint32_t y = 1; y < height - 1; ++y) {
     const uint8_t *row_above = raw_y + (size_t)(y - 1) * stride;
     const uint8_t *row = raw_y + (size_t)y * stride;
     const uint8_t *row_below = raw_y + (size_t)(y + 1) * stride;

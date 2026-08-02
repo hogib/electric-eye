@@ -17,6 +17,19 @@ ffmpeg_deps = [
     dependency('libavutil', required: false),
 ]
 
+# point_opps.c and conv.c already carry #pragma omp parallel for on every
+# hot loop -- those loops were written to be race-free specifically so this
+# would be safe once wired up (see the raw/work split: source and
+# destination buffers are always disjoint). Without this dependency, every
+# one of those pragmas is silently ignored and the loops run single-threaded,
+# which is the state the project has been in until now. required: false
+# matches ffmpeg_deps above: still build on a host without an OpenMP
+# runtime, just without the parallelism.
+omp_dep = dependency('openmp', required: false)
+if not omp_dep.found()
+    warning('OpenMP not found: point_opps.c/conv.c will build but their #pragma omp loops will run single-threaded.')
+endif
+
 exe_name = 'eeye'
 
 if get_option('buildtype') == 'debug'
@@ -43,7 +56,7 @@ dep = declare_dependency(
     include_directories: include_directories('src/'),
 )
 
-executable(exe_name, sources: src, dependencies: [m_dep, ffmpeg_deps])
+executable(exe_name, sources: src, dependencies: [m_dep, ffmpeg_deps, omp_dep])
 
 
 
