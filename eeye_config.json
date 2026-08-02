@@ -1,5 +1,5 @@
 {
-  "effect": "sobel",
+  "effect": "tint",
   "threshold_value": 128,
   "tint_u": 90,
   "tint_v": 150,
