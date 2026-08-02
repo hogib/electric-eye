@@ -30,7 +30,8 @@ struct V4l2In {
     void *start;
     size_t length;
   } buffers[8]; // sized by v4l2_in_max_buffers
-  tjhandle jpeg_decoder;
+  uint32_t capture_format; // V4L2_PIX_FMT_MJPEG or V4L2_PIX_FMT_YUYV
+  tjhandle jpeg_decoder;   // only set up when capture_format is MJPEG
 };
 
 typedef enum {
@@ -85,6 +86,56 @@ static DecodeResult decode_mjpeg_frame(V4l2In *in, const uint8_t *jpeg_data,
   return DECODE_OK;
 }
 
+// YUYV is packed 4:2:2: every 2 horizontal pixels are 4 bytes, Y0 U0 Y1 V0
+// -- two luma samples sharing one chroma pair, which is exactly I422's
+// subsampling, just interleaved instead of planar. No decode needed, only
+// a deinterleave: split those 4 bytes into VideoFrame's three separate
+// planes.
+static DecodeResult unpack_yuyv_frame(const uint8_t *yuyv, size_t yuyv_size,
+                                      VideoFrame *frame) {
+  size_t expected = (size_t)frame->width * frame->height * 2;
+  if (yuyv_size < expected) {
+    // Unlike a JPEG payload, YUYV has no self-describing length -- a short
+    // buffer here means the driver hasn't handed over a full frame yet
+    // (or a USB glitch truncated one), not a format problem, so this is
+    // worth retrying rather than failing outright.
+    printf("v4l2_in: YUYV frame too short: got %zu bytes, expected %zu\n",
+           yuyv_size, expected);
+    return DECODE_TRANSIENT_FAIL;
+  }
+
+  uint8_t *y_plane = frame->raw_planes[0];
+  uint8_t *u_plane = frame->raw_planes[1];
+  uint8_t *v_plane = frame->raw_planes[2];
+  size_t y_stride = frame->stride[0];
+  size_t c_stride = frame->stride[1]; // == stride[2]
+
+  for (uint32_t row = 0; row < frame->height; ++row) {
+    const uint8_t *src = yuyv + (size_t)row * frame->width * 2;
+    uint8_t *y_row = y_plane + (size_t)row * y_stride;
+    uint8_t *u_row = u_plane + (size_t)row * c_stride;
+    uint8_t *v_row = v_plane + (size_t)row * c_stride;
+
+    uint32_t x = 0, cx = 0;
+    for (; x + 1 < frame->width; x += 2, ++cx) {
+      y_row[x] = src[0];
+      u_row[cx] = src[1];
+      y_row[x + 1] = src[2];
+      v_row[cx] = src[3];
+      src += 4;
+    }
+    // An odd width leaves one trailing luma sample with no paired chroma
+    // update of its own -- vf_create's chroma_width = (width+1)/2 already
+    // reserves a slot for it, just copy the luma and leave that slot as
+    // whatever the previous pair wrote.
+    if (x < frame->width) {
+      y_row[x] = src[0];
+    }
+  }
+
+  return DECODE_OK;
+}
+
 bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
   // A handful of retries absorbs an isolated corrupt USB transfer (real,
   // if uncommon, on actual hardware) without surfacing it as a pipeline
@@ -116,9 +167,10 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
       return false;
     }
 
-    DecodeResult result = decode_mjpeg_frame(
-        in, (const uint8_t *)in->buffers[buf.index].start, buf.bytesused,
-        frame);
+    const uint8_t *data = (const uint8_t *)in->buffers[buf.index].start;
+    DecodeResult result = (in->capture_format == V4L2_PIX_FMT_MJPEG)
+                             ? decode_mjpeg_frame(in, data, buf.bytesused, frame)
+                             : unpack_yuyv_frame(data, buf.bytesused, frame);
 
     // The buffer goes back to the driver regardless of decode outcome --
     // skip this and streaming stalls silently once every buffer has been
@@ -161,6 +213,48 @@ void v4l2_in_close(V4l2In *in) {
     close(in->fd);
 
   free(in);
+}
+
+// Attempts VIDIOC_S_FMT for one pixel format at exactly width x height,
+// logging why on failure -- useful on its own merits (distinguishing "the
+// driver flatly rejected this format" from "it granted a different
+// resolution instead" matters when debugging an unfamiliar camera), and
+// specifically because v4l2_in_open's final fallback-exhausted message
+// doesn't repeat these details itself.
+//
+// Unlike v4l2_out.c's equivalent, a dimension mismatch here has to be
+// treated the same as an outright failure: the frame pool is sized from
+// width/height, and any capture format that doesn't land on them exactly
+// dooms every subsequent frame (see v4l2_in_open's other caller-facing
+// mismatch handling for the full reasoning).
+static bool try_set_format(int fd, uint32_t fourcc, uint32_t width,
+                          uint32_t height, struct v4l2_format *fmt_out) {
+  struct v4l2_format fmt = {0};
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  fmt.fmt.pix.width = width;
+  fmt.fmt.pix.height = height;
+  fmt.fmt.pix.pixelformat = fourcc;
+  fmt.fmt.pix.field = V4L2_FIELD_NONE;
+
+  if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+    printf("v4l2_in: %.4s not accepted at %ux%u: %s\n", (const char *)&fourcc,
+           width, height, strerror(errno));
+    return false;
+  }
+  if (fmt.fmt.pix.pixelformat != fourcc) {
+    printf("v4l2_in: %.4s was not granted (driver substituted a different "
+           "pixel format)\n",
+           (const char *)&fourcc);
+    return false;
+  }
+  if (fmt.fmt.pix.width != width || fmt.fmt.pix.height != height) {
+    printf("v4l2_in: %.4s at %ux%u got %ux%u instead\n", (const char *)&fourcc,
+           width, height, fmt.fmt.pix.width, fmt.fmt.pix.height);
+    return false;
+  }
+
+  *fmt_out = fmt;
+  return true;
 }
 
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
@@ -209,42 +303,28 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
 
-  struct v4l2_format fmt = {0};
-  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  fmt.fmt.pix.width = width;
-  fmt.fmt.pix.height = height;
-  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-  fmt.fmt.pix.field = V4L2_FIELD_NONE;
+  // MJPEG first: at USB2's ~24.6 MB/s isochronous ceiling, most webcams
+  // only offer higher resolutions/framerates through it, reserving raw
+  // YUYV for lower modes (see the framerate/bandwidth discussion this
+  // capture path was designed around). YUYV needs no decode at all, so
+  // it's still preferred over MJPEG at whatever resolution both are
+  // actually available -- try_set_format's exact-match requirement means
+  // this only ever falls through to YUYV when MJPEG genuinely isn't
+  // offered at this resolution, not as a blanket preference.
+  struct v4l2_format fmt;
+  uint32_t capture_format;
 
-  if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-    printf("Failed to set MJPEG capture format on %s: %s\n", path,
-           strerror(errno));
-    close(fd);
-    return NULL;
-  }
-
-  // S_FMT negotiates rather than assigns -- same caveat as v4l2_out.c.
-  if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
-    printf("%s would not give MJPEG at %ux%u; try a different resolution, "
-           "or this camera may need YUYV capture instead (not implemented "
-           "here)\n",
+  if (try_set_format(fd, V4L2_PIX_FMT_MJPEG, width, height, &fmt)) {
+    capture_format = V4L2_PIX_FMT_MJPEG;
+  } else if (try_set_format(fd, V4L2_PIX_FMT_YUYV, width, height, &fmt)) {
+    capture_format = V4L2_PIX_FMT_YUYV;
+    printf("%s: MJPEG not available at exactly %ux%u; falling back to "
+           "YUYV\n",
            path, width, height);
-    close(fd);
-    return NULL;
-  }
-  if (fmt.fmt.pix.width != width || fmt.fmt.pix.height != height) {
-    // Unlike v4l2_out.c's identical-looking check, this one has to be
-    // fatal: the frame pool is sized from the width/height the caller
-    // asked for (eeye.c's compile-time constants), not from whatever got
-    // negotiated here. If those disagree, decode_mjpeg_frame's dimension
-    // check will reject every real capture as DECODE_FORMAT_MISMATCH, and
-    // producer_loop's reconnect loop will just renegotiate this exact same
-    // mismatch forever -- an infinite retry loop instead of one clear
-    // error at open time.
-    printf("%s only offers %ux%u for MJPEG, not the requested %ux%u; "
-           "reconnecting will not fix this -- pick a resolution this "
-           "camera actually supports\n",
-           path, fmt.fmt.pix.width, fmt.fmt.pix.height, width, height);
+  } else {
+    // try_set_format() already logged why each attempt failed.
+    printf("%s: neither MJPEG nor YUYV is available at exactly %ux%u\n",
+           path, width, height);
     close(fd);
     return NULL;
   }
@@ -292,6 +372,7 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
   in->width = fmt.fmt.pix.width;
   in->height = fmt.fmt.pix.height;
   in->n_buffers = req.count;
+  in->capture_format = capture_format;
 
   for (uint32_t i = 0; i < in->n_buffers; i++) {
     struct v4l2_buffer buf = {0};
@@ -330,11 +411,15 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
 
-  in->jpeg_decoder = tjInitDecompress();
-  if (!in->jpeg_decoder) {
-    printf("tjInitDecompress failed: %s\n", tjGetErrorStr());
-    v4l2_in_close(in);
-    return NULL;
+  // YUYV needs no decoder at all -- in->jpeg_decoder stays NULL from
+  // calloc(), which v4l2_in_close() already checks for before tjDestroy().
+  if (in->capture_format == V4L2_PIX_FMT_MJPEG) {
+    in->jpeg_decoder = tjInitDecompress();
+    if (!in->jpeg_decoder) {
+      printf("tjInitDecompress failed: %s\n", tjGetErrorStr());
+      v4l2_in_close(in);
+      return NULL;
+    }
   }
 
   // Probe: capture and decode one real frame before declaring open()
