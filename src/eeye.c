@@ -1,3 +1,9 @@
+// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// ISO mode, which hides write()/STDOUT_FILENO in <unistd.h> unless a
+// feature-test macro asks for them explicitly. Same guard as
+// video_threads.c/config.c.
+#define _POSIX_C_SOURCE 200809L
+
 #include "config.h"
 #include "frame_ring_buffer.h"
 #include "video_frame.h"
@@ -6,6 +12,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <threads.h>
+#include <unistd.h>
 
 constexpr uint32_t frame_width = 1280;
 constexpr uint32_t frame_height = 720;
@@ -14,6 +21,23 @@ FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
 FrameRingBuffer ring_buffer_free;
 atomic_bool is_running = true;
+
+// atomic_store() on a lock-free type and write() are among the few
+// operations POSIX guarantees are safe to call from a signal handler --
+// printf is not one of them, since it can deadlock if the signal lands
+// while the interrupted code already holds stdio's internal lock. This
+// guarantee only holds because atomic_bool is required to be lock-free
+// here: a lock-based atomic would mean this handler could call into a
+// mutex from arbitrary interrupted context, which is not signal-safe.
+static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
+             "is_running must be lock-free to set from a signal handler");
+
+static void handle_shutdown_signal(int sig) {
+  (void)sig;
+  static const char msg[] = "\nShutting down...\n";
+  write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+  atomic_store(&is_running, false);
+}
 
 /*
  * .filename now holds the v4l2 camera device instead of an input file path.
@@ -57,6 +81,16 @@ int main(int argc, char **argv) {
   // would otherwise raise SIGPIPE and kill this whole process. Ignore it and
   // let consumer_loop's ferror(outfile) check handle shutdown gracefully.
   signal(SIGPIPE, SIG_IGN);
+
+  // SIGINT: Ctrl+C from an interactive terminal. SIGTERM: what a service
+  // manager (systemd, etc.) sends on stop/restart -- handling both the same
+  // way means "graceful exit" holds whether this runs at a terminal or as a
+  // deployed service. Both threads and the config watcher already poll
+  // is_running on a bounded interval, so flipping it is the entire job; the
+  // existing join/close/free sequence below is unchanged and runs exactly
+  // as it does on any other shutdown path.
+  signal(SIGINT, handle_shutdown_signal);
+  signal(SIGTERM, handle_shutdown_signal);
 
   const char *config_path = (argc > 1) ? argv[1] : "eeye_config.json";
 
