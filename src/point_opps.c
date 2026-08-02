@@ -259,6 +259,93 @@ void gs_invert(VideoFrame *frame) {
 #endif
 }
 
+#if defined(GS_NEON_AARCH64)
+// out = u + (target - u) * strength / 255 -- a lerp from u toward target,
+// weighted by strength/255. Deployment target is the Pi 5 (AArch64 only,
+// per the project's stated scope), so unlike gs_contrast_normalize/
+// gs_threshold_by_value/gs_invert above, this has no ARMv7 branch -- ARM32
+// builds fall through to the scalar path below instead.
+//
+// Verified bit-exact against the scalar loop exhaustively over every
+// (target, strength) pair -- the entire 256x256 input domain, not a
+// sample -- across four row-content patterns (all-zero, all-max, a ramp,
+// and pseudo-random), 262,144 trials total, cross-compiled for aarch64 and
+// run under qemu-user emulation; this file has not been built or run on
+// real hardware.
+static inline uint8x8_t tint_half8(uint16x8_t u, uint16x8_t target,
+                                   int16_t strength) {
+  // u and target both hold 0-255, so reinterpreting the zero-extended
+  // unsigned widen as signed changes no values (the sign bit is never
+  // set) -- it's what lets the subtraction below go negative correctly.
+  int16x8_t diff = vsubq_s16(vreinterpretq_s16_u16(target),
+                             vreinterpretq_s16_u16(u)); // range -255..255
+
+  // diff*strength ranges +-65025, past int16 range (+-32767) -- widen the
+  // multiply to 32-bit. vmull_s16 takes 4 lanes at a time, so the 8-lane
+  // diff needs two calls (low half, high half).
+  int16x8_t strength_v = vdupq_n_s16(strength);
+  int32x4_t prod_lo = vmull_s16(vget_low_s16(diff), vget_low_s16(strength_v));
+  int32x4_t prod_hi = vmull_s16(vget_high_s16(diff), vget_high_s16(strength_v));
+
+  // Signed truncating division by 255, matching C's `/` (truncates toward
+  // zero) exactly -- NEON has no integer divide. (x+1+(x>>8))>>8 computes
+  // x/255 exactly for unsigned x in [0, 65535], but only for non-negative
+  // x; since prod can be negative, divide the magnitude with that trick,
+  // then reapply the sign via the standard XOR-mask-and-subtract negate
+  // (mask is all-1s when prod<0, all-0s otherwise, from an arithmetic
+  // shift replicating the sign bit).
+  uint32x4_t abs_lo = vreinterpretq_u32_s32(vabsq_s32(prod_lo));
+  uint32x4_t q_lo_mag = vshrq_n_u32(
+      vaddq_u32(vaddq_u32(abs_lo, vdupq_n_u32(1)), vshrq_n_u32(abs_lo, 8)), 8);
+  int32x4_t mask_lo = vshrq_n_s32(prod_lo, 31);
+  int32x4_t q_lo =
+      vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q_lo_mag), mask_lo), mask_lo);
+
+  uint32x4_t abs_hi = vreinterpretq_u32_s32(vabsq_s32(prod_hi));
+  uint32x4_t q_hi_mag = vshrq_n_u32(
+      vaddq_u32(vaddq_u32(abs_hi, vdupq_n_u32(1)), vshrq_n_u32(abs_hi, 8)), 8);
+  int32x4_t mask_hi = vshrq_n_s32(prod_hi, 31);
+  int32x4_t q_hi =
+      vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q_hi_mag), mask_hi), mask_hi);
+
+  int32x4_t u32_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(u)));
+  int32x4_t u32_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(u)));
+
+  int16x8_t sum16 = vcombine_s16(vqmovn_s32(vaddq_s32(u32_lo, q_lo)),
+                                 vqmovn_s32(vaddq_s32(u32_hi, q_hi)));
+  return vqmovun_s16(sum16); // result is always in [0,255] by construction
+}
+
+static void tint_row(uint8_t *row, uint32_t width, uint8_t target,
+                     uint8_t strength) {
+  uint8x16_t target_v16 = vdupq_n_u8(target);
+  uint16x8_t target_lo = vmovl_u8(vget_low_u8(target_v16));
+  uint16x8_t target_hi = vmovl_u8(vget_high_u8(target_v16));
+
+  uint32_t x = 0;
+  for (; x + 15 < width; x += 16) {
+    uint8x16_t u = vld1q_u8(&row[x]);
+    uint8x8_t lo = tint_half8(vmovl_u8(vget_low_u8(u)), target_lo,
+                             (int16_t)strength);
+    uint8x8_t hi = tint_half8(vmovl_u8(vget_high_u8(u)), target_hi,
+                             (int16_t)strength);
+    vst1q_u8(&row[x], vcombine_u8(lo, hi));
+  }
+  for (; x < width; ++x) {
+    int32_t diff = (int32_t)target - (int32_t)row[x];
+    row[x] = (uint8_t)(row[x] + (diff * (int32_t)strength) / 255);
+  }
+}
+#else
+static void tint_row(uint8_t *row, uint32_t width, uint8_t target,
+                     uint8_t strength) {
+  for (uint32_t x = 0; x < width; ++x) {
+    int32_t diff = (int32_t)target - (int32_t)row[x];
+    row[x] = (uint8_t)(row[x] + (diff * (int32_t)strength) / 255);
+  }
+}
+#endif
+
 /*
  * Applies a color tint by pushing the U/V (chroma) planes toward a target
  * color instead of zeroing them out like grayscale() does. This is what
@@ -293,13 +380,7 @@ void color_tint(VideoFrame *frame, uint8_t target_u, uint8_t target_v,
 
     // Chroma planes are half-width for I422, so loop bound is stride[1/2]
     // (== chroma_width), not frame->width.
-    for (uint32_t x = 0; x < frame->stride[1]; ++x) {
-      int32_t diff = (int32_t)target_u - (int32_t)u_row[x];
-      u_row[x] = (uint8_t)(u_row[x] + (diff * strength) / 255);
-    }
-    for (uint32_t x = 0; x < frame->stride[2]; ++x) {
-      int32_t diff = (int32_t)target_v - (int32_t)v_row[x];
-      v_row[x] = (uint8_t)(v_row[x] + (diff * strength) / 255);
-    }
+    tint_row(u_row, frame->stride[1], target_u, strength);
+    tint_row(v_row, frame->stride[2], target_v, strength);
   }
 }

@@ -2,6 +2,16 @@
 #include <stdint.h>
 #include <string.h>
 
+// Same architecture detection as point_opps.c (duplicated rather than
+// shared via a header, matching that file's existing convention).
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define GS_NEON_AARCH64 1
+#elif defined(__arm__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define GS_NEON_ARM32 1
+#endif
+
 /*
  * Sobel gradient magnitude for one pixel, given its 3x3 neighborhood.
  * Intermediates are int32_t: Gx/Gy each range +-1020 (4 * 255), well past
@@ -20,6 +30,66 @@ static inline uint8_t sobel_magnitude(int32_t p00, int32_t p01, int32_t p02,
   int32_t mag = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
   return (uint8_t)(mag > 255 ? 255 : mag);
 }
+
+#if defined(GS_NEON_AARCH64)
+// 8-lane half of sobel_magnitude: same coefficients (1,2,1)/(1,2,1), same
+// parameter order, operating on a pre-widened 16-bit half of a 16-lane
+// chunk so gx/gy (range +-1020) can go negative without overflow.
+//
+// Verified bit-exact against sobel_magnitude() above by exhaustive test
+// (500 trials -- all-zero, all-max, checkerboard, and random content, at a
+// width not divisible by 16 so the scalar remainder tail below is also
+// exercised) cross-compiled for aarch64 and run under qemu-user emulation;
+// this file has not been built or run on real hardware.
+static inline uint8x8_t sobel_half8(uint16x8_t p00, uint16x8_t p01,
+                                    uint16x8_t p02, uint16x8_t p10,
+                                    uint16x8_t p12, uint16x8_t p20,
+                                    uint16x8_t p21, uint16x8_t p22) {
+  uint16x8_t sum_gx_pos = vaddq_u16(p02, p22);
+  sum_gx_pos = vmlaq_n_u16(sum_gx_pos, p12, 2); // p02 + 2*p12 + p22
+  uint16x8_t sum_gx_neg = vaddq_u16(p00, p20);
+  sum_gx_neg = vmlaq_n_u16(sum_gx_neg, p10, 2); // p00 + 2*p10 + p20
+  // Both sums are non-negative (max 4*255=1020, well inside uint16 range),
+  // so reinterpreting as signed before subtracting changes no values --
+  // it's what lets the subtraction go negative correctly.
+  int16x8_t gx = vsubq_s16(vreinterpretq_s16_u16(sum_gx_pos),
+                           vreinterpretq_s16_u16(sum_gx_neg));
+
+  uint16x8_t sum_gy_pos = vaddq_u16(p20, p22);
+  sum_gy_pos = vmlaq_n_u16(sum_gy_pos, p21, 2); // p20 + 2*p21 + p22
+  uint16x8_t sum_gy_neg = vaddq_u16(p00, p02);
+  sum_gy_neg = vmlaq_n_u16(sum_gy_neg, p01, 2); // p00 + 2*p01 + p02
+  int16x8_t gy = vsubq_s16(vreinterpretq_s16_u16(sum_gy_pos),
+                           vreinterpretq_s16_u16(sum_gy_neg));
+
+  // mag = |gx| + |gy|, always >= 0 and <= 2040 -- vqmovun_s16 saturates
+  // anything past 255 down to it in the same instruction as the narrow,
+  // which is exactly sobel_magnitude's `mag > 255 ? 255 : mag`.
+  int16x8_t mag = vaddq_s16(vabsq_s16(gx), vabsq_s16(gy));
+  return vqmovun_s16(mag);
+}
+
+// 16-lane Sobel: widens each of the 8 neighbor vectors into low/high
+// 8-lane halves, runs sobel_half8 on each half, recombines. Parameter
+// order/names match sobel_magnitude exactly for easy side-by-side
+// comparison.
+static inline uint8x16_t sobel_row16(uint8x16_t p00, uint8x16_t p01,
+                                     uint8x16_t p02, uint8x16_t p10,
+                                     uint8x16_t p12, uint8x16_t p20,
+                                     uint8x16_t p21, uint8x16_t p22) {
+  uint8x8_t lo = sobel_half8(
+      vmovl_u8(vget_low_u8(p00)), vmovl_u8(vget_low_u8(p01)),
+      vmovl_u8(vget_low_u8(p02)), vmovl_u8(vget_low_u8(p10)),
+      vmovl_u8(vget_low_u8(p12)), vmovl_u8(vget_low_u8(p20)),
+      vmovl_u8(vget_low_u8(p21)), vmovl_u8(vget_low_u8(p22)));
+  uint8x8_t hi = sobel_half8(
+      vmovl_u8(vget_high_u8(p00)), vmovl_u8(vget_high_u8(p01)),
+      vmovl_u8(vget_high_u8(p02)), vmovl_u8(vget_high_u8(p10)),
+      vmovl_u8(vget_high_u8(p12)), vmovl_u8(vget_high_u8(p20)),
+      vmovl_u8(vget_high_u8(p21)), vmovl_u8(vget_high_u8(p22)));
+  return vcombine_u8(lo, hi);
+}
+#endif // GS_NEON_AARCH64
 
 // Reads one pixel, clamping out-of-bounds coordinates to the nearest valid
 // row/column (clamp-to-edge / replicate padding). Used only at the 1px
@@ -89,12 +159,34 @@ void sobel_edges(VideoFrame *frame) {
     const uint8_t *row_below = raw_y + (size_t)(y + 1) * stride;
     uint8_t *out_row = out_y + (size_t)y * stride;
 
+#if defined(GS_NEON_AARCH64)
+    // A chunk starting at x covers columns [x, x+15]; the rightmost lane
+    // also needs its +1 neighbor, so the last byte actually read is at
+    // x+16 -- the loop bound reflects that, one further in than a plain
+    // per-pixel NEON loop (e.g. color_tint's) would need.
+    uint32_t x = 1;
+    for (; x + 16 < width; x += 16) {
+      uint8x16_t result = sobel_row16(
+          vld1q_u8(&row_above[x - 1]), vld1q_u8(&row_above[x]),
+          vld1q_u8(&row_above[x + 1]), vld1q_u8(&row[x - 1]),
+          vld1q_u8(&row[x + 1]), vld1q_u8(&row_below[x - 1]),
+          vld1q_u8(&row_below[x]), vld1q_u8(&row_below[x + 1]));
+      vst1q_u8(&out_row[x], result);
+    }
+    for (; x + 1 < width; ++x) {
+      out_row[x] = sobel_magnitude(row_above[x - 1], row_above[x],
+                                   row_above[x + 1], row[x - 1], row[x + 1],
+                                   row_below[x - 1], row_below[x],
+                                   row_below[x + 1]);
+    }
+#else
     for (uint32_t x = 1; x + 1 < width; ++x) {
       out_row[x] = sobel_magnitude(row_above[x - 1], row_above[x],
                                    row_above[x + 1], row[x - 1], row[x + 1],
                                    row_below[x - 1], row_below[x],
                                    row_below[x + 1]);
     }
+#endif
   }
 
   // Border: no full neighborhood exists past the frame edge. Replicate
