@@ -4,8 +4,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "video_threads.h"
+#include "conv.h"
 #include "frame_ring_buffer.h"
-#include "point_opps.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
 #include <linux/videodev2.h>
@@ -69,9 +69,12 @@ void *producer_loop(void *arg) {
     frame->pts = pts++;
 
     size_t bytes_read = 0;
-    bytes_read += fread(frame->planes[0], 1, frame->plane_sizes[0], infile);
-    bytes_read += fread(frame->planes[1], 1, frame->plane_sizes[1], infile);
-    bytes_read += fread(frame->planes[2], 1, frame->plane_sizes[2], infile);
+    bytes_read +=
+        fread(frame->raw_planes[0], 1, frame->plane_sizes[0], infile);
+    bytes_read +=
+        fread(frame->raw_planes[1], 1, frame->plane_sizes[1], infile);
+    bytes_read +=
+        fread(frame->raw_planes[2], 1, frame->plane_sizes[2], infile);
 
     if (bytes_read < (frame->plane_sizes[0] + frame->plane_sizes[1] +
                       frame->plane_sizes[2])) {
@@ -92,10 +95,6 @@ void *producer_loop(void *arg) {
   return NULL;
 }
 
-#define TINT_SEPIA_U 90
-#define TINT_SEPIA_V 0
-#define TINT_SEPIA_STRENGTH 255
-
 void *effects_loop(void *arg) {
   WorkerArgs *args = (WorkerArgs *)arg;
   while (
@@ -111,7 +110,7 @@ void *effects_loop(void *arg) {
       continue;
     }
 
-    color_tint(frame, TINT_SEPIA_U, TINT_SEPIA_V, TINT_SEPIA_STRENGTH);
+    sobel_edges(frame);
 
     while (!ring_push(args->ring_buffer_out, frame)) {
       sleep_us(100);

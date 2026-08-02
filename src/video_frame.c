@@ -57,6 +57,20 @@ VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts) {
   frame->planes[1] = frame->pixel_data + y_size;
   frame->planes[2] = frame->pixel_data + y_size + u_size;
 
+  // Separate allocation, not a slice of pixel_data: raw and work need to
+  // remain independently writable, and giving raw its own block means an
+  // out-of-bounds write into one can never corrupt the other.
+  frame->raw_data = (uint8_t *)malloc(y_size + u_size + v_size);
+  if (!frame->raw_data) {
+    free(frame->pixel_data);
+    free(frame);
+    return NULL;
+  }
+
+  frame->raw_planes[0] = frame->raw_data;
+  frame->raw_planes[1] = frame->raw_data + y_size;
+  frame->raw_planes[2] = frame->raw_data + y_size + u_size;
+
   return frame;
 }
 
@@ -66,6 +80,10 @@ void vf_free(VideoFrame *frame) {
 
   if (frame->pixel_data) {
     free(frame->pixel_data);
+  }
+
+  if (frame->raw_data) {
+    free(frame->raw_data);
   }
 
   free(frame);
