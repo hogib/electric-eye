@@ -1,48 +1,112 @@
 #include "conv.h"
+#include <stdint.h>
 #include <string.h>
 
 /*
- * TODO(you): replace the body below with the real Sobel gradient.
- *
- * Contract sobel_edges() must satisfy:
- *
- *   - Read only frame->raw_planes[0..2]. Never touch frame->planes as a
- *     source -- that's the write side.
- *
- *   - Write the *entirety* of frame->planes[0..2]. Nothing upstream
- *     initializes the work buffer anymore now that raw and work are
- *     separate allocations (see video_frame.h), so any pixel this function
- *     doesn't write is whatever garbage was left in that pool slot two
- *     cycles ago.
- *
- *   - planes[1]/planes[2] (chroma) should end up flat at 128 -- a pure
- *     edge map has no color, same as grayscale() in point_opps.c.
- *
- *   - planes[0] (Y) should hold |Gx| + |Gy| clamped to [0, 255] for every
- *     pixel, computed from the 3x3 neighborhood around that pixel in
- *     raw_planes[0]. Use int16_t/int32_t intermediates -- Gx and Gy each
- *     range roughly +-1020, well outside uint8_t.
- *
- *   - The 1px border has no full 3x3 neighborhood. Decide explicitly:
- *     zero it, or replicate the nearest interior row/column. Leaving it
- *     unwritten fails the "write the entirety" rule above.
- *
- * Because raw and planes are different buffers, this loop can run with
- * #pragma omp parallel for over rows with no banding/ordering concerns --
- * there's nothing here like the rolling-scratch write-behind trick that
- * would need loop-carried state.
- *
- * What's below is a placeholder, not a step toward the real thing: raw Y
- * copied straight through, chroma neutralized. It satisfies the contract
- * (builds, runs, produces real output) so the raw/work plumbing can be
- * verified before the gradient math exists. Delete it once the real loop
- * covers every pixel.
+ * Sobel gradient magnitude for one pixel, given its 3x3 neighborhood.
+ * Intermediates are int32_t: Gx/Gy each range +-1020 (4 * 255), well past
+ * what int8_t/uint8_t hold, and the sum of their magnitudes needs headroom
+ * past that before the final clamp.
  */
+static inline uint8_t sobel_magnitude(int32_t p00, int32_t p01, int32_t p02,
+                                      int32_t p10, int32_t p12, int32_t p20,
+                                      int32_t p21, int32_t p22) {
+  int32_t gx = (p02 + 2 * p12 + p22) - (p00 + 2 * p10 + p20);
+  int32_t gy = (p20 + 2 * p21 + p22) - (p00 + 2 * p01 + p02);
+
+  // |Gx| + |Gy| (L1) instead of sqrt(Gx^2 + Gy^2) (L2, the "true" gradient
+  // magnitude): visually near-identical, no float, no sqrt -- this is what
+  // realtime edge detectors use in practice.
+  int32_t mag = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+  return (uint8_t)(mag > 255 ? 255 : mag);
+}
+
+// Reads one pixel, clamping out-of-bounds coordinates to the nearest valid
+// row/column (clamp-to-edge / replicate padding). Used only at the 1px
+// frame border, where a full 3x3 neighborhood runs off the edge.
+static inline uint8_t clamped_sample(const uint8_t *y_plane, size_t stride,
+                                     uint32_t width, uint32_t height,
+                                     int32_t x, int32_t y) {
+  if (x < 0)
+    x = 0;
+  else if (x >= (int32_t)width)
+    x = (int32_t)width - 1;
+
+  if (y < 0)
+    y = 0;
+  else if (y >= (int32_t)height)
+    y = (int32_t)height - 1;
+
+  return y_plane[(size_t)y * stride + (size_t)x];
+}
+
+// Sobel at (x, y) via clamped sampling. Only for the border: it re-derives
+// all 8 neighbor coordinates and re-checks bounds on every call, which is
+// wasted work in the interior where bounds are already known to be safe.
+static inline uint8_t sobel_at_clamped(const uint8_t *y_plane, size_t stride,
+                                       uint32_t width, uint32_t height,
+                                       int32_t x, int32_t y) {
+  return sobel_magnitude(
+      clamped_sample(y_plane, stride, width, height, x - 1, y - 1),
+      clamped_sample(y_plane, stride, width, height, x, y - 1),
+      clamped_sample(y_plane, stride, width, height, x + 1, y - 1),
+      clamped_sample(y_plane, stride, width, height, x - 1, y),
+      clamped_sample(y_plane, stride, width, height, x + 1, y),
+      clamped_sample(y_plane, stride, width, height, x - 1, y + 1),
+      clamped_sample(y_plane, stride, width, height, x, y + 1),
+      clamped_sample(y_plane, stride, width, height, x + 1, y + 1));
+}
+
 void sobel_edges(VideoFrame *frame) {
-  if (!frame)
+  if (!frame || !frame->raw_planes[0] || !frame->planes[0])
     return;
 
-  memcpy(frame->planes[0], frame->raw_planes[0], frame->plane_sizes[0]);
+  const uint8_t *raw_y = frame->raw_planes[0];
+  uint8_t *out_y = frame->planes[0];
+  uint32_t width = frame->width;
+  uint32_t height = frame->height;
+  size_t stride = frame->stride[0];
+
+  // Interior: every pixel here has a full 3x3 neighborhood, so read directly
+  // through pointers instead of through clamped_sample's bounds checks. This
+  // is the hot loop -- every pixel except a 1px frame border.
+  //
+  // raw_y is never written by this function (or anything else once the
+  // producer has filled it), so overlapping reads of the same row by
+  // adjacent thread chunks -- row y+1 is both "row_below" for chunk N and
+  // "row_above" for chunk N+1 -- are safe with no synchronization. That is
+  // the property the raw/work split exists to buy.
+#pragma omp parallel for
+  for (uint32_t y = 1; y + 1 < height; ++y) {
+    const uint8_t *row_above = raw_y + (size_t)(y - 1) * stride;
+    const uint8_t *row = raw_y + (size_t)y * stride;
+    const uint8_t *row_below = raw_y + (size_t)(y + 1) * stride;
+    uint8_t *out_row = out_y + (size_t)y * stride;
+
+    for (uint32_t x = 1; x + 1 < width; ++x) {
+      out_row[x] = sobel_magnitude(row_above[x - 1], row_above[x],
+                                   row_above[x + 1], row[x - 1], row[x + 1],
+                                   row_below[x - 1], row_below[x],
+                                   row_below[x + 1]);
+    }
+  }
+
+  // Border: no full neighborhood exists past the frame edge. Replicate
+  // rather than zero-pad -- zero-padding a bright edge would read as a false
+  // hard line running along the frame boundary that has nothing to do with
+  // the actual scene.
+  for (uint32_t x = 0; x < width; ++x) {
+    out_y[x] = sobel_at_clamped(raw_y, stride, width, height, (int32_t)x, 0);
+    out_y[(size_t)(height - 1) * stride + x] = sobel_at_clamped(
+        raw_y, stride, width, height, (int32_t)x, (int32_t)height - 1);
+  }
+  for (uint32_t y = 1; y + 1 < height; ++y) {
+    out_y[(size_t)y * stride] =
+        sobel_at_clamped(raw_y, stride, width, height, 0, (int32_t)y);
+    out_y[(size_t)y * stride + (width - 1)] = sobel_at_clamped(
+        raw_y, stride, width, height, (int32_t)width - 1, (int32_t)y);
+  }
+
   memset(frame->planes[1], 128, frame->plane_sizes[1]);
   memset(frame->planes[2], 128, frame->plane_sizes[2]);
 }
