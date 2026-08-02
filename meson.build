@@ -12,6 +12,12 @@ project(
 cc = meson.get_compiler('c')
 m_dep = cc.find_library('m', required: false)
 
+# frame_ring_buffer.c now uses pthread_mutex_t/sem_t directly (previously
+# pthread linkage was only ever pulled in incidentally through
+# pthread_create() elsewhere) -- declare it explicitly rather than rely on
+# whichever glibc happens to already fold pthread into libc.
+thread_dep = dependency('threads')
+
 # Both the capture side (v4l2_in.c) and the output side (v4l2_out.c) now
 # talk to /dev/videoN directly via V4L2 ioctls and MMAP streaming -- the
 # ffmpeg CLI subprocess this project used to shell out to for both ends is
@@ -62,7 +68,11 @@ dep = declare_dependency(
     include_directories: include_directories('src/'),
 )
 
-executable(exe_name, sources: src, dependencies: [m_dep, turbojpeg_dep, omp_dep])
+executable(
+    exe_name,
+    sources: src,
+    dependencies: [m_dep, turbojpeg_dep, omp_dep, thread_dep],
+)
 
 
 

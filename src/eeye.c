@@ -201,5 +201,8 @@ int main(int argc, char **argv) {
   printf("Processing complete. Pipeline shut down cleanly.\n");
   config_watch_stop(config_watcher);
   vf_pool_free(pool, pool_size);
+  ring_destroy(&ring_buffer_in);
+  ring_destroy(&ring_buffer_out);
+  ring_destroy(&ring_buffer_free);
   return 0;
 }

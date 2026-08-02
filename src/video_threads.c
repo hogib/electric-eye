@@ -67,12 +67,8 @@ void *producer_loop(void *arg) {
     while (atomic_load(args->is_running)) {
       VideoFrame *frame = NULL;
 
-      while (!ring_pop(args->ring_buffer_free, (void **)&frame) &&
-             atomic_load(args->is_running)) {
-        sleep_us(100);
-      }
-
-      if (!frame)
+      if (!ring_pop_wait(args->ring_buffer_free, (void **)&frame,
+                        args->is_running))
         break; // shutting down while waiting for a free buffer
 
       frame->pts = pts++;
@@ -85,15 +81,14 @@ void *producer_loop(void *arg) {
         // wiggle or a brief power drop, replugging fixes it without ever
         // needing a restart.
         printf("Camera capture failed; will attempt to reconnect.\n");
-        while (!ring_push(args->ring_buffer_free, frame))
-          sleep_us(10);
+        // NULL: this frame must go back to the pool regardless of
+        // is_running -- abandoning it here would leak it out of the pool
+        // for the rest of the process's life.
+        ring_push_wait(args->ring_buffer_free, frame, NULL);
         break;
       }
 
-      while (!ring_push(args->ring_buffer_in, frame) &&
-             atomic_load(args->is_running)) {
-        sleep_us(100);
-      }
+      ring_push_wait(args->ring_buffer_in, frame, args->is_running);
     }
 
     v4l2_in_close(in);
@@ -112,8 +107,11 @@ void *effects_loop(void *arg) {
 
     VideoFrame *frame = NULL;
 
-    if (!ring_pop(args->ring_buffer_in, (void **)&frame)) {
-      sleep_us(100);
+    if (!ring_pop_wait(args->ring_buffer_in, (void **)&frame,
+                      args->is_running)) {
+      // is_running is false; the loop condition above will end the loop
+      // once ring_buffer_in is confirmed drained (or send us back here to
+      // wait again, if something was pushed in the interim).
       continue;
     }
 
@@ -156,9 +154,9 @@ void *effects_loop(void *arg) {
       }
     }
 
-    while (!ring_push(args->ring_buffer_out, frame)) {
-      sleep_us(100);
-    }
+    // NULL: a fully-processed frame must reach the consumer regardless of
+    // is_running -- abandoning it here would leak it out of the pool.
+    ring_push_wait(args->ring_buffer_out, frame, NULL);
   }
   return NULL;
 }
@@ -181,8 +179,8 @@ void *consumer_loop(void *arg) {
 
     VideoFrame *frame = NULL;
 
-    if (!ring_pop(args->ring_buffer_out, (void **)&frame)) {
-      sleep_us(100);
+    if (!ring_pop_wait(args->ring_buffer_out, (void **)&frame,
+                      args->is_running)) {
       continue;
     }
 
@@ -190,15 +188,17 @@ void *consumer_loop(void *arg) {
       // The loopback device went away or rejected the frame. Stop the whole
       // pipeline rather than spinning on a dead device.
       printf("Virtual camera write failed; shutting down.\n");
-      while (!ring_push(args->ring_buffer_free, frame))
-        sleep_us(10);
+      // NULL: this frame must go back to the pool regardless of
+      // is_running (which the very next line is about to clear anyway).
+      ring_push_wait(args->ring_buffer_free, frame, NULL);
       atomic_store(args->is_running, false);
       break;
     }
 
-    while (!ring_push(args->ring_buffer_free, frame)) {
-      sleep_us(100);
-    }
+    // NULL: same as every other pushback to the free-list ring -- must not
+    // be abandoned on shutdown, or the frame leaks out of the pool. This is
+    // the hot path: every single processed frame returns to the pool here.
+    ring_push_wait(args->ring_buffer_free, frame, NULL);
   }
 
   v4l2_out_close(out);
