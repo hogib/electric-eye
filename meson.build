@@ -30,6 +30,7 @@ endif
 
 src = [
     'src/eeye.c',
+    'src/config.c',
     'src/conv.c',
     'src/frame_ring_buffer.c',
     'src/video_frame.c',

@@ -6,6 +6,7 @@
 #include "video_threads.h"
 #include "conv.h"
 #include "frame_ring_buffer.h"
+#include "point_opps.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
 #include <linux/videodev2.h>
@@ -13,6 +14,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <threads.h>
 
 /*
@@ -110,7 +112,44 @@ void *effects_loop(void *arg) {
       continue;
     }
 
-    sobel_edges(frame);
+    // One snapshot per frame, not per effect: this guarantees a config push
+    // landing mid-processing can't split a single output frame between old
+    // and new parameters.
+    const Config *cfg = config_current(args->config);
+
+    if (cfg->effect == EFFECT_SOBEL) {
+      // Sobel overwrites every byte of the work buffer itself (see
+      // conv.c), so unlike the point ops below it needs no fresh copy from
+      // raw first.
+      sobel_edges(frame);
+    } else {
+      // Every other effect here is a point op inherited from before the
+      // raw/work split: it mutates frame->planes in place, assuming that
+      // buffer already holds the current frame. Now that raw and work are
+      // separate allocations, nothing else keeps work fresh, so refresh it
+      // here before handing off.
+      size_t total = frame->plane_sizes[0] + frame->plane_sizes[1] +
+                     frame->plane_sizes[2];
+      memcpy(frame->pixel_data, frame->raw_data, total);
+
+      switch (cfg->effect) {
+      case EFFECT_GRAYSCALE:
+        grayscale(frame);
+        break;
+      case EFFECT_INVERT:
+        gs_invert(frame);
+        break;
+      case EFFECT_THRESHOLD:
+        gs_threshold_by_value(frame, cfg->threshold_value);
+        break;
+      case EFFECT_TINT:
+        color_tint(frame, cfg->tint_u, cfg->tint_v, cfg->tint_strength);
+        break;
+      case EFFECT_NONE:
+      case EFFECT_SOBEL: // unreachable, handled in the branch above
+        break;
+      }
+    }
 
     while (!ring_push(args->ring_buffer_out, frame)) {
       sleep_us(100);

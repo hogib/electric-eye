@@ -1,4 +1,5 @@
 #pragma once
+#include "config.h"
 #include "frame_ring_buffer.h"
 #include <stdatomic.h>
 #include <stdint.h>
@@ -25,6 +26,7 @@ typedef struct {
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_in;
   FrameRingBuffer *ring_buffer_out;
+  const ConfigWatcher *config;
   uint32_t frame_width;
   uint32_t frame_height;
 } WorkerArgs;

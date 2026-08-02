@@ -1,3 +1,4 @@
+#include "config.h"
 #include "frame_ring_buffer.h"
 #include "video_frame.h"
 #include "video_threads.h"
@@ -32,6 +33,8 @@ ProducerArgs prod_args = {.filename = "/dev/video0",
                           .frame_width = frame_width,
                           .frame_height = frame_height};
 
+// .config is filled in by main() once config_watch_start() has run --
+// building the watcher needs is_running, which isn't available until then.
 WorkerArgs work_args = {
     .is_running = &is_running,
     .ring_buffer_in = &ring_buffer_in,
@@ -49,11 +52,13 @@ ConsumerArgs cons_args = {
     .frame_height = frame_height,
 };
 
-int main(void) {
+int main(int argc, char **argv) {
   // If the output ffmpeg (virtual cam) process dies/exits, writes to its pipe
   // would otherwise raise SIGPIPE and kill this whole process. Ignore it and
   // let consumer_loop's ferror(outfile) check handle shutdown gracefully.
   signal(SIGPIPE, SIG_IGN);
+
+  const char *config_path = (argc > 1) ? argv[1] : "eeye_config.json";
 
   printf("Initializing pipeline...\n");
   ring_init(&ring_buffer_in);
@@ -72,6 +77,13 @@ int main(void) {
   }
 
   atomic_store(&is_running, true);
+
+  ConfigWatcher *config_watcher = config_watch_start(config_path, &is_running);
+  if (!config_watcher) {
+    printf("Error: Failed to start config watcher.\n");
+    return 1;
+  }
+  work_args.config = config_watcher;
 
   pthread_t producer, worker, consumer;
   if (pthread_create(&producer, NULL, producer_loop, &prod_args) != 0) {
@@ -96,6 +108,7 @@ int main(void) {
   pthread_join(consumer, NULL);
 
   printf("Processing complete. Pipeline shut down cleanly.\n");
+  config_watch_stop(config_watcher);
   vf_pool_free(pool, pool_size);
   return 0;
 }
