@@ -163,8 +163,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // ring_push_wait, not the plain ring_push: the latter only updates the
+  // lock-free head/tail queue and never touches the filled/empty
+  // semaphores ring_pop_wait actually waits on, which left every one of
+  // these frames invisible to producer_loop -- the ring held them, but
+  // nothing was ever posted to say so. NULL is safe here (never give up
+  // rather than abandon a frame) since is_running is already true and
+  // there is always exactly enough room: pool_size == ring_buffer_size - 1,
+  // matching empty's initial capacity exactly.
   for (unsigned int i = 0; i < pool_size; ++i) {
-    ring_push(&ring_buffer_free, pool[i]);
+    ring_push_wait(&ring_buffer_free, pool[i], NULL);
   }
 
   atomic_store(&is_running, true);
