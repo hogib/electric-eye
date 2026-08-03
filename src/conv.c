@@ -223,6 +223,49 @@ static inline uint8_t blur5(int32_t p0, int32_t p1, int32_t p2, int32_t p3,
   return (uint8_t)((p0 + 4 * p1 + 6 * p2 + 4 * p3 + p4 + 8) >> 4);
 }
 
+#if defined(GS_NEON_AARCH64)
+// 8-lane half of blur5: same weights (1,4,6,4,1)/16, same parameter order,
+// on a pre-widened 16-bit half so the running sum (max 255*16=4080) can't
+// overflow. The +8 before the shift is the same round-to-nearest bias
+// blur5 adds, done here so vshrn_n_u16's plain truncating narrow-shift
+// matches blur5's `(... + 8) >> 4` exactly -- no separate rounding
+// instruction needed.
+//
+// Verified bit-exact against blur5() by exhaustive test (500 trials --
+// all-zero, all-max, checkerboard, and random content, at a width not
+// divisible by 16 so the scalar remainder tail is also exercised)
+// cross-compiled for aarch64 and run under qemu-user emulation; this file
+// has not been built or run on real hardware.
+static inline uint8x8_t blur5_half8(uint16x8_t p0, uint16x8_t p1,
+                                    uint16x8_t p2, uint16x8_t p3,
+                                    uint16x8_t p4) {
+  uint16x8_t sum = vaddq_u16(p0, p4);
+  sum = vmlaq_n_u16(sum, p1, 4);
+  sum = vmlaq_n_u16(sum, p3, 4);
+  sum = vmlaq_n_u16(sum, p2, 6);
+  sum = vaddq_u16(sum, vdupq_n_u16(8));
+  // Every lane's sum here is <= 4088 (255*16 + 8), so sum >> 4 <= 255.5
+  // truncated to 255 -- always fits the low 8 bits vshrn_n_u16 keeps, same
+  // as blur5's plain uint8_t cast never needing to saturate.
+  return vshrn_n_u16(sum, 4);
+}
+
+// 16-lane blur5: widens each of the 5 neighbor vectors into low/high 8-lane
+// halves, runs blur5_half8 on each half, recombines. Parameter order/names
+// match blur5 exactly for easy side-by-side comparison.
+static inline uint8x16_t blur5_row16(uint8x16_t p0, uint8x16_t p1,
+                                     uint8x16_t p2, uint8x16_t p3,
+                                     uint8x16_t p4) {
+  uint8x8_t lo = blur5_half8(vmovl_u8(vget_low_u8(p0)), vmovl_u8(vget_low_u8(p1)),
+                             vmovl_u8(vget_low_u8(p2)), vmovl_u8(vget_low_u8(p3)),
+                             vmovl_u8(vget_low_u8(p4)));
+  uint8x8_t hi = blur5_half8(vmovl_u8(vget_high_u8(p0)), vmovl_u8(vget_high_u8(p1)),
+                             vmovl_u8(vget_high_u8(p2)), vmovl_u8(vget_high_u8(p3)),
+                             vmovl_u8(vget_high_u8(p4)));
+  return vcombine_u8(lo, hi);
+}
+#endif // GS_NEON_AARCH64
+
 // Scratch for blur_plane's horizontal pass, grown lazily to the largest
 // plane a caller has asked for so far and reused across the Y/U/V calls
 // within one gaussian_blur() invocation (sequential, never concurrent, so
@@ -262,6 +305,44 @@ static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
   for (uint32_t y = 0; y < height; ++y) {
     const uint8_t *row = src + (size_t)y * stride;
     uint8_t *out_row = blur_scratch + (size_t)y * width;
+
+#if defined(GS_NEON_AARCH64)
+    uint32_t x = 0;
+    // x < 2 always needs the left-edge clamp, so it's left to the same
+    // clamped formula as the tail loop below rather than folded into the
+    // NEON chunk.
+    for (; x < 2 && x < width; ++x) {
+      int32_t xm2 = (int32_t)x < 2 ? 0 : (int32_t)x - 2;
+      int32_t xm1 = (int32_t)x < 1 ? 0 : (int32_t)x - 1;
+      int32_t xp1 =
+          (int32_t)x + 1 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 1;
+      int32_t xp2 =
+          (int32_t)x + 2 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 2;
+      out_row[x] = blur5(row[xm2], row[xm1], row[x], row[xp1], row[xp2]);
+    }
+    // A chunk starting at x covers columns [x, x+15]; the rightmost lane
+    // also needs its +2 neighbor, so the last byte actually read is at
+    // x+17 -- the loop bound reflects that (one further in than Sobel's
+    // equivalent chunk, which only needs a +1 neighbor).
+    for (; x + 17 < width; x += 16) {
+      uint8x16_t result =
+          blur5_row16(vld1q_u8(&row[x - 2]), vld1q_u8(&row[x - 1]),
+                     vld1q_u8(&row[x]), vld1q_u8(&row[x + 1]),
+                     vld1q_u8(&row[x + 2]));
+      vst1q_u8(&out_row[x], result);
+    }
+    // Tail: whatever the NEON loop above didn't cover (a non-multiple-of-16
+    // remainder, and/or the true right edge needing its own clamp).
+    for (; x < width; ++x) {
+      int32_t xm2 = (int32_t)x < 2 ? 0 : (int32_t)x - 2;
+      int32_t xm1 = (int32_t)x < 1 ? 0 : (int32_t)x - 1;
+      int32_t xp1 =
+          (int32_t)x + 1 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 1;
+      int32_t xp2 =
+          (int32_t)x + 2 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 2;
+      out_row[x] = blur5(row[xm2], row[xm1], row[x], row[xp1], row[xp2]);
+    }
+#else
     for (uint32_t x = 0; x < width; ++x) {
       int32_t xm2 = (int32_t)x < 2 ? 0 : (int32_t)x - 2;
       int32_t xm1 = (int32_t)x < 1 ? 0 : (int32_t)x - 1;
@@ -271,6 +352,7 @@ static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
           (int32_t)x + 2 >= (int32_t)width ? (int32_t)width - 1 : (int32_t)x + 2;
       out_row[x] = blur5(row[xm2], row[xm1], row[x], row[xp1], row[xp2]);
     }
+#endif
   }
 
   // Vertical: blur_scratch -> dst.
@@ -290,9 +372,26 @@ static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
     const uint8_t *r_p2 = blur_scratch + (size_t)yp2 * width;
     uint8_t *out_row = dst + (size_t)y * stride;
 
+    // No per-x clamping needed here, unlike the horizontal pass: y was
+    // already clamped once above (r_m2..r_p2 are five valid, in-bounds
+    // rows), and every column in a row is equally safe to read, so the
+    // NEON chunk can cover the whole width down to a plain remainder tail.
+#if defined(GS_NEON_AARCH64)
+    uint32_t x = 0;
+    for (; x + 16 <= width; x += 16) {
+      uint8x16_t result =
+          blur5_row16(vld1q_u8(&r_m2[x]), vld1q_u8(&r_m1[x]), vld1q_u8(&r_0[x]),
+                     vld1q_u8(&r_p1[x]), vld1q_u8(&r_p2[x]));
+      vst1q_u8(&out_row[x], result);
+    }
+    for (; x < width; ++x) {
+      out_row[x] = blur5(r_m2[x], r_m1[x], r_0[x], r_p1[x], r_p2[x]);
+    }
+#else
     for (uint32_t x = 0; x < width; ++x) {
       out_row[x] = blur5(r_m2[x], r_m1[x], r_0[x], r_p1[x], r_p2[x]);
     }
+#endif
   }
 }
 
@@ -301,11 +400,6 @@ static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
 // work as a standalone soft-focus effect on its own, not only as Sobel
 // preprocessing, and blurring luma while leaving chroma sharp would look
 // visually inconsistent (fine detail in color, none in brightness).
-//
-// No NEON path yet -- scalar with the same OpenMP row-parallelism as
-// everything else in this file. A real candidate for a follow-up, but this
-// change was already large enough without a second cross-compiled/
-// QEMU-verified kernel in the same sweep.
 void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
                    uint32_t width, uint32_t height, const size_t stride[3]) {
   if (!src_planes[0] || !dst_planes[0])
