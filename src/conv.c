@@ -19,9 +19,13 @@
  * what int8_t/uint8_t hold, and the sum of their magnitudes needs headroom
  * past that before the final clamp.
  */
+// threshold: magnitudes below this are clamped to 0, applied after the
+// 255 clamp -- so e.g. threshold=0 (the default; see EffectStage in
+// config.h) keeps every magnitude exactly as computed.
 static inline uint8_t sobel_magnitude(int32_t p00, int32_t p01, int32_t p02,
                                       int32_t p10, int32_t p12, int32_t p20,
-                                      int32_t p21, int32_t p22) {
+                                      int32_t p21, int32_t p22,
+                                      uint8_t threshold) {
   int32_t gx = (p02 + 2 * p12 + p22) - (p00 + 2 * p10 + p20);
   int32_t gy = (p20 + 2 * p21 + p22) - (p00 + 2 * p01 + p02);
 
@@ -29,7 +33,8 @@ static inline uint8_t sobel_magnitude(int32_t p00, int32_t p01, int32_t p02,
   // magnitude): visually near-identical, no float, no sqrt -- this is what
   // realtime edge detectors use in practice.
   int32_t mag = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
-  return (uint8_t)(mag > 255 ? 255 : mag);
+  uint8_t clamped = (uint8_t)(mag > 255 ? 255 : mag);
+  return clamped < threshold ? 0 : clamped;
 }
 
 #if defined(GS_NEON_AARCH64)
@@ -71,13 +76,19 @@ static inline uint8x8_t sobel_half8(uint16x8_t p00, uint16x8_t p01,
 }
 
 // 16-lane Sobel: widens each of the 8 neighbor vectors into low/high
-// 8-lane halves, runs sobel_half8 on each half, recombines. Parameter
+// 8-lane halves, runs sobel_half8 on each half (unchanged, unthresholded --
+// keeps that already-verified kernel untouched), recombines, then applies
+// threshold as a post-step: mask = (mag >= threshold) ? 0xFF : 0x00,
+// result = mag & mask. For any mag/threshold in [0,255] that's exactly
+// `mag < threshold ? 0 : mag` -- mag & 0xFF is mag itself, mag & 0 is 0 --
+// matching sobel_magnitude()'s scalar formula bit-for-bit. Parameter
 // order/names match sobel_magnitude exactly for easy side-by-side
 // comparison.
 static inline uint8x16_t sobel_row16(uint8x16_t p00, uint8x16_t p01,
                                      uint8x16_t p02, uint8x16_t p10,
                                      uint8x16_t p12, uint8x16_t p20,
-                                     uint8x16_t p21, uint8x16_t p22) {
+                                     uint8x16_t p21, uint8x16_t p22,
+                                     uint8x16_t threshold_vec) {
   uint8x8_t lo = sobel_half8(
       vmovl_u8(vget_low_u8(p00)), vmovl_u8(vget_low_u8(p01)),
       vmovl_u8(vget_low_u8(p02)), vmovl_u8(vget_low_u8(p10)),
@@ -88,7 +99,9 @@ static inline uint8x16_t sobel_row16(uint8x16_t p00, uint8x16_t p01,
       vmovl_u8(vget_high_u8(p02)), vmovl_u8(vget_high_u8(p10)),
       vmovl_u8(vget_high_u8(p12)), vmovl_u8(vget_high_u8(p20)),
       vmovl_u8(vget_high_u8(p21)), vmovl_u8(vget_high_u8(p22)));
-  return vcombine_u8(lo, hi);
+  uint8x16_t mag = vcombine_u8(lo, hi);
+  uint8x16_t mask = vcgeq_u8(mag, threshold_vec);
+  return vandq_u8(mag, mask);
 }
 #endif // GS_NEON_AARCH64
 
@@ -116,7 +129,8 @@ static inline uint8_t clamped_sample(const uint8_t *y_plane, size_t stride,
 // wasted work in the interior where bounds are already known to be safe.
 static inline uint8_t sobel_at_clamped(const uint8_t *y_plane, size_t stride,
                                        uint32_t width, uint32_t height,
-                                       int32_t x, int32_t y) {
+                                       int32_t x, int32_t y,
+                                       uint8_t threshold) {
   return sobel_magnitude(
       clamped_sample(y_plane, stride, width, height, x - 1, y - 1),
       clamped_sample(y_plane, stride, width, height, x, y - 1),
@@ -125,17 +139,21 @@ static inline uint8_t sobel_at_clamped(const uint8_t *y_plane, size_t stride,
       clamped_sample(y_plane, stride, width, height, x + 1, y),
       clamped_sample(y_plane, stride, width, height, x - 1, y + 1),
       clamped_sample(y_plane, stride, width, height, x, y + 1),
-      clamped_sample(y_plane, stride, width, height, x + 1, y + 1));
+      clamped_sample(y_plane, stride, width, height, x + 1, y + 1), threshold);
 }
 
 void sobel_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
-                 uint32_t width, uint32_t height, const size_t stride_arr[3]) {
+                 uint32_t width, uint32_t height, const size_t stride_arr[3],
+                 uint8_t threshold) {
   if (!src_planes[0] || !dst_planes[0])
     return;
 
   const uint8_t *raw_y = src_planes[0];
   uint8_t *out_y = dst_planes[0];
   size_t stride = stride_arr[0];
+#if defined(GS_NEON_AARCH64)
+  uint8x16_t threshold_vec = vdupq_n_u8(threshold);
+#endif
 
   // Interior: every pixel here has a full 3x3 neighborhood, so read directly
   // through pointers instead of through clamped_sample's bounds checks. This
@@ -170,21 +188,21 @@ void sobel_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3
           vld1q_u8(&row_above[x - 1]), vld1q_u8(&row_above[x]),
           vld1q_u8(&row_above[x + 1]), vld1q_u8(&row[x - 1]),
           vld1q_u8(&row[x + 1]), vld1q_u8(&row_below[x - 1]),
-          vld1q_u8(&row_below[x]), vld1q_u8(&row_below[x + 1]));
+          vld1q_u8(&row_below[x]), vld1q_u8(&row_below[x + 1]), threshold_vec);
       vst1q_u8(&out_row[x], result);
     }
     for (; x + 1 < width; ++x) {
       out_row[x] = sobel_magnitude(row_above[x - 1], row_above[x],
                                    row_above[x + 1], row[x - 1], row[x + 1],
                                    row_below[x - 1], row_below[x],
-                                   row_below[x + 1]);
+                                   row_below[x + 1], threshold);
     }
 #else
     for (uint32_t x = 1; x + 1 < width; ++x) {
       out_row[x] = sobel_magnitude(row_above[x - 1], row_above[x],
                                    row_above[x + 1], row[x - 1], row[x + 1],
                                    row_below[x - 1], row_below[x],
-                                   row_below[x + 1]);
+                                   row_below[x + 1], threshold);
     }
 #endif
   }
@@ -194,15 +212,18 @@ void sobel_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3
   // hard line running along the frame boundary that has nothing to do with
   // the actual scene.
   for (uint32_t x = 0; x < width; ++x) {
-    out_y[x] = sobel_at_clamped(raw_y, stride, width, height, (int32_t)x, 0);
-    out_y[(size_t)(height - 1) * stride + x] = sobel_at_clamped(
-        raw_y, stride, width, height, (int32_t)x, (int32_t)height - 1);
+    out_y[x] =
+        sobel_at_clamped(raw_y, stride, width, height, (int32_t)x, 0, threshold);
+    out_y[(size_t)(height - 1) * stride + x] =
+        sobel_at_clamped(raw_y, stride, width, height, (int32_t)x,
+                         (int32_t)height - 1, threshold);
   }
   for (uint32_t y = 1; y + 1 < height; ++y) {
-    out_y[(size_t)y * stride] =
-        sobel_at_clamped(raw_y, stride, width, height, 0, (int32_t)y);
-    out_y[(size_t)y * stride + (width - 1)] = sobel_at_clamped(
-        raw_y, stride, width, height, (int32_t)width - 1, (int32_t)y);
+    out_y[(size_t)y * stride] = sobel_at_clamped(raw_y, stride, width, height,
+                                                 0, (int32_t)y, threshold);
+    out_y[(size_t)y * stride + (width - 1)] =
+        sobel_at_clamped(raw_y, stride, width, height, (int32_t)width - 1,
+                         (int32_t)y, threshold);
   }
 
   // plane_sizes[1]/[2] aren't available without a VideoFrame -- both equal
@@ -400,17 +421,37 @@ static void blur_plane(const uint8_t *src, uint8_t *dst, uint32_t width,
 // work as a standalone soft-focus effect on its own, not only as Sobel
 // preprocessing, and blurring luma while leaving chroma sharp would look
 // visually inconsistent (fine detail in color, none in brightness).
+// One plane, `passes` repetitions of blur_plane(). The first pass reads
+// src (untouched by this function) into dst; every pass after that reads
+// dst and writes dst again -- safe aliasing, since blur_plane() always
+// fully drains its source into blur_scratch before writing its
+// destination at all (see blur_plane's own comment).
+static void blur_plane_repeated(const uint8_t *src, uint8_t *dst, uint32_t width,
+                               uint32_t height, size_t stride, uint32_t passes) {
+  blur_plane(src, dst, width, height, stride);
+  for (uint32_t p = 1; p < passes; ++p) {
+    blur_plane(dst, dst, width, height, stride);
+  }
+}
+
 void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
-                   uint32_t width, uint32_t height, const size_t stride[3]) {
+                   uint32_t width, uint32_t height, const size_t stride[3],
+                   uint8_t strength) {
   if (!src_planes[0] || !dst_planes[0])
     return;
 
-  blur_plane(src_planes[0], dst_planes[0], width, height, stride[0]);
+  // 0 and 1 both mean "just the one pass" -- see conv.h.
+  uint32_t passes = strength == 0 ? 1 : strength;
+
+  blur_plane_repeated(src_planes[0], dst_planes[0], width, height, stride[0],
+                      passes);
 
   // stride[1]/[2] are exactly the chroma width with no padding (see
   // vf_create), matching how color_tint already uses them as its own loop
   // bound.
   uint32_t chroma_width = (uint32_t)stride[1];
-  blur_plane(src_planes[1], dst_planes[1], chroma_width, height, stride[1]);
-  blur_plane(src_planes[2], dst_planes[2], chroma_width, height, stride[2]);
+  blur_plane_repeated(src_planes[1], dst_planes[1], chroma_width, height,
+                      stride[1], passes);
+  blur_plane_repeated(src_planes[2], dst_planes[2], chroma_width, height,
+                      stride[2], passes);
 }

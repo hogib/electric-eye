@@ -24,6 +24,20 @@ typedef struct {
   uint8_t tint_u;          // used when effect == EFFECT_TINT
   uint8_t tint_v;
   uint8_t tint_strength;
+
+  // used when effect == EFFECT_SOBEL: gradient magnitudes below this are
+  // clamped to 0 -- raises the bar for what counts as an edge, so faint
+  // sensor noise doesn't show up as a sea of dim edge pixels. 0 (the
+  // default) keeps every magnitude sobel_edges() would otherwise produce,
+  // identical to not having this field at all.
+  uint8_t sobel_threshold;
+
+  // used when effect == EFFECT_BLUR: how many times to repeat the 5-tap
+  // pass. 0 and 1 both mean a single pass (today's blur, unchanged); each
+  // additional pass roughly doubles that stage's cost, so this is the
+  // knob for "soft focus" vs. "heavily smoothed" rather than a free
+  // parameter to max out.
+  uint8_t blur_strength;
 } EffectStage;
 
 // Bounds the chain to a fixed-size array rather than something dynamically
@@ -69,9 +83,9 @@ typedef struct {
  * "chain" is a list of stages, applied in order; each is one of
  * none|grayscale|invert|threshold|tint|sobel|blur, plus that effect's own
  * parameters where it takes any (threshold_value for threshold; tint_u/
- * tint_v/tint_strength for tint -- all 0-255). An empty chain ([]) is a
- * valid pass-through. "record_path" is optional; omit it (or set "") to
- * leave recording off.
+ * tint_v/tint_strength for tint; sobel_threshold for sobel; blur_strength
+ * for blur -- all 0-255). An empty chain ([]) is a valid pass-through.
+ * "record_path" is optional; omit it (or set "") to leave recording off.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

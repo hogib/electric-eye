@@ -179,10 +179,10 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
 
       if (stage->effect == EFFECT_SOBEL) {
         sobel_edges(src_planes, dst_planes, frame->width, frame->height,
-                   frame->stride);
+                   frame->stride, stage->sobel_threshold);
       } else {
         gaussian_blur(src_planes, dst_planes, frame->width, frame->height,
-                     frame->stride);
+                     frame->stride, stage->blur_strength);
       }
 
       cur = dst;

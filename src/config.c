@@ -230,6 +230,10 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
         ok = parse_u8(c, &parsed.tint_v);
       } else if (strcmp(key, "tint_strength") == 0) {
         ok = parse_u8(c, &parsed.tint_strength);
+      } else if (strcmp(key, "sobel_threshold") == 0) {
+        ok = parse_u8(c, &parsed.sobel_threshold);
+      } else if (strcmp(key, "blur_strength") == 0) {
+        ok = parse_u8(c, &parsed.blur_strength);
       } else {
         printf("Config: unknown key \"%s\" in a chain stage\n", key);
         return false;
