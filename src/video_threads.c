@@ -23,6 +23,7 @@
 // single one, so a camera left unplugged for hours doesn't flood the log
 // while the daemon keeps quietly retrying underneath.
 #define CAMERA_RECONNECT_LOG_EVERY 15
+#define STATS_LOG_INTERVAL_MS 5000
 
 void *producer_loop(void *arg) {
   ProducerArgs *args = (ProducerArgs *)arg;
@@ -227,5 +228,41 @@ void *consumer_loop(void *arg) {
     fclose(record_file);
 
   v4l2_out_close(out);
+  return NULL;
+}
+
+static void log_ring_stats(const char *name, const FrameRingBuffer *rb) {
+  RingStats s;
+  ring_get_stats(rb, &s);
+  printf("  %-24s occ %2zu/%2zu (peak %2zu)  full_stalls %llu  "
+        "empty_stalls %llu\n",
+        name, s.occupancy, s.capacity, s.high_water,
+        (unsigned long long)s.full_stalls, (unsigned long long)s.empty_stalls);
+}
+
+void *stats_loop(void *arg) {
+  StatsArgs *args = (StatsArgs *)arg;
+
+  while (atomic_load(args->is_running)) {
+    for (int waited_ms = 0;
+        waited_ms < STATS_LOG_INTERVAL_MS && atomic_load(args->is_running);
+        waited_ms += 100) {
+      sleep_us(100000); // 100ms chunks so shutdown is noticed promptly
+    }
+    if (!atomic_load(args->is_running))
+      break; // don't log a final partial-interval snapshot on shutdown --
+             // eeye.c's main() logs one definitive snapshot after every
+             // other thread has joined instead.
+
+    // "200ms" here is ring_wait_timeout_ns from frame_ring_buffer.c (not
+    // reachable from this file -- it's a private constant there); keep
+    // this in sync if that ever changes.
+    printf("Ring stats (occupancy out of usable capacity; stalls are "
+          "~200ms wait-windows spent blocked, not event counts):\n");
+    log_ring_stats("in   (producer->effects)", args->ring_buffer_in);
+    log_ring_stats("out  (effects->consumer)", args->ring_buffer_out);
+    log_ring_stats("free (pool)             ", args->ring_buffer_free);
+  }
+
   return NULL;
 }

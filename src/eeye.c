@@ -87,6 +87,13 @@ ConsumerArgs cons_args = {
     .frame_height = frame_height,
 };
 
+StatsArgs stats_args = {
+    .is_running = &is_running,
+    .ring_buffer_in = &ring_buffer_in,
+    .ring_buffer_out = &ring_buffer_out,
+    .ring_buffer_free = &ring_buffer_free,
+};
+
 int main(int argc, char **argv) {
   // libgomp's default OMP_WAIT_POLICY is "active": each worker thread in a
   // #pragma omp parallel for team (conv.c, point_opps.c) busy-spins between
@@ -185,7 +192,7 @@ int main(int argc, char **argv) {
   work_args.config = config_watcher;
   cons_args.config = config_watcher;
 
-  pthread_t producer, worker, consumer;
+  pthread_t producer, worker, consumer, stats;
   if (pthread_create(&producer, NULL, producer_loop, &prod_args) != 0) {
     printf("Error: Failed to create producer thread.\n");
     return 1;
@@ -198,6 +205,13 @@ int main(int argc, char **argv) {
     printf("Error: Failed to create consumer thread.\n");
     return 1;
   }
+  // Diagnostic only: a failure here doesn't affect the actual pipeline, so
+  // it logs and carries on running without stats rather than exiting.
+  bool stats_started = pthread_create(&stats, NULL, stats_loop, &stats_args) == 0;
+  if (!stats_started) {
+    printf("Warning: failed to create stats thread; ring diagnostics "
+           "disabled.\n");
+  }
 
   printf("Pipeline running. Capturing from camera -> virtual cam...\n");
   printf("Point another app (browser, Zoom, etc.) at the virtual camera "
@@ -206,8 +220,32 @@ int main(int argc, char **argv) {
   pthread_join(producer, NULL);
   pthread_join(worker, NULL);
   pthread_join(consumer, NULL);
+  if (stats_started)
+    pthread_join(stats, NULL);
 
   printf("Processing complete. Pipeline shut down cleanly.\n");
+
+  // One definitive snapshot of each ring's lifetime peak occupancy and
+  // stall counts, now that every producer/consumer of them has stopped --
+  // the real numbers the ring-tuning question needed, not an estimate.
+  printf("Final ring stats:\n");
+  RingStats s;
+  ring_get_stats(&ring_buffer_in, &s);
+  printf("  in   (producer->effects) peak %zu/%zu  full_stalls %llu  "
+        "empty_stalls %llu\n",
+        s.high_water, s.capacity, (unsigned long long)s.full_stalls,
+        (unsigned long long)s.empty_stalls);
+  ring_get_stats(&ring_buffer_out, &s);
+  printf("  out  (effects->consumer) peak %zu/%zu  full_stalls %llu  "
+        "empty_stalls %llu\n",
+        s.high_water, s.capacity, (unsigned long long)s.full_stalls,
+        (unsigned long long)s.empty_stalls);
+  ring_get_stats(&ring_buffer_free, &s);
+  printf("  free (pool)              peak %zu/%zu  full_stalls %llu  "
+        "empty_stalls %llu\n",
+        s.high_water, s.capacity, (unsigned long long)s.full_stalls,
+        (unsigned long long)s.empty_stalls);
+
   config_watch_stop(config_watcher);
   vf_pool_free(pool, pool_size);
   ring_destroy(&ring_buffer_in);

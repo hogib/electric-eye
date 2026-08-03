@@ -27,6 +27,9 @@ void ring_init(FrameRingBuffer *rb) {
   sem_init(&rb->filled, 0, 0);
   sem_init(&rb->empty, 0, ring_buffer_size - 1);
   pthread_mutex_init(&rb->push_lock, NULL);
+  atomic_init(&rb->high_water, 0);
+  atomic_init(&rb->full_stalls, 0);
+  atomic_init(&rb->empty_stalls, 0);
 }
 
 void ring_destroy(FrameRingBuffer *rb) {
@@ -49,6 +52,15 @@ bool ring_push(FrameRingBuffer *rb, void *frame_ptr) {
   if (ok) {
     rb->buffer[head] = frame_ptr;
     atomic_store_explicit(&rb->head, next_head, memory_order_release);
+
+    // high_water diagnostics: occupancy just after this push. push_lock
+    // (held for the whole function) already serializes every pusher, so
+    // this load-compare-store is race-free without any extra atomicity.
+    size_t occupancy = (next_head - tail) & (ring_buffer_size - 1);
+    size_t prev_high = atomic_load_explicit(&rb->high_water, memory_order_relaxed);
+    if (occupancy > prev_high) {
+      atomic_store_explicit(&rb->high_water, occupancy, memory_order_relaxed);
+    }
   }
 
   pthread_mutex_unlock(&rb->push_lock);
@@ -83,6 +95,9 @@ bool ring_push_wait(FrameRingBuffer *rb, void *frame_ptr,
       continue;
     // ETIMEDOUT (the expected case while genuinely waiting) or any other
     // unexpected errno: either way, only stop retrying if told to give up.
+    // One increment per ~200ms window actually spent waiting here (not per
+    // call) -- see RingStats' comment in the header.
+    atomic_fetch_add_explicit(&rb->full_stalls, 1, memory_order_relaxed);
     if (is_running && !atomic_load(is_running))
       return false;
   }
@@ -110,6 +125,7 @@ bool ring_pop_wait(FrameRingBuffer *rb, void **frame_ptr,
       break; // an item is reserved for us -- pop below cannot fail
     if (errno == EINTR)
       continue;
+    atomic_fetch_add_explicit(&rb->empty_stalls, 1, memory_order_relaxed);
     if (is_running && !atomic_load(is_running))
       return false;
   }
@@ -120,4 +136,15 @@ bool ring_pop_wait(FrameRingBuffer *rb, void **frame_ptr,
 
   sem_post(&rb->empty);
   return true;
+}
+
+void ring_get_stats(const FrameRingBuffer *rb, RingStats *out) {
+  size_t head = atomic_load_explicit(&rb->head, memory_order_acquire);
+  size_t tail = atomic_load_explicit(&rb->tail, memory_order_acquire);
+
+  out->capacity = ring_buffer_size - 1;
+  out->occupancy = (head - tail) & (ring_buffer_size - 1);
+  out->high_water = atomic_load_explicit(&rb->high_water, memory_order_relaxed);
+  out->full_stalls = atomic_load_explicit(&rb->full_stalls, memory_order_relaxed);
+  out->empty_stalls = atomic_load_explicit(&rb->empty_stalls, memory_order_relaxed);
 }
