@@ -29,6 +29,16 @@ Type=simple
 User=pi
 Group=video
 
+# eeye now loads/unloads the v4l2loopback kernel module itself (see
+# virtual_cam.c) instead of requiring a one-time `sudo modprobe` before
+# every launch. Loading a kernel module needs CAP_SYS_MODULE, which User=pi
+# above does not have on its own -- grant just that one capability rather
+# than running the whole daemon as root. Ambient capabilities are inherited
+# across exec by capability-aware children, so the modprobe(8) child
+# process eeye forks gets it too.
+AmbientCapabilities=CAP_SYS_MODULE
+CapabilityBoundingSet=CAP_SYS_MODULE
+
 WorkingDirectory=/opt/electric-eye
 ExecStart=/opt/electric-eye/builddir/eeye /opt/electric-eye/eeye_config.json
 

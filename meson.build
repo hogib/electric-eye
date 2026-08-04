@@ -63,6 +63,7 @@ src = [
     'src/v4l2_in.c',
     'src/v4l2_out.c',
     'src/video_threads.c',
+    'src/virtual_cam.c',
 ]
 
 dep = declare_dependency(

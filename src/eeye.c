@@ -8,6 +8,7 @@
 #include "frame_ring_buffer.h"
 #include "video_frame.h"
 #include "video_threads.h"
+#include "virtual_cam.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -24,6 +25,12 @@ extern char **environ;
 
 constexpr uint32_t frame_width = 1280;
 constexpr uint32_t frame_height = 720;
+
+// virtual_cam_ensure_loaded() is what actually makes virtual_cam_device_path
+// exist; cons_args.outpath below points at the same path.
+constexpr uint32_t virtual_cam_video_nr = 10;
+constexpr char virtual_cam_card_label[] = "VirtualCam";
+constexpr char virtual_cam_device_path[] = "/dev/video10";
 
 FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
@@ -56,7 +63,13 @@ static void handle_shutdown_signal(int sig) {
  *
  * One-time host setup required:
  *   sudo apt install v4l2loopback-dkms libturbojpeg0-dev
- *   sudo modprobe v4l2loopback video_nr=10 card_label="VirtualCam" exclusive_caps=1
+ *
+ * v4l2loopback itself no longer needs to be modprobed by hand -- see
+ * virtual_cam.c, called from main() below -- but loading a kernel module
+ * needs CAP_SYS_MODULE, so this binary must run as root (e.g. `sudo
+ * ./eeye`) or, under eeye.service, with the AmbientCapabilities=
+ * CAP_SYS_MODULE line already set there. Without either, startup fails
+ * fast with the equivalent manual `sudo modprobe` command printed.
  *
  * Confirm your real camera's device number with:
  *   v4l2-ctl --list-devices
@@ -79,7 +92,7 @@ WorkerArgs work_args = {
 };
 
 ConsumerArgs cons_args = {
-    .outpath = "/dev/video10",
+    .outpath = virtual_cam_device_path,
     .is_running = &is_running,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
@@ -157,6 +170,23 @@ int main(int argc, char **argv) {
   signal(SIGTERM, handle_shutdown_signal);
 
   const char *config_path = (argc > 1) ? argv[1] : "eeye_config.json";
+
+  // Loads v4l2loopback (if not already loaded) so the one-time `sudo
+  // modprobe ...` from this file's header comment no longer has to be run
+  // by hand before every launch. atexit() -- rather than a call at the
+  // bottom of main() -- covers every return path below uniformly,
+  // including the early failure returns that follow. Registered before
+  // the call it guards (not after): virtual_cam_ensure_loaded() can load
+  // the module and then still fail (device node never appeared) -- in
+  // which case it has already set the "we loaded it" state that
+  // virtual_cam_unload() checks, so cleanup must still run on the
+  // immediate `return 1` below. virtual_cam_unload() itself is a no-op
+  // whenever that state wasn't set, so registering it unconditionally
+  // here is always safe.
+  atexit(virtual_cam_unload);
+  if (!virtual_cam_ensure_loaded(virtual_cam_video_nr, virtual_cam_card_label,
+                                 virtual_cam_device_path))
+    return 1;
 
   printf("Initializing pipeline...\n");
   ring_init(&ring_buffer_in);
