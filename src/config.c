@@ -180,6 +180,10 @@ static bool effect_from_string(const char *s, EffectType *out) {
     *out = EFFECT_SOBEL;
   else if (strcmp(s, "blur") == 0)
     *out = EFFECT_BLUR;
+  else if (strcmp(s, "contrast") == 0)
+    *out = EFFECT_CONTRAST;
+  else if (strcmp(s, "light") == 0)
+    *out = EFFECT_LIGHT;
   else
     return false;
   return true;
@@ -191,6 +195,13 @@ static bool effect_from_string(const char *s, EffectType *out) {
 // blur stage, is rejected rather than silently ignored).
 static bool parse_effect_stage(Cursor *c, EffectStage *out) {
   EffectStage parsed = {0};
+  // Every other field's natural zero-init default happens to already mean
+  // "no visible effect" for its own effect (tint_strength 0, sobel/blur's
+  // documented zero-behavior, etc). light_level's neutral point is 128, not
+  // 0, so it needs an explicit seed here or omitting it on a "light" stage
+  // would silently mean "fully dark and desaturated" instead of "no
+  // change" -- see EffectStage's own doc comment on light_level.
+  parsed.light_level = 128;
   bool have_effect = false;
 
   if (!cur_expect(c, '{')) {
@@ -236,6 +247,8 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
         ok = parse_u8(c, &parsed.sobel_threshold);
       } else if (strcmp(key, "blur_strength") == 0) {
         ok = parse_u8(c, &parsed.blur_strength);
+      } else if (strcmp(key, "light_level") == 0) {
+        ok = parse_u8(c, &parsed.light_level);
       } else {
         printf("Config: unknown key \"%s\" in a chain stage\n", key);
         return false;

@@ -114,6 +114,8 @@ EFFECT_FIELDS = {
     ],
     "sobel": [["sobel_threshold", 0, 255, 0]],
     "blur": [["blur_strength", 0, 255, 0]],
+    "contrast": [],
+    "light": [["light_level", 0, 255, 128]],
 }
 
 INDEX_HTML_TEMPLATE = """<!doctype html>
@@ -130,8 +132,15 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
            background: #1c1c1c; border-radius: 6px; padding: 8px; margin-bottom: 6px; }
   .stage select { font-size: 14px; }
   .stage label { font-size: 12px; color: #aaa; margin-left: 6px; }
-  .stage input[type=number] { width: 60px; }
+  .stage input[type=range] { width: 90px; vertical-align: middle; margin: 0 4px; }
+  .stage .val { display: inline-block; min-width: 26px; text-align: right;
+                font-variant-numeric: tabular-nums; color: #ddd; }
   .stage .spacer { flex: 1; }
+  .rgb-row { display: inline-flex; align-items: center; gap: 2px; }
+  .rgb-row span.chan { color: #aaa; font-size: 12px; }
+  .rgb-row input[type=range] { width: 70px; }
+  .swatch { display: inline-block; width: 22px; height: 22px; border-radius: 4px;
+            border: 1px solid #555; margin-left: 6px; vertical-align: middle; }
   button { font-size: 13px; padding: 4px 10px; cursor: pointer; }
   #apply { font-size: 15px; padding: 8px 20px; margin-top: 16px; }
   #status { margin-top: 10px; font-size: 13px; white-space: pre-wrap; }
@@ -171,8 +180,73 @@ const stagesEl = document.getElementById("stages");
 
 function fieldRowHtml(stage, key, min, max, def) {
   const val = (stage && stage[key] !== undefined) ? stage[key] : def;
-  return `<label>${key}<input type="number" min="${min}" max="${max}" `
-       + `value="${val}" data-field="${key}"></label>`;
+  return `<label>${key}`
+       + `<input type="range" min="${min}" max="${max}" value="${val}" `
+       + `data-field="${key}" oninput="this.nextElementSibling.textContent=this.value">`
+       + `<span class="val">${val}</span></label>`;
+}
+
+// tint's config fields are chroma (tint_u/tint_v, 128 = neutral, see
+// src/point_opps.c's doc comment) -- not something anyone should have to
+// pick by typing raw YCbCr numbers. These convert an RGB color picked via
+// sliders into that chroma pair (BT.601, Y dropped since the tint effect
+// never touches luma) and back (assuming Y=128, since the real per-pixel Y
+// isn't known client-side -- only used to seed the sliders' starting
+// position from an existing config, never sent anywhere).
+function clampByte(n) { return Math.max(0, Math.min(255, Math.round(n))); }
+function rgbToUV(r, g, b) {
+  return [
+    clampByte(-0.169 * r - 0.331 * g + 0.5 * b + 128),
+    clampByte(0.5 * r - 0.419 * g - 0.081 * b + 128),
+  ];
+}
+function uvToRgb(u, v) {
+  const cb = u - 128, cr = v - 128;
+  return [
+    clampByte(128 + 1.402 * cr),
+    clampByte(128 - 0.344136 * cb - 0.714136 * cr),
+    clampByte(128 + 1.772 * cb),
+  ];
+}
+
+function renderTintFields(fields, stage) {
+  const u0 = (stage && stage.tint_u !== undefined) ? stage.tint_u : 90;
+  const v0 = (stage && stage.tint_v !== undefined) ? stage.tint_v : 150;
+  const strength0 = (stage && stage.tint_strength !== undefined) ? stage.tint_strength : 180;
+  const [r0, g0, b0] = uvToRgb(u0, v0);
+
+  fields.innerHTML =
+    `<span class="rgb-row">`
+    + `<span class="chan">R</span><input type="range" min="0" max="255" value="${r0}" class="rgb-r" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${r0}</span>`
+    + `<span class="chan">G</span><input type="range" min="0" max="255" value="${g0}" class="rgb-g" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${g0}</span>`
+    + `<span class="chan">B</span><input type="range" min="0" max="255" value="${b0}" class="rgb-b" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${b0}</span>`
+    + `<span class="swatch"></span>`
+    + `</span>`
+    + `<label>strength`
+    + `<input type="range" min="0" max="255" value="${strength0}" data-field="tint_strength" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${strength0}</span></label>`
+    + `<input type="hidden" data-field="tint_u" value="${u0}">`
+    + `<input type="hidden" data-field="tint_v" value="${v0}">`;
+
+  const rIn = fields.querySelector(".rgb-r");
+  const gIn = fields.querySelector(".rgb-g");
+  const bIn = fields.querySelector(".rgb-b");
+  const swatch = fields.querySelector(".swatch");
+  const uHidden = fields.querySelector('[data-field="tint_u"]');
+  const vHidden = fields.querySelector('[data-field="tint_v"]');
+
+  function syncFromRgb() {
+    const r = Number(rIn.value), g = Number(gIn.value), b = Number(bIn.value);
+    swatch.style.background = `rgb(${r}, ${g}, ${b})`;
+    const [u, v] = rgbToUV(r, g, b);
+    uHidden.value = u;
+    vHidden.value = v;
+  }
+  for (const el of [rIn, gIn, bIn]) el.addEventListener("input", syncFromRgb);
+  syncFromRgb();
 }
 
 function addStage(stage) {
@@ -194,6 +268,10 @@ function addStage(stage) {
 
   function renderFields() {
     fields.innerHTML = "";
+    if (select.value === "tint") {
+      renderTintFields(fields, stage);
+      return;
+    }
     for (const [key, min, max, def] of EFFECT_FIELDS[select.value]) {
       fields.insertAdjacentHTML("beforeend", fieldRowHtml(stage, key, min, max, def));
     }
@@ -263,15 +341,29 @@ async function refreshFromDrone() {
   }
 }
 
+// web_ui.py's own proxy already gives up on the drone's config_agent after
+// 5s, and config_agent gives up on eeye's own confirmation after 2s -- so
+// a healthy round trip never takes long. But this request crosses a real
+// network hop over the tether, which can just drop packets with no RST/FIN
+// to ever wake up fetch()'s promise, especially before this ever runs over
+// the actual fiber run rather than localhost. Without a hard client-side
+// deadline, that kind of stall leaves the button stuck on "Applying..."
+// forever with no way out except reloading the page -- so this aborts and
+// reports it instead of waiting indefinitely.
+const APPLY_TIMEOUT_MS = 8000;
+
 document.getElementById("apply").addEventListener("click", async () => {
   const status = document.getElementById("status");
   status.textContent = "Applying...";
   status.className = "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), APPLY_TIMEOUT_MS);
   try {
     const res = await fetch("/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(buildConfig()),
+      signal: controller.signal,
     });
     const text = await res.text();
     if (!res.ok) {
@@ -296,8 +388,13 @@ document.getElementById("apply").addEventListener("click", async () => {
       }
     }
   } catch (e) {
-    status.textContent = "Request failed: " + e;
+    status.textContent = (e.name === "AbortError")
+      ? `Timed out after ${APPLY_TIMEOUT_MS / 1000}s waiting for a response `
+        + "-- check the connection to the topside server and the drone."
+      : "Request failed: " + e;
     status.className = "err";
+  } finally {
+    clearTimeout(timer);
   }
 });
 
@@ -320,7 +417,13 @@ def make_handler(source, agent_host, agent_port):
 
         def do_GET(self):
             if self.path == "/":
-                self._respond(200, "text/html", index_html)
+                # no-store: a browser tab left open across a server restart
+                # (e.g. after a code update) must never keep running JS from
+                # before the restart -- a stale Apply handler is exactly the
+                # kind of thing that's silently wrong instead of loudly
+                # broken.
+                self._respond(200, "text/html", index_html,
+                               extra_headers={"Cache-Control": "no-store"})
             elif self.path == "/stream":
                 self._serve_stream()
             elif self.path == "/config":
@@ -334,10 +437,12 @@ def make_handler(source, agent_host, agent_port):
             else:
                 self.send_error(404)
 
-        def _respond(self, status, content_type, body):
+        def _respond(self, status, content_type, body, extra_headers=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 

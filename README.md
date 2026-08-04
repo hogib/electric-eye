@@ -153,8 +153,8 @@ running. Every key is optional; anything missing takes the default shown:
 
 `"chain"` is a list of stages, **applied in order** — reorder it and you get a
 different result (blur-then-sobel looks different from sobel-then-blur). Each stage is
-one of `none`, `grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, plus that
-effect's own parameters:
+one of `none`, `grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, `contrast`,
+`light`, plus that effect's own parameters:
 
 | Key | Used by | Range | Meaning |
 |---|---|---|---|
@@ -164,6 +164,19 @@ effect's own parameters:
 | `tint_strength` | `tint` | 0–255 | Blend strength: 0 = no change, 255 = fully replaced. |
 | `sobel_threshold` | `sobel` | 0–255 | Gradient magnitudes below this are clamped to 0 (raises the bar for what counts as an edge). |
 | `blur_strength` | `blur` | 0–255 | How many times to repeat the 5-tap blur pass; 0 and 1 both mean a single pass. |
+| `light_level` | `light` | 0–255 | One dial over brightness *and* saturation together; 128 = neutral (default). Below darkens/desaturates toward black, above brightens/boosts saturation. |
+
+`contrast` takes no parameters — it's a full-frame auto min/max luma stretch,
+recomputed fresh from whatever the chain has produced so far every single frame, so
+there's nothing to tune beyond whether it's in the chain or not. Unlike `contrast`,
+`light` doesn't inspect the actual frame — its `light_level` value alone determines
+the whole transform, which is what lets it fold into the same fast LUT-based pass as
+`grayscale`/`invert`/`threshold`/`tint` instead of needing its own full-frame scan.
+`light_level` is also the one field in this table that defaults to 128, not 0, when
+omitted — every other optional field's zero-init default already happens to mean "no
+change" for its effect, but 0 for `light_level` would mean "fully dark and
+desaturated," so it's special-cased to default to neutral instead (see
+`parse_effect_stage` in `src/config.c`).
 
 A stage carrying a key its effect doesn't use (e.g. `tint_u` on a `blur` stage) is a
 hard parse error, not silently ignored — a typo should be loud, not a quiet no-op. An

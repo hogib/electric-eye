@@ -12,6 +12,8 @@ typedef enum {
   EFFECT_TINT,
   EFFECT_SOBEL,
   EFFECT_BLUR,
+  EFFECT_CONTRAST,
+  EFFECT_LIGHT,
 } EffectType;
 
 // One entry in an effect chain. Every stage carries its own parameters
@@ -38,6 +40,19 @@ typedef struct {
   // knob for "soft focus" vs. "heavily smoothed" rather than a free
   // parameter to max out.
   uint8_t blur_strength;
+
+  // used when effect == EFFECT_LIGHT: a single dial over both brightness
+  // (Y) and color saturation (U/V distance from neutral), moved together
+  // -- unlike EFFECT_CONTRAST this is a fixed function of the level, not
+  // the frame's actual content, so it composes into effect_chain.c's
+  // point-op LUT fusion instead of needing its own full-frame pass. 128 =
+  // neutral (also the default when this key is omitted -- see
+  // parse_effect_stage, which seeds this field to 128 before parsing,
+  // unlike every other field here which defaults to a zero-initialized
+  // 0). Below 128: darker and desaturated, down to fully black/gray at 0.
+  // Above 128: brighter and more saturated, up to roughly double
+  // saturation at 255.
+  uint8_t light_level;
 } EffectStage;
 
 // Bounds the chain to a fixed-size array rather than something dynamically
@@ -96,10 +111,20 @@ typedef struct {
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
- * none|grayscale|invert|threshold|tint|sobel|blur, plus that effect's own
- * parameters where it takes any (threshold_value for threshold; tint_u/
- * tint_v/tint_strength for tint; sobel_threshold for sobel; blur_strength
- * for blur -- all 0-255). An empty chain ([]) is a valid pass-through.
+ * none|grayscale|invert|threshold|tint|sobel|blur|contrast|light, plus that
+ * effect's own parameters where it takes any (threshold_value for
+ * threshold; tint_u/tint_v/tint_strength for tint; sobel_threshold for
+ * sobel; blur_strength for blur; light_level for light -- all 0-255).
+ * contrast takes no parameters: it's a full-frame auto min/max luma
+ * stretch (see gs_contrast_normalize in point_opps.h), recomputed fresh
+ * every frame, so there's nothing to configure beyond having it in the
+ * chain or not. light_level (default 128, the only field here that
+ * doesn't default to 0 when omitted -- see EffectStage's own comment on
+ * light_level) moves brightness and color saturation together: below 128
+ * is darker/desaturated, above 128 is brighter/more saturated, unlike
+ * contrast this is a fixed function of the level rather than the frame's
+ * actual content (see color_light in point_opps.h). An empty chain ([])
+ * is a valid pass-through.
  * "record_path" is optional; omit it (or set "") to leave recording off.
  * "stream_frame_interval" is optional (default 0, meaning the live-preview
  * stream tap -- see stream_server.h -- is off); N sends every Nth

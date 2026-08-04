@@ -1,5 +1,6 @@
 #include "effect_chain.h"
 #include "conv.h"
+#include "point_opps.h"
 #include <string.h>
 
 // Which of VideoFrame's three buffers currently holds the chain's state.
@@ -54,6 +55,7 @@ static bool is_point_op(EffectType e) {
   case EFFECT_INVERT:
   case EFFECT_THRESHOLD:
   case EFFECT_TINT:
+  case EFFECT_LIGHT:
     return true;
   default:
     return false;
@@ -146,6 +148,42 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
       }
       break;
 
+    case EFFECT_LIGHT:
+      // Matches color_light()'s no-op fast path and its offset (Y) /
+      // scale-around-128 (U, V) math exactly -- keep the two in sync.
+      if (s->light_level != 128) {
+        int32_t offset = (int32_t)s->light_level - 128;
+        float chroma_scale = (float)s->light_level / 128.0f;
+
+        for (int v = 0; v < 256; ++v) {
+          int32_t ny = (int32_t)lut_y[v] + offset;
+          if (ny < 0)
+            ny = 0;
+          if (ny > 255)
+            ny = 255;
+          lut_y[v] = (uint8_t)ny;
+        }
+        for (int v = 0; v < 256; ++v) {
+          float nu = 128.0f + ((float)lut_u[v] - 128.0f) * chroma_scale;
+          if (nu < 0.0f)
+            nu = 0.0f;
+          if (nu > 255.0f)
+            nu = 255.0f;
+          lut_u[v] = (uint8_t)(nu + 0.5f);
+
+          float nvv = 128.0f + ((float)lut_v[v] - 128.0f) * chroma_scale;
+          if (nvv < 0.0f)
+            nvv = 0.0f;
+          if (nvv > 255.0f)
+            nvv = 255.0f;
+          lut_v[v] = (uint8_t)(nvv + 0.5f);
+        }
+        *touched_y = true;
+        *touched_u = true;
+        *touched_v = true;
+      }
+      break;
+
     case EFFECT_NONE:
     default:
       break; // no channel touched
@@ -186,6 +224,23 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       }
 
       cur = dst;
+      ++i;
+      continue;
+    }
+
+    if (stage->effect == EFFECT_CONTRAST) {
+      // Unlike grayscale/invert/threshold/tint, this LUT depends on the
+      // actual min/max luma present in the frame *at this point in the
+      // chain* -- gs_contrast_normalize scans for it itself every call, so
+      // unlike the point ops below it can't be folded into a LUT composed
+      // ahead of any real pixel data. It still only touches frame->planes
+      // in place, same as the fused point-op run, so it just needs 'cur'
+      // brought into work first exactly the same way.
+      if (cur != CHAIN_WORK) {
+        memcpy(frame->pixel_data, chain_buf_data(frame, cur), total);
+        cur = CHAIN_WORK;
+      }
+      gs_contrast_normalize(frame);
       ++i;
       continue;
     }

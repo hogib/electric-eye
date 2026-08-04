@@ -384,3 +384,69 @@ void color_tint(VideoFrame *frame, uint8_t target_u, uint8_t target_v,
     tint_row(v_row, frame->stride[2], target_v, strength);
   }
 }
+
+/*
+ * A single "light" dial over both brightness and color at once: level 128
+ * is neutral, below darkens and desaturates together (down to flat black
+ * at 0), above brightens and boosts saturation together (up to roughly
+ * double saturation at 255). Two independent controls (gs_contrast_normalize
+ * for brightness, color_tint for a color push) already exist for anyone who
+ * wants to drive luma and chroma separately -- this is deliberately one
+ * knob that moves both the same direction at once, which is closer to
+ * what "more/less light" actually looks like than adjusting either alone.
+ *
+ * Unlike gs_contrast_normalize, this is a fixed function of `level` alone
+ * -- it doesn't need to know anything about the frame's actual pixel
+ * values to build its LUT, which is what lets effect_chain.c fold this
+ * into the same LUT-fusion pass as grayscale/invert/threshold/tint instead
+ * of needing its own full-frame pass (see fuse_point_op_run's EFFECT_LIGHT
+ * case, which reimplements this exact math to compose with neighboring
+ * point ops -- keep the two in sync).
+ */
+void color_light(VideoFrame *frame, uint8_t level) {
+  if (!frame || !frame->planes[0] || !frame->planes[1] || !frame->planes[2])
+    return;
+
+  if (level == 128)
+    return; // No-op fast path: neutral, original frame untouched.
+
+  int32_t offset = (int32_t)level - 128;
+  float chroma_scale = (float)level / 128.0f;
+
+  uint8_t lut_y[256];
+  for (int v = 0; v <= y_plain_max_jpeg; ++v) {
+    int32_t nv = v + offset;
+    if (nv < y_plain_min_jpeg)
+      nv = y_plain_min_jpeg;
+    if (nv > y_plain_max_jpeg)
+      nv = y_plain_max_jpeg;
+    lut_y[v] = (uint8_t)nv;
+  }
+
+  uint8_t lut_c[256]; // shared by U and V -- both centered at 128 alike
+  for (int v = 0; v <= y_plain_max_jpeg; ++v) {
+    float nv = 128.0f + ((float)v - 128.0f) * chroma_scale;
+    if (nv < (float)y_plain_min_jpeg)
+      nv = (float)y_plain_min_jpeg;
+    if (nv > (float)y_plain_max_jpeg)
+      nv = (float)y_plain_max_jpeg;
+    lut_c[v] = (uint8_t)(nv + 0.5f);
+  }
+
+#pragma omp parallel for
+  for (uint32_t y = 0; y < frame->height; ++y) {
+    uint8_t *y_row = frame->planes[0] + (y * frame->stride[0]);
+    for (uint32_t x = 0; x < frame->width; ++x) {
+      y_row[x] = lut_y[y_row[x]];
+    }
+
+    uint8_t *u_row = frame->planes[1] + (y * frame->stride[1]);
+    uint8_t *v_row = frame->planes[2] + (y * frame->stride[2]);
+    for (uint32_t x = 0; x < frame->stride[1]; ++x) {
+      u_row[x] = lut_c[u_row[x]];
+    }
+    for (uint32_t x = 0; x < frame->stride[2]; ++x) {
+      v_row[x] = lut_c[v_row[x]];
+    }
+  }
+}

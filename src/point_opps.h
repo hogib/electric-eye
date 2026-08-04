@@ -18,3 +18,5 @@ void gs_invert(VideoFrame *frame);
 
 void color_tint(VideoFrame *frame, uint8_t target_u, uint8_t target_v,
              uint8_t strength);
+
+void color_light(VideoFrame *frame, uint8_t level);
