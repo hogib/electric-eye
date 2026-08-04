@@ -54,6 +54,10 @@ dkms.conf
 # debug information files
 *.dwo
 
+# Python
+__pycache__/
+*.pyc
+
 # Build
 build/
 builddir/
