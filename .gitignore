@@ -58,6 +58,9 @@ dkms.conf
 __pycache__/
 *.pyc
 
+# Runtime-generated config reload status (see config.h/config.c)
+*.json.status
+
 # Build
 build/
 builddir/

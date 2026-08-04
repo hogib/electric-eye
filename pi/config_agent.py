@@ -12,7 +12,11 @@ Deliberately does not re-validate the config's schema beyond "is this
 well-formed JSON" -- config.c already does thorough validation on reload
 and logs exactly why an invalid config was rejected (see eeye's own
 stdout/journalctl), so duplicating that logic here would just create a
-second place that can disagree with the first about what's valid.
+second place that can disagree with the first about what's valid. Instead,
+a POST here waits briefly for eeye's own verdict (see
+wait_for_reload_status() below) and relays *that* -- true confirmation
+that the config took effect, not just that this script managed to write a
+file.
 
 Only needs the Python standard library -- nothing to install.
 
@@ -23,12 +27,16 @@ Serves, on all interfaces:
   GET  /config   the current config file's raw contents
   POST /config   replace the file's contents with the request body (must be
                  well-formed JSON; written atomically -- see
-                 write_config_atomic() below)
+                 write_config_atomic() below), then respond with JSON:
+                 {"written": true, "eeye_accepted": true|false|null}
+                 -- null means eeye didn't report back within the timeout
+                 (not running, or hot-reload disabled -- check its own log)
 """
 import argparse
 import http.server
 import json
 import os
+import time
 
 
 def write_config_atomic(path, data: bytes):
@@ -45,6 +53,33 @@ def write_config_atomic(path, data: bytes):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+
+
+def wait_for_reload_status(config_path, previous_mtime, timeout=2.0):
+    """Polls "<config_path>.status" (see config.h's doc comment on
+    ConfigWatcher) until it changes from whatever it was before we wrote
+    the new config, then returns its "ok" value -- or None on timeout,
+    meaning eeye never weighed in (not running, watching a different path,
+    or hot-reload disabled). previous_mtime lets this tell "eeye just
+    processed our write" apart from "that's a stale status left over from
+    before we even wrote anything" -- both look identical as a bare file
+    read, only the mtime comparison distinguishes them."""
+    status_path = config_path + ".status"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            mtime = os.path.getmtime(status_path)
+        except FileNotFoundError:
+            mtime = None
+        if mtime is not None and mtime != previous_mtime:
+            try:
+                with open(status_path) as f:
+                    return json.load(f).get("ok")
+            except (OSError, json.JSONDecodeError):
+                pass  # caught mid-write (rename isn't visible until it completes,
+                      # but guard anyway); keep polling
+        time.sleep(0.1)
+    return None
 
 
 def make_handler(config_path):
@@ -82,10 +117,28 @@ def make_handler(config_path):
                 self.wfile.write(f"invalid JSON: {e}".encode())
                 return
 
+            status_path = config_path + ".status"
+            try:
+                previous_mtime = os.path.getmtime(status_path)
+            except FileNotFoundError:
+                previous_mtime = None
+
             write_config_atomic(config_path, body)
             print(f"[config_agent] wrote new config to {config_path}")
+
+            eeye_accepted = wait_for_reload_status(config_path, previous_mtime)
+            if eeye_accepted is None:
+                print("[config_agent] no reload confirmation from eeye within "
+                      "the timeout -- is it running and watching this path?")
+
+            response = json.dumps(
+                {"written": True, "eeye_accepted": eeye_accepted}
+            ).encode()
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
             self.end_headers()
+            self.wfile.write(response)
 
     return Handler
 

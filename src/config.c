@@ -449,6 +449,41 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
   atomic_store_explicit(&w->current, &w->ring[slot], memory_order_release);
 }
 
+// Writes "<config_path>.status" with a one-line {"ok":true|false} verdict
+// after every load/reload attempt -- config_try_load() (called just before
+// this, both here and in config_watch_start()) already printed the full
+// reason on failure, so this file only needs to carry the yes/no a remote
+// writer (e.g. pi/config_agent.py) can't otherwise get: whether the config
+// it just wrote actually took effect, as opposed to being silently
+// rejected in favor of whatever was running before. Same writer contract
+// as the config file itself (temp file in the same directory, then
+// rename()) for the same reason -- a reader must never observe a
+// half-written status file.
+//
+// Best-effort: a failure to write this must never affect the pipeline
+// itself, so this only logs and returns, exactly like the printf-only
+// reporting it's layered on top of.
+static void write_reload_status(const char *config_path, bool ok) {
+  char status_path[PATH_MAX + 8];
+  char tmp_path[PATH_MAX + 16];
+  snprintf(status_path, sizeof status_path, "%s.status", config_path);
+  snprintf(tmp_path, sizeof tmp_path, "%s.status.tmp", config_path);
+
+  FILE *f = fopen(tmp_path, "wb");
+  if (!f) {
+    printf("Config: could not write reload status to %s: %s\n", tmp_path,
+           strerror(errno));
+    return;
+  }
+  fprintf(f, "{\"ok\":%s}\n", ok ? "true" : "false");
+  fclose(f);
+
+  if (rename(tmp_path, status_path) < 0) {
+    printf("Config: could not publish reload status to %s: %s\n",
+           status_path, strerror(errno));
+  }
+}
+
 static void *config_watch_thread(void *arg) {
   ConfigWatcher *w = (ConfigWatcher *)arg;
   // inotify_event has a flexible-array-member `name`; alignment matters
@@ -473,13 +508,15 @@ static void *config_watch_thread(void *arg) {
       struct inotify_event *ev = (struct inotify_event *)p;
       if (ev->len > 0 && strcmp(ev->name, w->watch_name) == 0) {
         Config parsed;
-        if (config_try_load(w->path, &parsed)) {
+        bool ok = config_try_load(w->path, &parsed);
+        if (ok) {
           config_publish(w, &parsed);
           printf("Config: reloaded %s\n", w->path);
         } else {
           printf("Config: reload of %s failed; keeping previous config\n",
                  w->path);
         }
+        write_reload_status(w->path, ok);
       }
       p += (ptrdiff_t)(sizeof(struct inotify_event) + ev->len);
     }
@@ -498,7 +535,8 @@ ConfigWatcher *config_watch_start(const char *path, atomic_bool *is_running) {
   snprintf(w->path, sizeof w->path, "%s", path);
 
   Config initial;
-  if (config_try_load(path, &initial)) {
+  bool initial_ok = config_try_load(path, &initial);
+  if (initial_ok) {
     printf("Config: loaded %s\n", path);
   } else {
     printf("Config: %s not usable at startup, using built-in defaults\n",
@@ -506,6 +544,7 @@ ConfigWatcher *config_watch_start(const char *path, atomic_bool *is_running) {
     initial = config_defaults;
   }
   config_publish(w, &initial);
+  write_reload_status(path, initial_ok);
 
   split_path(path, w->watch_dir, sizeof w->watch_dir, w->watch_name,
             sizeof w->watch_name);

@@ -112,6 +112,17 @@ typedef struct {
  * atomic from a reader's point of view. inotify watches the directory
  * rather than the file itself for exactly this reason: a watch on the
  * file's inode goes stale the moment rename() replaces it.
+ *
+ * Reload feedback: after every load attempt (startup or reload), a
+ * sibling file "<path>.status" is written (same atomic rename contract as
+ * above) containing a single line: {"ok":true} if that attempt's config
+ * is now what's running, {"ok":false} if it was rejected and the previous
+ * config is still active. This exists for a remote writer (e.g.
+ * pi/config_agent.py) that has no other way to know whether what it just
+ * wrote actually took effect -- the detailed reason for a rejection is
+ * only ever on this process's own stdout/journalctl, not in the status
+ * file, to avoid needing a second place that must agree with parse_config()
+ * about how to phrase every possible error.
  */
 typedef struct ConfigWatcher ConfigWatcher;
 

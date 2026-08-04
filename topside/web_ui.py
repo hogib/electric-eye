@@ -274,14 +274,26 @@ document.getElementById("apply").addEventListener("click", async () => {
       body: JSON.stringify(buildConfig()),
     });
     const text = await res.text();
-    if (res.ok) {
-      status.textContent = "Applied. (eeye logs whether it actually accepted "
-        + "the new config -- check journalctl/stdout on the drone if the "
-        + "effect doesn't change.)";
-      status.className = "ok";
-    } else {
+    if (!res.ok) {
       status.textContent = "Rejected: " + text;
       status.className = "err";
+    } else {
+      let data;
+      try { data = JSON.parse(text); } catch { data = {}; }
+      if (data.eeye_accepted === true) {
+        status.textContent = "Applied -- eeye confirmed it took effect.";
+        status.className = "ok";
+      } else if (data.eeye_accepted === false) {
+        status.textContent = "Written, but eeye REJECTED it and kept the "
+          + "previous config. Check eeye's own log/journalctl on the drone "
+          + "for why.";
+        status.className = "err";
+      } else {
+        status.textContent = "Written, but got no confirmation from eeye "
+          + "within the timeout -- is it running and watching this exact "
+          + "config path?";
+        status.className = "err";
+      }
     }
   } catch (e) {
     status.textContent = "Request failed: " + e;

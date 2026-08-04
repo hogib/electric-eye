@@ -1,1 +1,9 @@
-{"chain":[{"effect":"invert"},{"effect":"none"}],"record_path":"","stream_frame_interval":2,"stream_quality":60}
+{
+  "chain": [
+    {"effect": "blur"},
+    {"effect": "sobel"}
+  ],
+  "record_path": "",
+  "stream_frame_interval": 3,
+  "stream_quality": 60
+}
