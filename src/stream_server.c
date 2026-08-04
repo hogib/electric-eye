@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +107,16 @@ static void accept_pending(StreamServer *s) {
   struct timeval tv = {.tv_sec = send_timeout_ms / 1000,
                        .tv_usec = (send_timeout_ms % 1000) * 1000};
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+  // Every frame goes out as two send() calls (a 4-byte length prefix, then
+  // the JPEG body -- see send_all's two calls below); without this, Nagle's
+  // algorithm can hold that tiny first packet back waiting to coalesce with
+  // more data or an ACK, adding real per-frame latency to a stream that's
+  // otherwise sent as soon as each frame is ready. There's no coalescing
+  // upside to lose here -- these are already the largest writes this socket
+  // will ever make, not a stream of tiny writes Nagle is meant to batch.
+  int one = 1;
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
   s->client_fd = fd;
   printf("stream_server: viewer connected\n");

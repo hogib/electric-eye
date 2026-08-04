@@ -412,6 +412,13 @@ def make_handler(source, agent_host, agent_port):
     ).encode()
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        # /stream sends each frame as several small writes (see
+        # _serve_stream's boundary/header/body/CRLF sequence) -- without
+        # this, Nagle's algorithm can hold the first of those back waiting
+        # to coalesce with the next one or an ACK, adding latency to every
+        # single frame this process forwards to a browser.
+        disable_nagle_algorithm = True
+
         def log_message(self, fmt, *log_args):
             pass  # the default per-request access log is just noise here
 
@@ -482,11 +489,16 @@ def make_handler(source, agent_host, agent_port):
             try:
                 while True:
                     frame, last_id = source.wait_for_frame(last_id)
-                    self.wfile.write(f"--{boundary}\r\n".encode())
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                    self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
-                    self.wfile.write(frame)
-                    self.wfile.write(b"\r\n")
+                    # One write, not five: even with Nagle disabled
+                    # (disable_nagle_algorithm above), splitting a single
+                    # frame across several small writes is needless syscall
+                    # overhead on what's already a per-frame hot path.
+                    header = (
+                        f"--{boundary}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(frame)}\r\n\r\n"
+                    ).encode()
+                    self.wfile.write(header + frame + b"\r\n")
             except (BrokenPipeError, ConnectionResetError):
                 pass  # viewer closed the tab -- not an error
 
