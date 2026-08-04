@@ -62,6 +62,19 @@ typedef struct {
   // Empty string means recording is off. Written as raw I422 with no
   // container; see video_threads.c's own note on how to play it back.
   char record_path[max_record_path_len];
+
+  // Live-preview stream tap (see stream_server.h): every Nth post-effects
+  // frame is JPEG-encoded and sent to whichever viewer is currently
+  // connected. 0 means the tap is off -- no JPEG work happens at all, not
+  // even for a connected viewer. This is a lossy, throttled preview only;
+  // record_path above is the untouched, full-quality copy.
+  uint8_t stream_frame_interval;
+
+  // JPEG quality (1-100) for the stream tap above; meaningless when
+  // stream_frame_interval is 0. Parsed as a plain 0-255 byte like every
+  // other u8 config field, but values above 100 are clamped by turbojpeg
+  // itself, so this field doesn't separately validate that range.
+  uint8_t stream_quality;
 } Config;
 
 /*
@@ -77,7 +90,9 @@ typedef struct {
  *       {"effect": "sobel"},
  *       {"effect": "tint", "tint_u": 90, "tint_v": 150, "tint_strength": 180}
  *     ],
- *     "record_path": "/opt/electric-eye/recordings/session.raw"
+ *     "record_path": "/opt/electric-eye/recordings/session.raw",
+ *     "stream_frame_interval": 3,
+ *     "stream_quality": 60
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -86,6 +101,10 @@ typedef struct {
  * tint_v/tint_strength for tint; sobel_threshold for sobel; blur_strength
  * for blur -- all 0-255). An empty chain ([]) is a valid pass-through.
  * "record_path" is optional; omit it (or set "") to leave recording off.
+ * "stream_frame_interval" is optional (default 0, meaning the live-preview
+ * stream tap -- see stream_server.h -- is off); N sends every Nth
+ * post-effects frame to whoever is currently connected. "stream_quality" is
+ * optional (default 60), the JPEG quality (1-100) used for that tap.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

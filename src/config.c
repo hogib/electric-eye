@@ -43,6 +43,8 @@ static const Config config_defaults = {
     .stages = {{.effect = EFFECT_SOBEL}},
     .stage_count = 1,
     .record_path = "",
+    .stream_frame_interval = 0, // off by default -- no JPEG work, no socket traffic
+    .stream_quality = 60,
 };
 
 // path="/a/b/c.json" -> dir="/a/b", name="c.json". path="c.json" (no
@@ -361,6 +363,16 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
       } else if (strcmp(key, "record_path") == 0) {
         if (!parse_string(&c, parsed.record_path, sizeof parsed.record_path)) {
           printf("Config: invalid value for \"record_path\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "stream_frame_interval") == 0) {
+        if (!parse_u8(&c, &parsed.stream_frame_interval)) {
+          printf("Config: invalid value for \"stream_frame_interval\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "stream_quality") == 0) {
+        if (!parse_u8(&c, &parsed.stream_quality)) {
+          printf("Config: invalid value for \"stream_quality\"\n");
           return false;
         }
       } else {

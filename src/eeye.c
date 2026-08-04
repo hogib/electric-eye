@@ -32,6 +32,11 @@ constexpr uint32_t virtual_cam_video_nr = 10;
 constexpr char virtual_cam_card_label[] = "VirtualCam";
 constexpr char virtual_cam_device_path[] = "/dev/video10";
 
+// Live-preview stream tap (see stream_server.h). Off by default (Config's
+// stream_frame_interval starts at 0); this is only the port it listens on
+// once a config turns it on.
+constexpr uint16_t stream_server_port = 9000;
+
 FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
 FrameRingBuffer ring_buffer_free;
@@ -98,6 +103,7 @@ ConsumerArgs cons_args = {
     .ring_buffer_free = &ring_buffer_free,
     .frame_width = frame_width,
     .frame_height = frame_height,
+    .stream_port = stream_server_port,
 };
 
 StatsArgs stats_args = {

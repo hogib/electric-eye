@@ -36,9 +36,10 @@ typedef struct {
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_out;
   FrameRingBuffer *ring_buffer_free;
-  const ConfigWatcher *config; // for the recording tap's record_path
+  const ConfigWatcher *config; // for the recording/stream taps' config
   uint32_t frame_width;
   uint32_t frame_height;
+  uint16_t stream_port; // see stream_server.h; the live-preview tap's port
 } ConsumerArgs;
 
 // All three rings, read-only from here -- stats_loop only ever calls

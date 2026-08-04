@@ -1,6 +1,7 @@
 #include "video_threads.h"
 #include "effect_chain.h"
 #include "frame_ring_buffer.h"
+#include "stream_server.h"
 #include "v4l2_in.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
@@ -139,6 +140,16 @@ void *consumer_loop(void *arg) {
     return NULL;
   }
 
+  // Live-preview stream tap (see stream_server.h): unlike the virtual-cam
+  // write above, this is genuinely optional -- a topside viewer over the
+  // tether is a convenience, not something the local pipeline depends on.
+  // A failure here (e.g. the port's already in use) only disables the
+  // tap, logged, rather than tearing down the whole process.
+  StreamServer *stream = stream_server_open(args->stream_port);
+  if (!stream) {
+    printf("Warning: live-preview stream disabled (see error above).\n");
+  }
+
   // Recording tap: writes frame->raw_data -- the untouched camera frame,
   // independent of whatever the effect chain does to the copy sent to the
   // virtual camera -- to record_path whenever the config specifies a
@@ -207,6 +218,17 @@ void *consumer_loop(void *arg) {
       }
     }
 
+    // Live-preview stream tap: throttled by pts rather than a separate
+    // counter, since pts already increments by exactly 1 per frame (see
+    // producer_loop) -- nothing extra to keep in sync across reloads.
+    // stream_server_send_frame() itself skips all JPEG work when no
+    // viewer is connected, so this costs nothing while unwatched even at
+    // stream_frame_interval == 1.
+    if (stream && cfg->stream_frame_interval > 0 &&
+        frame->pts % cfg->stream_frame_interval == 0) {
+      stream_server_send_frame(stream, frame, cfg->stream_quality);
+    }
+
     if (!v4l2_out_write(out, frame)) {
       // The loopback device went away or rejected the frame. Stop the whole
       // pipeline rather than spinning on a dead device.
@@ -227,6 +249,7 @@ void *consumer_loop(void *arg) {
   if (record_file)
     fclose(record_file);
 
+  stream_server_close(stream);
   v4l2_out_close(out);
   return NULL;
 }
