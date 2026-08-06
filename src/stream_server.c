@@ -30,6 +30,8 @@ struct StreamServer {
   int listen_fd;
   int client_fd; // -1 when no client is connected
   tjhandle encoder;
+  unsigned char *jpeg_buf; // Reused across frames -- see stream_server_send_frame.
+  unsigned long jpeg_buf_cap;
 };
 
 StreamServer *stream_server_open(uint16_t port) {
@@ -157,23 +159,34 @@ bool stream_server_send_frame(StreamServer *s, const VideoFrame *frame,
   int strides[3] = {(int)frame->stride[0], (int)frame->stride[1],
                     (int)frame->stride[2]};
 
-  unsigned char *jpeg_buf = NULL;
+  // Reused across every streamed frame instead of letting
+  // tjCompressFromYUVPlanes malloc/free a fresh buffer each call -- frame
+  // dimensions never change mid-run in this pipeline, so after the first
+  // call this is just a bounds check, not a real allocation.
+  unsigned long needed =
+      tjBufSize((int)frame->width, (int)frame->height, TJSAMP_422);
+  if (s->jpeg_buf_cap < needed) {
+    if (s->jpeg_buf)
+      tjFree(s->jpeg_buf);
+    s->jpeg_buf = tjAlloc((int)needed);
+    s->jpeg_buf_cap = s->jpeg_buf ? needed : 0;
+  }
+  if (!s->jpeg_buf)
+    return false; // Allocation failed; nothing to send this frame.
+
   unsigned long jpeg_size = 0;
   if (tjCompressFromYUVPlanes(s->encoder, planes, (int)frame->width, strides,
-                              (int)frame->height, TJSAMP_422, &jpeg_buf,
-                              &jpeg_size, quality, TJFLAG_FASTDCT) < 0) {
+                              (int)frame->height, TJSAMP_422, &s->jpeg_buf,
+                              &jpeg_size, quality,
+                              TJFLAG_FASTDCT | TJFLAG_NOREALLOC) < 0) {
     printf("stream_server: tjCompressFromYUVPlanes failed: %s\n",
            tjGetErrorStr2(s->encoder));
-    if (jpeg_buf)
-      tjFree(jpeg_buf);
     return false;
   }
 
   uint32_t len_be = htonl((uint32_t)jpeg_size);
   bool ok = send_all(s->client_fd, (const uint8_t *)&len_be, sizeof len_be) &&
-           send_all(s->client_fd, jpeg_buf, jpeg_size);
-
-  tjFree(jpeg_buf);
+           send_all(s->client_fd, s->jpeg_buf, jpeg_size);
 
   if (!ok) {
     printf("stream_server: viewer disconnected (or too slow); dropping\n");
@@ -193,5 +206,7 @@ void stream_server_close(StreamServer *s) {
     close(s->listen_fd);
   if (s->encoder)
     tjDestroy(s->encoder);
+  if (s->jpeg_buf)
+    tjFree(s->jpeg_buf);
   free(s);
 }

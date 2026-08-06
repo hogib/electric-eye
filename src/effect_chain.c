@@ -62,10 +62,34 @@ static bool is_point_op(EffectType e) {
   }
 }
 
-static void apply_lut_plane(uint8_t *plane, size_t size, const uint8_t lut[256]) {
+// True (with the shared value in *out) when every entry of lut is the same
+// -- e.g. plain grayscale's composed chroma LUT, which maps every input to
+// 128 regardless. When that happens the output doesn't depend on src at
+// all, so apply_lut_plane can skip reading it entirely.
+static bool lut_is_constant(const uint8_t lut[256], uint8_t *out) {
+  for (int i = 1; i < 256; ++i) {
+    if (lut[i] != lut[0])
+      return false;
+  }
+  *out = lut[0];
+  return true;
+}
+
+// src and dst need not be the same buffer -- apply_effect_chain calls this
+// with src pointing at whichever chain buffer is current and dst pointing
+// at work, so a touched plane goes straight from src to its LUT'd result in
+// dst without a separate copy-then-overwrite step first. Safe in-place too
+// (src == dst) since dst[i] only ever depends on src[i].
+static void apply_lut_plane(const uint8_t *src, uint8_t *dst, size_t size,
+                            const uint8_t lut[256]) {
+  uint8_t constant;
+  if (lut_is_constant(lut, &constant)) {
+    memset(dst, constant, size);
+    return;
+  }
 #pragma omp parallel for
   for (size_t i = 0; i < size; ++i) {
-    plane[i] = lut[plane[i]];
+    dst[i] = lut[src[i]];
   }
 }
 
@@ -105,9 +129,9 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
 
     switch (s->effect) {
     case EFFECT_GRAYSCALE:
-      // Matches grayscale()'s memset(..., 128, ...): every byte becomes
-      // 128 regardless of what it was, so the composed LUT is just a
-      // constant, discarding whatever any earlier stage in this run did.
+      // Every chroma byte becomes 128 regardless of what it was, so the
+      // composed LUT is just a constant, discarding whatever any earlier
+      // stage in this run did.
       for (int v = 0; v < 256; ++v) {
         lut_u[v] = 128;
         lut_v[v] = 128;
@@ -117,7 +141,7 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
       break;
 
     case EFFECT_INVERT:
-      // Matches gs_invert()'s `255 - x`.
+      // `255 - x`.
       for (int v = 0; v < 256; ++v) {
         lut_y[v] = (uint8_t)(255 - lut_y[v]);
       }
@@ -125,7 +149,7 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
       break;
 
     case EFFECT_THRESHOLD:
-      // Matches gs_threshold_by_value()'s `x < tval ? 0 : 255`.
+      // `x < tval ? 0 : 255`.
       for (int v = 0; v < 256; ++v) {
         lut_y[v] = (lut_y[v] < s->threshold_value) ? 0 : 255;
       }
@@ -133,9 +157,9 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
       break;
 
     case EFFECT_TINT:
-      // Matches color_tint()'s no-op fast path and its
-      // `x + (target - x) * strength / 255` blend exactly, including its
-      // truncating integer division.
+      // `x + (target - x) * strength / 255` -- a lerp toward target,
+      // including C's truncating integer division. tint_strength == 0 is
+      // a no-op, left as the identity LUT.
       if (s->tint_strength != 0) {
         for (int v = 0; v < 256; ++v) {
           int32_t diff_u = (int32_t)s->tint_u - (int32_t)lut_u[v];
@@ -149,8 +173,8 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
       break;
 
     case EFFECT_LIGHT:
-      // Matches color_light()'s no-op fast path and its offset (Y) /
-      // scale-around-128 (U, V) math exactly -- keep the two in sync.
+      // Offset (Y) / scale-around-128 (U, V). light_level == 128 is a
+      // no-op, left as the identity LUT.
       if (s->light_level != 128) {
         int32_t offset = (int32_t)s->light_level - 128;
         float chroma_scale = (float)s->light_level / 128.0f;
@@ -195,8 +219,6 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
 
 void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   ChainBuf cur = CHAIN_RAW;
-  size_t total =
-      frame->plane_sizes[0] + frame->plane_sizes[1] + frame->plane_sizes[2];
 
   size_t i = 0;
   while (i < cfg->stage_count) {
@@ -233,14 +255,20 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       // actual min/max luma present in the frame *at this point in the
       // chain* -- gs_contrast_normalize scans for it itself every call, so
       // unlike the point ops below it can't be folded into a LUT composed
-      // ahead of any real pixel data. It still only touches frame->planes
-      // in place, same as the fused point-op run, so it just needs 'cur'
-      // brought into work first exactly the same way.
+      // ahead of any real pixel data. It only ever touches Y, though, so
+      // unlike the old code there's no need to bring the whole frame into
+      // work first: gs_contrast_normalize reads straight from cur's Y plane
+      // and writes straight into work's, and only the untouched U/V planes
+      // need an explicit copy (when cur isn't already work).
+      const uint8_t *src_planes[3];
+      chain_buf_planes_const(frame, cur, src_planes);
       if (cur != CHAIN_WORK) {
-        memcpy(frame->pixel_data, chain_buf_data(frame, cur), total);
-        cur = CHAIN_WORK;
+        memcpy(frame->planes[1], src_planes[1], frame->plane_sizes[1]);
+        memcpy(frame->planes[2], src_planes[2], frame->plane_sizes[2]);
       }
-      gs_contrast_normalize(frame);
+      gs_contrast_normalize(src_planes[0], frame->planes[0], frame->width,
+                            frame->height, frame->stride[0]);
+      cur = CHAIN_WORK;
       ++i;
       continue;
     }
@@ -253,22 +281,32 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
     fuse_point_op_run(cfg, &i, lut_y, lut_u, lut_v, &touched_y, &touched_u,
                       &touched_v);
 
-    // Point ops always mutate frame->planes (work) in place, exactly as
-    // before chaining existed. Bring the chain's current state into work
-    // first if a prior stage left it somewhere else -- unconditional on
-    // whether this run touched anything, matching the old per-stage code's
-    // behavior for a lone EFFECT_NONE stage.
-    if (cur != CHAIN_WORK) {
-      memcpy(frame->pixel_data, chain_buf_data(frame, cur), total);
-      cur = CHAIN_WORK;
-    }
+    // Touched planes go straight from cur's buffer to their LUT'd result in
+    // work -- no separate copy-then-overwrite first. Only an untouched
+    // plane needs a plain copy (when cur isn't already work), since nothing
+    // else is going to write it before the chain moves on.
+    const uint8_t *src_planes[3];
+    chain_buf_planes_const(frame, cur, src_planes);
 
-    if (touched_y)
-      apply_lut_plane(frame->planes[0], frame->plane_sizes[0], lut_y);
-    if (touched_u)
-      apply_lut_plane(frame->planes[1], frame->plane_sizes[1], lut_u);
-    if (touched_v)
-      apply_lut_plane(frame->planes[2], frame->plane_sizes[2], lut_v);
+    if (touched_y) {
+      apply_lut_plane(src_planes[0], frame->planes[0], frame->plane_sizes[0],
+                      lut_y);
+    } else if (cur != CHAIN_WORK) {
+      memcpy(frame->planes[0], src_planes[0], frame->plane_sizes[0]);
+    }
+    if (touched_u) {
+      apply_lut_plane(src_planes[1], frame->planes[1], frame->plane_sizes[1],
+                      lut_u);
+    } else if (cur != CHAIN_WORK) {
+      memcpy(frame->planes[1], src_planes[1], frame->plane_sizes[1]);
+    }
+    if (touched_v) {
+      apply_lut_plane(src_planes[2], frame->planes[2], frame->plane_sizes[2],
+                      lut_v);
+    } else if (cur != CHAIN_WORK) {
+      memcpy(frame->planes[2], src_planes[2], frame->plane_sizes[2]);
+    }
+    cur = CHAIN_WORK;
   }
 
   // The rest of the pipeline always expects the result in frame->planes.
@@ -277,6 +315,8 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   // stage was a neighborhood op that happened to leave the result in
   // spare rather than work.
   if (cur != CHAIN_WORK) {
+    size_t total =
+        frame->plane_sizes[0] + frame->plane_sizes[1] + frame->plane_sizes[2];
     memcpy(frame->pixel_data, chain_buf_data(frame, cur), total);
   }
 }

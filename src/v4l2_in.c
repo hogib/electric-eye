@@ -19,6 +19,16 @@
 #include <turbojpeg.h>
 #include <unistd.h>
 
+// Same architecture detection as point_opps.c/conv.c (duplicated rather
+// than shared via a header, matching those files' existing convention).
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define GS_NEON_AARCH64 1
+#elif defined(__arm__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define GS_NEON_ARM32 1
+#endif
+
 constexpr uint32_t v4l2_in_max_buffers = 8;
 
 struct V4l2In {
@@ -304,19 +314,41 @@ static DecodeResult unpack_yuyv_frame(const uint8_t *yuyv, size_t yuyv_size,
     uint8_t *v_row = v_plane + (size_t)row * c_stride;
 
     uint32_t x = 0, cx = 0;
+#if defined(GS_NEON_AARCH64) || defined(GS_NEON_ARM32)
+    // YUYV's 4-byte groups (Y0 U0 Y1 V0) are exactly a 4-channel
+    // interleaved format, which vld4q_u8 exists to de-interleave: one
+    // 64-byte load yields 16 lanes each of Y0, U, Y1, V. U and V land
+    // already in planar order, one store each. Y needs Y0/Y1 re-interleaved
+    // back into a single row (Y0[0],Y1[0],Y0[1],Y1[1],...) -- vst2q_u8
+    // does exactly that interleave on the way out, so no manual zip is
+    // needed. Each chunk covers 32 luma pixels (16 pixel pairs) from 64
+    // source bytes.
+    //
+    // Verified bit-exact against the scalar loop below over pseudo-random
+    // frame content at widths both divisible and not divisible by 32 (so
+    // the scalar remainder tail is also exercised), cross-compiled for
+    // aarch64 and run under qemu-user emulation; this file has not been
+    // built or run on real hardware.
+    for (; x + 31 < frame->width; x += 32, cx += 16) {
+      uint8x16x4_t g = vld4q_u8(&src[x * 2]);
+      vst1q_u8(&u_row[cx], g.val[1]);
+      vst1q_u8(&v_row[cx], g.val[3]);
+      uint8x16x2_t y_pair = {{g.val[0], g.val[2]}};
+      vst2q_u8(&y_row[x], y_pair);
+    }
+#endif
     for (; x + 1 < frame->width; x += 2, ++cx) {
-      y_row[x] = src[0];
-      u_row[cx] = src[1];
-      y_row[x + 1] = src[2];
-      v_row[cx] = src[3];
-      src += 4;
+      y_row[x] = src[x * 2];
+      u_row[cx] = src[x * 2 + 1];
+      y_row[x + 1] = src[x * 2 + 2];
+      v_row[cx] = src[x * 2 + 3];
     }
     // An odd width leaves one trailing luma sample with no paired chroma
     // update of its own -- vf_create's chroma_width = (width+1)/2 already
     // reserves a slot for it, just copy the luma and leave that slot as
     // whatever the previous pair wrote.
     if (x < frame->width) {
-      y_row[x] = src[0];
+      y_row[x] = src[x * 2];
     }
   }
 

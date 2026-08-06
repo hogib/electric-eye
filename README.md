@@ -19,8 +19,9 @@ Built and tested targeting a Raspberry Pi 5 with a USB UVC webcam, but nothing i
   parameterized: `sobel` (edge detection), `blur`, `grayscale`, `invert`, `threshold`,
   `tint`, `none`. Consecutive point ops (grayscale/invert/threshold/tint) fuse into a
   single lookup-table pass rather than running as separate loops over the frame.
-- **NEON-accelerated** on AArch64 for `sobel`, `blur`, and `tint` (falls back to plain
-  C, still OpenMP-parallelized, everywhere else).
+- **NEON-accelerated** on AArch64 for `sobel`, `blur`, and `contrast`'s min/max scan
+  (falls back to plain C, still OpenMP-parallelized, everywhere else — including the
+  fused point-op LUT chain, where a plain cache-friendly lookup beats a NEON gather).
 - **Hot-reloadable JSON config.** Edit the config file — locally, or have a script on
   another device write it over the network — and the running pipeline picks up the
   change within ~200ms, no restart. A sibling `.status` file reports back whether each
@@ -331,7 +332,9 @@ Project layout: `src/` is a flat set of translation units, no subdirectories —
 capture (`v4l2_in`), virtual-cam output (`v4l2_out`), the live-preview stream tap
 (`stream_server`), `v4l2loopback` load/unload (`virtual_cam`), the frame ring buffer,
 the `VideoFrame` raw/work/spare pool, effects (`conv.c` for Sobel/blur, `point_opps.c`
-for grayscale/invert/threshold/tint), the chain runner (`effect_chain.c`), and config
-hot-reload (`config.c`) are each self-contained modules wired together in
+for `contrast`'s min/max-scan-and-stretch), the chain runner (`effect_chain.c` — also
+where grayscale/invert/threshold/tint/light actually live, fused into LUTs; see
+[Configuring effects](#configuring-effects)), and config hot-reload (`config.c`) are
+each self-contained modules wired together in
 `video_threads.c` / `eeye.c`. `pi/` and `topside/` are standalone Python scripts, not
 part of the meson build — see [Live preview + web control](#live-preview--web-control).
