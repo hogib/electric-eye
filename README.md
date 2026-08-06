@@ -214,18 +214,19 @@ effect instead of just confirming it wrote a file.
 
 ## Live preview + web control
 
-Two small, optional, stdlib-only Python scripts — nothing to `pip install` — turn this
-into a tethered control station, which is the actual use case this project targets: a
-drone underwater, connected by a cable to a topside operator.
+Two small, optional, stdlib-only Python scripts — `pi/config_agent.py` and
+`topside/web_ui.py` (aka the Hellion) — turn this into a tethered control station,
+which is the actual use case this project targets: a drone underwater, connected by
+a cable to a topside operator.
 
 ```
    drone (Pi)                                    topside (any machine)
-┌─────────────────────┐                        ┌──────────────────────┐
-│ eeye                │──JPEG, throttled──────► │                      │
-│  stream_server :9000│    (TCP socket)         │  topside/web_ui.py   │──► browser
-│                      │                         │   :8080              │
-│ pi/config_agent.py   │◄──config JSON──────────│                      │
-│  :9001               │   (HTTP, proxied)       └──────────────────────┘
+┌─────────────────────┐                        ┌──────────────────────────┐
+│ eeye                │──JPEG, throttled──────► │                          │
+│  stream_server :9000│    (TCP socket)         │  topside/web_ui.py       │──► browser
+│                      │                         │   (the Hellion) :8080    │
+│ pi/config_agent.py   │◄──config JSON──────────│                          │
+│  :9001               │   (HTTP, proxied)       └──────────────────────────┘
 └─────────────────────┘
 ```
 
@@ -241,15 +242,15 @@ python3 pi/config_agent.py --config-path eeye_config.json
 python3 topside/web_ui.py --drone-host <drone's IP over the tether>
 ```
 
-Then open `http://<topside machine's IP>:8080/` in a browser. The page shows the live
-feed and a form for the effect chain, recording path, and stream settings; hitting
-Apply sends your changes to `config_agent.py`, which writes them to `eeye_config.json`
-and waits for `eeye`'s own `.status` file to confirm whether they actually took
-effect — the UI tells you definitively "applied," "rejected" (check `eeye`'s own log
-for why), or "no confirmation" (is `eeye` even running?), not just "the network request
-succeeded."
+Then open `http://<topside machine's IP>:8080/` in a browser. The Hellion's page shows
+the live feed and a form for the effect chain, recording path, and stream settings;
+hitting Apply sends your changes to `config_agent.py`, which writes them to
+`eeye_config.json` and waits for `eeye`'s own `.status` file to confirm whether they
+actually took effect — the UI tells you definitively "applied," "rejected" (check
+`eeye`'s own log for why), or "no confirmation" (is `eeye` even running?), not just
+"the network request succeeded."
 
-The browser only ever talks to `web_ui.py`; it proxies the config read/write to
+The browser only ever talks to the Hellion; it proxies the config read/write to
 `config_agent.py` server-to-server, so there's no CORS to deal with and the drone's own
 ports don't need to be reachable from whatever network a browser happens to be on.
 
