@@ -434,6 +434,152 @@ static void blur_plane_repeated(const uint8_t *src, uint8_t *dst, uint32_t width
   }
 }
 
+// --- Half-resolution fast path for higher blur_strength values --------
+//
+// Frame dimensions here are always the compile-time constants in eeye.c
+// (1280x720 luma, 640x720 chroma for 4:2:2 -- see vf_create), which are
+// exactly divisible by 2 at every level this code is ever called with, so
+// every split below is a clean half with no remainder row/column to
+// special-case.
+//
+// blur_plane_repeated's cost is linear in `passes`; downsampling first
+// cuts every one of those repeated passes to a quarter of its pixels (half
+// width * half height) at the fixed one-time cost of one 2x2 box-average
+// down and one 2x bilinear up. That fixed cost isn't worth paying for a
+// single pass -- see halfres_blur_pass_threshold below -- but it pays for
+// itself increasingly well as `passes` climbs, which is exactly the
+// situation that makes blur the dominant cost of a frame in the first
+// place.
+
+// 2x2 box average: touches every input pixel exactly once. No benefit to
+// splitting this into two 2:1 passes the way the blur itself is separable
+// -- every output sample already needs exactly its own 4 input samples, so
+// an extra buffer round-trip would only add cost, not remove any.
+static void downsample_box2x2(const uint8_t *src, size_t src_stride,
+                              uint32_t half_w, uint32_t half_h, uint8_t *dst) {
+#pragma omp parallel for
+  for (uint32_t y = 0; y < half_h; ++y) {
+    const uint8_t *row0 = src + (size_t)(2 * y) * src_stride;
+    const uint8_t *row1 = src + (size_t)(2 * y + 1) * src_stride;
+    uint8_t *out_row = dst + (size_t)y * half_w;
+    for (uint32_t x = 0; x < half_w; ++x) {
+      uint32_t x0 = 2 * x, x1 = x0 + 1;
+      out_row[x] =
+          (uint8_t)((row0[x0] + row0[x1] + row1[x0] + row1[x1] + 2) >> 2);
+    }
+  }
+}
+
+// One row of the 2x horizontal bilinear upsample below -- standalone so
+// the vertical pass (upsample_bilinear2x) can apply the exact same 3-1/1-3
+// weighting to rows instead of columns.
+//
+// Standard half-pixel-center bilinear upsample for an exact 2x scale
+// factor: output sample 2k sits 1/4 of the way from in[k] toward in[k-1];
+// output sample 2k+1 sits 1/4 of the way from in[k] toward in[k+1]. A
+// fixed 2x scale means those weights (3/4, 1/4) never change, so they're
+// baked in as integers rather than computed per pixel -- no runtime
+// interpolation math, same rounding convention as blur5's "+bias >> shift".
+static void upsample2x_row(const uint8_t *in, uint32_t half_w, uint8_t *out) {
+  for (uint32_t k = 0; k < half_w; ++k) {
+    uint32_t km1 = k == 0 ? 0 : k - 1;
+    uint32_t kp1 = k + 1 >= half_w ? half_w - 1 : k + 1;
+    out[2 * k] = (uint8_t)((1 * in[km1] + 3 * in[k] + 2) >> 2);
+    out[2 * k + 1] = (uint8_t)((3 * in[k] + 1 * in[kp1] + 2) >> 2);
+  }
+}
+
+// Mirrors blur_plane's own horizontal-then-vertical structure: expand
+// columns first (half_w -> width, one row at a time) into blur_scratch,
+// then expand rows (half_h -> height) out of that into dst. Safe to reuse
+// blur_scratch here even though blur_plane also owns it -- by the time
+// upsampling starts, whatever repeated blur passes used it have already
+// completed and returned, so it's free for this second, unrelated purpose.
+static void upsample_bilinear2x(const uint8_t *small, uint32_t half_w,
+                                uint32_t half_h, uint8_t *dst, uint32_t width,
+                                uint32_t height, size_t dst_stride) {
+  size_t needed = (size_t)width * half_h;
+  if (blur_scratch_cap < needed) {
+    uint8_t *grown = realloc(blur_scratch, needed);
+    if (!grown)
+      return; // Leave dst untouched, matching blur_plane's own OOM handling.
+    blur_scratch = grown;
+    blur_scratch_cap = needed;
+  }
+
+#pragma omp parallel for
+  for (uint32_t y = 0; y < half_h; ++y) {
+    upsample2x_row(small + (size_t)y * half_w, half_w,
+                   blur_scratch + (size_t)y * width);
+  }
+
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    uint32_t k = y / 2;
+    bool lean_down = (y % 2) == 0; // even output row leans toward row k-1
+    uint32_t other =
+        lean_down ? (k == 0 ? 0 : k - 1) : (k + 1 >= half_h ? half_h - 1 : k + 1);
+    const uint8_t *r_k = blur_scratch + (size_t)k * width;
+    const uint8_t *r_other = blur_scratch + (size_t)other * width;
+    uint8_t *out_row = dst + (size_t)y * dst_stride;
+    for (uint32_t x = 0; x < width; ++x) {
+      out_row[x] = (uint8_t)((3 * r_k[x] + r_other[x] + 2) >> 2);
+    }
+  }
+}
+
+// Half-resolution scratch for blur_plane_repeated_auto's downsample step --
+// same lazy-grow/never-shrink lifetime as blur_scratch, just a distinct
+// buffer since it needs to stay alive across the downsample, the repeated
+// half-res blur passes, and the upsample, whereas blur_scratch itself gets
+// reused partway through by both the repeated passes and the upsample.
+static uint8_t *halfres_scratch;
+static size_t halfres_scratch_cap;
+
+// Below this many repeat passes, the fixed downsample/upsample cost isn't
+// worth paying: it eats most of the savings right when a single extra
+// full-res pass is already cheap, and a low pass count is the "just soften
+// this a little" case most likely to actually be scrutinized. At and above
+// it, the linear-in-passes savings from blurring a quarter as many pixels
+// per pass clearly wins, and the softening those two extra resize steps
+// add is comparatively unnoticeable on top of an already-heavy blur.
+constexpr uint32_t halfres_blur_pass_threshold = 4;
+
+static void blur_plane_repeated_auto(const uint8_t *src, uint8_t *dst,
+                                     uint32_t width, uint32_t height,
+                                     size_t stride, uint32_t passes) {
+  if (passes < halfres_blur_pass_threshold) {
+    blur_plane_repeated(src, dst, width, height, stride, passes);
+    return;
+  }
+
+  uint32_t half_w = width / 2, half_h = height / 2;
+  size_t needed = (size_t)half_w * half_h;
+  if (halfres_scratch_cap < needed) {
+    uint8_t *grown = realloc(halfres_scratch, needed);
+    if (!grown) { // Fall back to the always-correct full-res path rather
+                  // than leaving dst stale.
+      blur_plane_repeated(src, dst, width, height, stride, passes);
+      return;
+    }
+    halfres_scratch = grown;
+    halfres_scratch_cap = needed;
+  }
+
+  downsample_box2x2(src, stride, half_w, half_h, halfres_scratch);
+  // halfres_scratch is tightly packed, so its own stride is half_w. Using
+  // it as both source and destination here is the same aliasing
+  // blur_plane_repeated's pass 2+ already relies on (see blur_plane's own
+  // comment): the horizontal pass fully drains its source into blur_scratch
+  // before the vertical pass writes anything, with a hard OpenMP barrier
+  // between the two, so it's just as safe on pass 1 when src and dst happen
+  // to be the same buffer.
+  blur_plane_repeated(halfres_scratch, halfres_scratch, half_w, half_h,
+                      half_w, passes);
+  upsample_bilinear2x(halfres_scratch, half_w, half_h, dst, width, height,
+                      stride);
+}
+
 void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
                    uint32_t width, uint32_t height, const size_t stride[3],
                    uint8_t strength) {
@@ -443,15 +589,15 @@ void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes
   // 0 and 1 both mean "just the one pass" -- see conv.h.
   uint32_t passes = strength == 0 ? 1 : strength;
 
-  blur_plane_repeated(src_planes[0], dst_planes[0], width, height, stride[0],
-                      passes);
+  blur_plane_repeated_auto(src_planes[0], dst_planes[0], width, height,
+                           stride[0], passes);
 
   // stride[1]/[2] are exactly the chroma width with no padding (see
   // vf_create), matching how color_tint already uses them as its own loop
   // bound.
   uint32_t chroma_width = (uint32_t)stride[1];
-  blur_plane_repeated(src_planes[1], dst_planes[1], chroma_width, height,
-                      stride[1], passes);
-  blur_plane_repeated(src_planes[2], dst_planes[2], chroma_width, height,
-                      stride[2], passes);
+  blur_plane_repeated_auto(src_planes[1], dst_planes[1], chroma_width, height,
+                           stride[1], passes);
+  blur_plane_repeated_auto(src_planes[2], dst_planes[2], chroma_width, height,
+                           stride[2], passes);
 }

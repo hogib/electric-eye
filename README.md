@@ -163,7 +163,7 @@ one of `none`, `grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, `con
 | `tint_v` | `tint` | 0–255 | Target chroma V (red–green axis, 128 = neutral). |
 | `tint_strength` | `tint` | 0–255 | Blend strength: 0 = no change, 255 = fully replaced. |
 | `sobel_threshold` | `sobel` | 0–255 | Gradient magnitudes below this are clamped to 0 (raises the bar for what counts as an edge). |
-| `blur_strength` | `blur` | 0–255 | How many times to repeat the 5-tap blur pass; 0 and 1 both mean a single pass. |
+| `blur_strength` | `blur` | 0–255 | How many times to repeat the 5-tap blur pass; 0 and 1 both mean a single pass. Cost is linear in this value but the visible effect isn't (repeated small-kernel blur's effective radius grows with the square root of the pass count), so past ~20 you're mostly paying for frame time, not more blur — the web UI's slider caps there for that reason; edit the JSON directly for higher. |
 | `light_level` | `light` | 0–255 | One dial over brightness *and* saturation together; 128 = neutral (default). Below darkens/desaturates toward black, above brightens/boosts saturation. |
 
 `contrast` takes no parameters — it's a full-frame auto min/max luma stretch,
@@ -177,6 +177,13 @@ omitted — every other optional field's zero-init default already happens to me
 change" for its effect, but 0 for `light_level` would mean "fully dark and
 desaturated," so it's special-cased to default to neutral instead (see
 `parse_effect_stage` in `src/config.c`).
+
+At `blur_strength` 4 and above, `blur` internally downsamples to half resolution,
+runs its repeated passes there, then upsamples back — a quarter as many pixels per
+pass for a softening that's already hard to tell apart from the full-resolution
+version at that pass count. Below 4 it stays full-resolution, since the fixed cost of
+that resize isn't worth paying when there's only one or two passes to save it on. See
+`blur_plane_repeated_auto` in `src/conv.c`.
 
 A stage carrying a key its effect doesn't use (e.g. `tint_u` on a `blur` stage) is a
 hard parse error, not silently ignored — a typo should be loud, not a quiet no-op. An

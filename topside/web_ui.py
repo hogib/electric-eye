@@ -113,7 +113,13 @@ EFFECT_FIELDS = {
         ["tint_strength", 0, 255, 180],
     ],
     "sobel": [["sobel_threshold", 0, 255, 0]],
-    "blur": [["blur_strength", 0, 255, 0]],
+    # Range capped well below the field's real 0-255 (repeat-count) domain:
+    # each unit is a full extra 5-tap pass over the whole frame, and past
+    # ~20 the added blur is visually indistinguishable (effective radius
+    # grows with sqrt(passes)) while cost keeps climbing linearly -- at 255
+    # it's ~5x slower per frame than at 20 for no visible gain. Edit
+    # eeye_config.json directly if you ever want higher than the slider goes.
+    "blur": [["blur_strength", 0, 20, 0]],
     "contrast": [],
     "light": [["light_level", 0, 255, 128]],
 }
