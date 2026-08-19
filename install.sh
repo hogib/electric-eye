@@ -42,6 +42,19 @@ command -v apt-get >/dev/null 2>&1 || die "apt-get not found. This installer tar
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/builddir"
 
+if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+  warn "Secure Boot is on. Installing v4l2loopback-dkms below may pop up a \
+one-time MOK enrollment password prompt -- don't skip it. Afterward you \
+MUST reboot: a blue 'MOK Manager' screen will appear during boot asking \
+for that same password to actually enroll the signing key. Skip either \
+step and the module builds fine but the kernel refuses to load it, which \
+looks exactly like a permissions error later ('modprobe: could not \
+insert ... Operation not permitted') rather than what it actually is. If \
+you miss the prompt, check 'sudo mokutil --list-new' -- non-empty output \
+means enrollment is still pending, and rebooting will show the MOK \
+Manager screen again."
+fi
+
 log "Installing build and runtime dependencies"
 apt-get update
 if ! apt-get install -y build-essential meson ninja-build pkg-config \
