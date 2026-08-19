@@ -80,8 +80,11 @@ config push can never land mid-frame.
   [Known limitations](#known-limitations)).
 - `v4l2loopback` (kernel module) — `eeye` loads it itself, but loading a kernel module
   needs `CAP_SYS_MODULE`; see [Loading v4l2loopback](#loading-v4l2loopback) below.
-- `libturbojpeg`, `meson`, `ninja`, a C23 compiler (gcc or clang), OpenMP (`libgomp`,
-  ships with gcc).
+- `meson`, `ninja`, a C23 compiler (gcc or clang), OpenMP (`libgomp`, ships with gcc).
+  `libturbojpeg` is used if the system has it (`libturbojpeg0-dev` on Debian/Ubuntu),
+  but isn't required — if meson can't find it, it builds a static copy from source
+  automatically, so there's nothing to install by hand if that package is missing,
+  wrongly named, or the runtime `.so` is out of sync with the dev headers.
 - Python 3 (standard library only, nothing to `pip install`) if you want the optional
   web UI — see [Live preview + web control](#live-preview--web-control). Not needed
   for the core pipeline at all.

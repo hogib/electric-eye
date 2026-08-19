@@ -6,6 +6,13 @@ project(
         'warning_level=3',
         'c_std=gnu23',
         'buildtype=debugoptimized',
+        # electric_eye itself has no library() targets, so this only matters
+        # when the libturbojpeg fallback below pulls in libjpeg-turbo (and
+        # its own spng/zlib subprojects) from source -- meson propagates a
+        # project's default_library down through subprojects unless a wrap
+        # overrides it, so setting it here is what makes that whole chain
+        # link statically instead of just the outermost one.
+        'default_library=static',
     ],
 )
 
@@ -24,7 +31,20 @@ thread_dep = dependency('threads')
 # gone. Nothing in src/ has ever linked against libavcodec/libavformat/
 # libavutil directly (grep confirms it), so the dependency that used to be
 # declared here for them is dropped rather than kept around unused.
-turbojpeg_dep = dependency('libturbojpeg')
+#
+# stream_server.c only calls tjInitCompress/tjCompressFromYUVPlanes/tjBufSize
+# -- no file I/O, no decode. Prefer the system libturbojpeg (usually a distro
+# dev package) when it's there; if it's missing or broken (this fell over on
+# a fresh Linux Mint box), fall back to building libjpeg-turbo from source as
+# a static subproject, so eeye needs no turbojpeg apt package and no
+# libturbojpeg.so.0 at runtime either way. This is "no system package
+# needed", not "fully static ELF" -- glibc/pthread/OpenMP are still linked
+# dynamically.
+turbojpeg_dep = dependency(
+    'libturbojpeg',
+    fallback: ['libjpeg-turbo', 'turbojpeg_dep'],
+    default_options: ['turbojpeg=enabled'],
+)
 
 # point_opps.c and conv.c already carry #pragma omp parallel for on every
 # hot loop -- those loops were written to be race-free specifically so this

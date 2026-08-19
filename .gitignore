@@ -69,3 +69,9 @@ notes/
 test/
 build-dbg/
 build-rel/
+
+# meson subprojects: only the .wrap files (which fetch these on demand) are
+# tracked; the extracted/downloaded source trees they point at are not.
+subprojects/*
+!subprojects/*.wrap
+!subprojects/packagefiles/
