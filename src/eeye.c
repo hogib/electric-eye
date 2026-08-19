@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "frame_ring_buffer.h"
+#include "v4l2_in.h"
 #include "video_frame.h"
 #include "video_threads.h"
 #include "virtual_cam.h"
@@ -188,11 +189,25 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  uint32_t out_width, out_height;
-  config_output_geometry(&startup_config, &out_width, &out_height);
+  uint32_t capture_width = startup_config.capture_width;
+  uint32_t capture_height = startup_config.capture_height;
 
-  prod_args.capture_width = startup_config.capture_width;
-  prod_args.capture_height = startup_config.capture_height;
+  // Ask the camera what it can actually do before anything is sized from
+  // the answer. Advisory only: if the camera isn't plugged in yet this
+  // leaves the configured size alone and producer_loop's reconnect loop
+  // takes over, so startup without a camera keeps working. Done here
+  // rather than inside v4l2_in_open because the frame pool below is
+  // allocated once, up front, and every frame in it has to match whatever
+  // size the camera is eventually opened at -- by the time v4l2_in_open
+  // runs (on the producer thread) that size is already committed.
+  v4l2_in_negotiate_size(prod_args.filename, &capture_width, &capture_height,
+                         startup_config.downscale);
+
+  uint32_t out_width = capture_width / startup_config.downscale;
+  uint32_t out_height = capture_height / startup_config.downscale;
+
+  prod_args.capture_width = capture_width;
+  prod_args.capture_height = capture_height;
   prod_args.downscale = startup_config.downscale;
   prod_args.frame_width = out_width;
   prod_args.frame_height = out_height;
@@ -201,11 +216,15 @@ int main(int argc, char **argv) {
   cons_args.frame_width = out_width;
   cons_args.frame_height = out_height;
 
+  // Reports the negotiated capture size, not the configured one -- they
+  // differ whenever v4l2_in_negotiate_size() substituted a mode, and this
+  // line is the one place an operator checks to see what the run is
+  // actually doing.
   if (startup_config.downscale > 1) {
     printf("Geometry: capturing %ux%u, downscaling %ux -> pipeline runs at "
            "%ux%u\n",
-           startup_config.capture_width, startup_config.capture_height,
-           startup_config.downscale, out_width, out_height);
+           capture_width, capture_height, startup_config.downscale, out_width,
+           out_height);
   } else {
     printf("Geometry: %ux%u, no downscaling\n", out_width, out_height);
   }

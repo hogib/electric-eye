@@ -26,10 +26,12 @@ Built and tested targeting a Raspberry Pi 5 with a USB UVC webcam, but nothing i
   another device write it over the network — and the running pipeline picks up the
   change within ~200ms, no restart. A sibling `.status` file reports back whether each
   attempt was actually accepted (see [Configuring effects](#configuring-effects)).
-- **Configurable resolution with an integer downscale.** Capture at whatever your
-  camera offers, then optionally run the entire pipeline at ½, ¼, or ⅛ of it — the
-  single biggest lever on frame cost and tether bandwidth. On MJPEG the scaling
-  happens *inside* the JPEG decode, so the decode itself gets cheaper too. See
+- **Configurable, auto-negotiated resolution with an integer downscale.** Ask for a
+  resolution and `eeye` falls back to the closest mode the camera actually offers
+  (aspect ratio first) rather than refusing to start — then optionally runs the entire
+  pipeline at ½, ¼, or ⅛ of it, the single biggest lever on frame cost and tether
+  bandwidth. On MJPEG the scaling happens *inside* the JPEG decode, so the decode
+  itself gets cheaper too. See
   [Resolution and downscaling](#resolution-and-downscaling).
 - **Optional live-preview streaming + a topside web UI**, for exactly the case this
   project was built for: the drone is somewhere you can't be, connected by a tether.
@@ -235,8 +237,23 @@ ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE
 ### Resolution and downscaling
 
 `"capture_width"` / `"capture_height"` (default 1280×720) are what `eeye` asks the
-camera for. The camera has to grant them **exactly** — this is a demand, not a hint —
-so check what yours actually offers:
+camera for. If the camera doesn't offer that exact mode, `eeye` enumerates what it
+*does* offer (across both MJPEG and YUYV) and picks the closest usable one, logging
+the substitution at startup:
+
+```
+v4l2_in: /dev/video0 does not offer 1920x1080; using 1280x720 instead
+         (closest available at the same aspect ratio, and divisible by downscale 2)
+```
+
+Closest means **aspect ratio first, pixel count second** — a 4:3 stand-in for a 16:9
+request re-frames every shot, which is a worse surprise than the same framing at
+fewer pixels. Candidates that would break the downscale divisibility rule below are
+excluded outright. An exact match is always chosen, silently.
+
+This is best-effort, not a guarantee: it needs the camera present at startup to have
+anything to enumerate. If it isn't plugged in yet, the configured size stays in force
+and the normal reconnect loop takes over. To see the modes yourself:
 
 ```sh
 v4l2-ctl --list-formats-ext -d /dev/video0
@@ -381,10 +398,15 @@ retries that internally without a restart.
   standard tables when that's detected. Mentioned here only because it's the kind of
   thing worth knowing exists if you're debugging a decode failure on a new camera.
 - **Framerate and both device paths are compile-time constants.** Resolution is
-  configurable now (see [Resolution and downscaling](#resolution-and-downscaling)),
-  but it's still a demand rather than a negotiation: `eeye` asks the camera for
-  exactly what the config says and fails at launch if that isn't on offer, instead of
-  enumerating supported sizes and picking the nearest.
+  configurable and negotiated (see
+  [Resolution and downscaling](#resolution-and-downscaling)).
+- **Resolution is negotiated once, at startup.** If the camera is unplugged at launch
+  there's nothing to enumerate, so the configured size stays in force and `eeye`
+  retries with it; a *different* camera plugged in later is then held to that size
+  rather than renegotiated. Replugging the same camera is unaffected.
+- **The web UI's geometry display reads the config file**, so it shows the size you
+  asked for, not the one negotiated with the camera. Check `eeye`'s startup log
+  (`journalctl -u eeye`) for the size actually in use.
 - **Geometry changes need a restart.** `capture_width`/`capture_height`/`downscale`
   are read once at startup; changing them in a running config is logged and ignored.
 - **Live-preview stream is single-viewer.** `stream_server` accepts one connection at a

@@ -55,6 +55,37 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
                      uint32_t framerate_hint, uint32_t downscale);
 
 /*
+ * Best-effort "what can this camera actually do?" pass, run once at
+ * startup before anything is sized from the answer. Asks the driver
+ * (VIDIOC_ENUM_FRAMESIZES, over both MJPEG and YUYV) what it offers and
+ * rewrites the width and height it is given to the closest usable match
+ * for what was requested, so a camera that simply doesn't do the
+ * configured resolution runs at a sensible nearby one instead of failing
+ * to open forever.
+ *
+ * Ranking is aspect ratio first, pixel count second: a 4:3 substitute for
+ * a 16:9 request changes the framing of every subsequent frame, which is
+ * a worse surprise than the same framing at fewer pixels. An exact match
+ * always wins outright and is chosen silently.
+ *
+ * Candidates are filtered by `downscale`'s divisibility rule (width a
+ * multiple of 2*downscale, height a multiple of downscale) -- the same
+ * rule config.c enforces on the requested size, applied here because the
+ * negotiated size is what the box-average and I422 chroma math actually
+ * run on. A camera whose every mode fails that rule is reported rather
+ * than silently reverting downscale.
+ *
+ * This deliberately cannot fail the caller: it returns false (leaving
+ * both values untouched) when the device is absent or refuses to
+ * enumerate, because the camera legitimately may not be plugged in yet at
+ * startup -- producer_loop's reconnect loop covers that case, and the
+ * configured size stays in force. It is only ever advisory; v4l2_in_open()
+ * still demands whatever size it is eventually given, exactly.
+ */
+bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
+                            uint32_t *height, uint32_t downscale);
+
+/*
  * Blocks until the driver has a filled buffer (bounded by an internal
  * poll timeout), decodes it into frame->raw_planes, and returns the
  * driver's buffer so streaming continues.

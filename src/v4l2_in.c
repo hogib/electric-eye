@@ -572,6 +572,180 @@ static bool try_set_format(int fd, uint32_t fourcc, uint32_t width,
   return true;
 }
 
+// How far a candidate's aspect ratio may sit from the best one found and
+// still be considered on equal footing, in the same 1/10000 units
+// aspect_error() returns. 100 is 1%, comfortably wider than the rounding
+// noise between nominally-identical ratios (a 4:3 mode listed as 352x288
+// is really 11:9, ~1.9% off, and correctly does *not* get grouped with a
+// true 4:3 mode by this).
+constexpr int64_t aspect_group_tolerance = 100;
+
+// |w/h - want_w/want_h|, scaled by 10000 to stay in integer math. Cross-
+// multiplied so neither division can round before the comparison.
+static int64_t aspect_error(uint32_t w, uint32_t h, uint32_t want_w,
+                            uint32_t want_h) {
+  int64_t num = (int64_t)w * want_h - (int64_t)want_w * h;
+  if (num < 0)
+    num = -num;
+  return (num * 10000) / ((int64_t)h * want_h);
+}
+
+typedef struct {
+  uint32_t width, height;
+  bool found;
+  bool exact;
+  // Ranking keys, only meaningful once found is true.
+  int64_t aspect;
+  uint64_t pixel_gap;
+} SizeChoice;
+
+// Folds one candidate mode into the running best. Ordering: an exact match
+// beats everything; otherwise the smallest aspect error wins, and among
+// candidates whose aspect errors are within aspect_group_tolerance of each
+// other, the closest pixel count wins.
+static void consider_size(SizeChoice *best, uint32_t w, uint32_t h,
+                          uint32_t want_w, uint32_t want_h,
+                          uint32_t downscale) {
+  if (w == 0 || h == 0)
+    return;
+  // The same rule config.c applies to the requested size. Enforced here
+  // too because it is the *negotiated* size the I422 chroma halving and
+  // the YUYV box average actually run on -- a mode that fails it would
+  // produce a frame whose chroma planes don't line up with its luma.
+  if (w % (downscale * 2u) != 0 || h % downscale != 0)
+    return;
+
+  bool exact = (w == want_w && h == want_h);
+  int64_t asp = aspect_error(w, h, want_w, want_h);
+  uint64_t want_px = (uint64_t)want_w * want_h;
+  uint64_t px = (uint64_t)w * h;
+  uint64_t gap = px > want_px ? px - want_px : want_px - px;
+
+  if (!best->found || exact) {
+    // First viable candidate, or an exact hit that ends the search.
+    if (best->exact && !exact)
+      return;
+    *best = (SizeChoice){.width = w,
+                         .height = h,
+                         .found = true,
+                         .exact = exact,
+                         .aspect = asp,
+                         .pixel_gap = gap};
+    return;
+  }
+  if (best->exact)
+    return;
+
+  if (asp + aspect_group_tolerance < best->aspect ||
+      (asp <= best->aspect + aspect_group_tolerance && gap < best->pixel_gap)) {
+    *best = (SizeChoice){.width = w,
+                         .height = h,
+                         .found = true,
+                         .exact = false,
+                         // Keep the better (smaller) of the two aspect
+                         // errors as the group's yardstick, so a later
+                         // candidate is compared against the best ratio
+                         // seen rather than against whichever one happened
+                         // to win on pixel count.
+                         .aspect = asp < best->aspect ? asp : best->aspect,
+                         .pixel_gap = gap};
+  }
+}
+
+// Walks VIDIOC_ENUM_FRAMESIZES for one pixel format. Drivers report either
+// a discrete list or a single stepwise/continuous range; both are handled,
+// the latter by deriving one best-fit candidate rather than materializing
+// what can be an enormous range.
+static void enumerate_sizes(int fd, uint32_t fourcc, SizeChoice *best,
+                            uint32_t want_w, uint32_t want_h,
+                            uint32_t downscale) {
+  struct v4l2_frmsizeenum fse = {0};
+  fse.pixel_format = fourcc;
+
+  for (fse.index = 0; xioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fse) == 0;
+       fse.index++) {
+    if (fse.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+      consider_size(best, fse.discrete.width, fse.discrete.height, want_w,
+                    want_h, downscale);
+      continue;
+    }
+
+    // Stepwise/continuous: clamp the request into range, then round down
+    // onto both the driver's step grid and our divisibility rule. Rounding
+    // down (rather than to nearest) can only ever land back inside the
+    // range, which rounding up could overshoot. Continuous is just
+    // stepwise with a step of 1, and the kernel reports it that way.
+    uint32_t sw = fse.stepwise.step_width ? fse.stepwise.step_width : 1;
+    uint32_t sh = fse.stepwise.step_height ? fse.stepwise.step_height : 1;
+    uint32_t w = want_w, h = want_h;
+    if (w < fse.stepwise.min_width)
+      w = fse.stepwise.min_width;
+    if (w > fse.stepwise.max_width)
+      w = fse.stepwise.max_width;
+    if (h < fse.stepwise.min_height)
+      h = fse.stepwise.min_height;
+    if (h > fse.stepwise.max_height)
+      h = fse.stepwise.max_height;
+    w -= (w - fse.stepwise.min_width) % sw;
+    h -= (h - fse.stepwise.min_height) % sh;
+    // Walk down the step grid until the divisibility rule is satisfied
+    // too. Bounded by the range itself, and cheap: the rule's period is at
+    // most 16 pixels, so this gives up almost immediately when a step size
+    // makes the two grids incompatible.
+    while (w >= fse.stepwise.min_width && w % (downscale * 2u) != 0)
+      w -= sw;
+    while (h >= fse.stepwise.min_height && h % downscale != 0)
+      h -= sh;
+    if (w >= fse.stepwise.min_width && h >= fse.stepwise.min_height)
+      consider_size(best, w, h, want_w, want_h, downscale);
+
+    break; // a stepwise/continuous report is always the only entry
+  }
+}
+
+bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
+                            uint32_t *height, uint32_t downscale) {
+  if (downscale == 0)
+    downscale = 1;
+
+  int fd = open(path, O_RDWR | O_NONBLOCK);
+  if (fd < 0) {
+    // Not an error worth reporting here: the camera being absent at
+    // startup is an expected, already-handled state (producer_loop retries
+    // and logs its own message). Staying quiet avoids implying the
+    // configured resolution was rejected when it was never tested.
+    return false;
+  }
+
+  SizeChoice best = {0};
+  enumerate_sizes(fd, V4L2_PIX_FMT_MJPEG, &best, *width, *height, downscale);
+  enumerate_sizes(fd, V4L2_PIX_FMT_YUYV, &best, *width, *height, downscale);
+  close(fd);
+
+  if (!best.found) {
+    // Either the driver doesn't implement ENUM_FRAMESIZES (legal, and some
+    // don't) or every mode it offers fails the divisibility rule. Both
+    // leave the configured size in force -- v4l2_in_open will then either
+    // succeed anyway or report the exact mismatch itself, which is a
+    // better-targeted message than anything guessable from here.
+    printf("v4l2_in: %s offered no frame size usable at downscale %u; "
+           "keeping the configured %ux%u\n",
+           path, downscale, *width, *height);
+    return false;
+  }
+
+  if (best.exact)
+    return true; // configured size is available; nothing to say
+
+  printf("v4l2_in: %s does not offer %ux%u; using %ux%u instead (closest "
+         "available at the same aspect ratio, and divisible by downscale "
+         "%u)\n",
+         path, *width, *height, best.width, best.height, downscale);
+  *width = best.width;
+  *height = best.height;
+  return true;
+}
+
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
                      uint32_t framerate_hint, uint32_t downscale) {
   int fd = open(path, O_RDWR | O_NONBLOCK);
