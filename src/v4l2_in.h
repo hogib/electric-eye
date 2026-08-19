@@ -41,10 +41,18 @@ typedef struct V4l2In V4l2In;
  * clearly, here -- rather than resurfacing as a confusing per-frame
  * decode failure once streaming is already underway.
  *
+ * `downscale` (1, 2, 4, or 8 -- validated by config.c) is applied on the
+ * way out of the decode, not as a separate pass afterward: the frames
+ * handed to v4l2_in_read_frame() are width/downscale x height/downscale,
+ * and nothing downstream ever sees a full-resolution frame. The MJPEG
+ * path gets this nearly free by asking libjpeg-turbo to scale during
+ * decompression (fewer IDCT coefficients, so decode itself gets cheaper);
+ * the YUYV path box-averages each NxN block while deinterleaving.
+ *
  * Returns NULL on failure, having already reported the reason.
  */
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
-                     uint32_t framerate_hint);
+                     uint32_t framerate_hint, uint32_t downscale);
 
 /*
  * Blocks until the driver has a filled buffer (bounded by an internal

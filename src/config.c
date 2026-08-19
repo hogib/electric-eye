@@ -45,7 +45,17 @@ static const Config config_defaults = {
     .record_path = "",
     .stream_frame_interval = 0, // off by default -- no JPEG work, no socket traffic
     .stream_quality = 60,
+    .capture_width = 1280,
+    .capture_height = 720,
+    .downscale = 1, // full resolution: what this ran at before the field existed
 };
+
+// The geometry actually in force, captured by config_load_once() before any
+// thread starts and never written again. Only config_publish()'s
+// "you changed this, it won't take effect" warning reads it -- the pipeline
+// itself carries its geometry in the arg structs it was built with.
+static Config startup_geometry;
+static bool startup_geometry_valid = false;
 
 // path="/a/b/c.json" -> dir="/a/b", name="c.json". path="c.json" (no
 // directory component) -> dir=".", name="c.json". Hand-rolled rather than
@@ -162,6 +172,47 @@ static bool parse_u8(Cursor *c, uint8_t *out) {
   }
 
   *out = (uint8_t)v;
+  return true;
+}
+
+// Same shape as parse_u8 above, widened for the capture dimensions --
+// those are the only config values that don't fit in a byte. Kept as a
+// separate function rather than a shared parse_uint(max) because the two
+// callers' error messages and range checks read better spelled out, and
+// this way parse_u8's hot path (every effect parameter) stays exactly as
+// it was.
+static bool parse_u16(Cursor *c, uint16_t *out) {
+  size_t start = c->pos;
+  if (c->pos < c->len && c->s[c->pos] == '-')
+    c->pos++; // consumed so strtol sees the sign; range check below rejects it
+
+  bool any_digit = false;
+  while (c->pos < c->len && c->s[c->pos] >= '0' && c->s[c->pos] <= '9') {
+    c->pos++;
+    any_digit = true;
+  }
+  if (!any_digit) {
+    c->pos = start;
+    return false;
+  }
+
+  char buf[32];
+  size_t n = c->pos - start;
+  if (n >= sizeof buf) { // pathological digit run; bail before strtol sees it
+    c->pos = start;
+    return false;
+  }
+  memcpy(buf, c->s + start, n);
+  buf[n] = '\0';
+
+  char *end = NULL;
+  long v = strtol(buf, &end, 10);
+  if (end == buf || *end != '\0' || v < 0 || v > 65535) {
+    c->pos = start;
+    return false;
+  }
+
+  *out = (uint16_t)v;
   return true;
 }
 
@@ -388,6 +439,21 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"stream_quality\"\n");
           return false;
         }
+      } else if (strcmp(key, "capture_width") == 0) {
+        if (!parse_u16(&c, &parsed.capture_width)) {
+          printf("Config: invalid value for \"capture_width\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "capture_height") == 0) {
+        if (!parse_u16(&c, &parsed.capture_height)) {
+          printf("Config: invalid value for \"capture_height\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "downscale") == 0) {
+        if (!parse_u8(&c, &parsed.downscale)) {
+          printf("Config: invalid value for \"downscale\"\n");
+          return false;
+        }
       } else {
         printf("Config: unknown key \"%s\"\n", key);
         return false;
@@ -417,8 +483,47 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
     return false;
   }
 
+  // Geometry validation happens here, once the whole object is parsed,
+  // rather than at each key: downscale and the two dimensions constrain
+  // each other, and the keys can appear in any order, so none of them can
+  // be fully checked in isolation.
+  if (parsed.downscale != 1 && parsed.downscale != 2 && parsed.downscale != 4 &&
+      parsed.downscale != 8) {
+    printf("Config: \"downscale\" must be 1, 2, 4, or 8 (got %u) -- see the "
+           "geometry note in config.h for why it isn't an arbitrary ratio\n",
+           parsed.downscale);
+    return false;
+  }
+  if (parsed.capture_width == 0 || parsed.capture_height == 0) {
+    printf("Config: \"capture_width\"/\"capture_height\" must both be "
+           "non-zero (got %ux%u)\n",
+           parsed.capture_width, parsed.capture_height);
+    return false;
+  }
+  // The output frame is I422: its chroma planes are half its luma width.
+  // Requiring the *output* width to be even (hence capture width divisible
+  // by 2*downscale) keeps that halving exact, so the YUYV box-average and
+  // libjpeg-turbo's scaled decode agree on plane sizes instead of
+  // disagreeing by a half-sampled edge column.
+  uint32_t wstep = (uint32_t)parsed.downscale * 2u;
+  if (parsed.capture_width % wstep != 0 ||
+      parsed.capture_height % parsed.downscale != 0) {
+    printf("Config: %ux%u doesn't divide evenly by \"downscale\": %u -- "
+           "width must be a multiple of %u and height a multiple of %u\n",
+           parsed.capture_width, parsed.capture_height, parsed.downscale, wstep,
+           parsed.downscale);
+    return false;
+  }
+
   *out = parsed;
   return true;
+}
+
+void config_output_geometry(const Config *cfg, uint32_t *out_width,
+                            uint32_t *out_height) {
+  uint32_t d = cfg->downscale ? cfg->downscale : 1u;
+  *out_width = (uint32_t)cfg->capture_width / d;
+  *out_height = (uint32_t)cfg->capture_height / d;
 }
 
 static bool config_try_load(const char *path, Config *out) {
@@ -455,7 +560,48 @@ static bool config_try_load(const char *path, Config *out) {
   return parse_config(buf, n, out);
 }
 
+bool config_load_once(const char *path, Config *out) {
+  *out = config_defaults;
+
+  // A missing file is the documented "just use the defaults" case, matching
+  // config_watch_start; anything else (present but unreadable, malformed,
+  // over the size limit) is a real error worth refusing to start on, since
+  // there is no earlier geometry to keep running with.
+  FILE *probe = fopen(path, "rb");
+  if (!probe) {
+    printf("Config: %s not found; using default geometry (%ux%u, downscale "
+           "%u)\n",
+           path, out->capture_width, out->capture_height, out->downscale);
+  } else {
+    fclose(probe);
+    if (!config_try_load(path, out))
+      return false; // config_try_load/parse_config already explained why
+  }
+
+  startup_geometry = *out;
+  startup_geometry_valid = true;
+  return true;
+}
+
 static void config_publish(ConfigWatcher *w, const Config *parsed) {
+  // Geometry is startup-only (see Config's own note): warn rather than
+  // silently ignore, since a config field that appears to change but does
+  // nothing is exactly the kind of thing that costs an hour to notice.
+  // Only the *pipeline* can't follow a geometry change -- the parsed value
+  // is still published as-is, so config_current() keeps reporting whatever
+  // is actually in the file.
+  if (startup_geometry_valid &&
+      (parsed->capture_width != startup_geometry.capture_width ||
+       parsed->capture_height != startup_geometry.capture_height ||
+       parsed->downscale != startup_geometry.downscale)) {
+    printf("Config: geometry changed (%ux%u/downscale %u -> %ux%u/downscale "
+           "%u) but it only takes effect at startup -- still running at the "
+           "original size. Restart eeye to apply it.\n",
+           startup_geometry.capture_width, startup_geometry.capture_height,
+           startup_geometry.downscale, parsed->capture_width,
+           parsed->capture_height, parsed->downscale);
+  }
+
   size_t slot = w->ring_pos % config_ring_size;
   w->ring_pos++;
   w->ring[slot] = *parsed;

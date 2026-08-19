@@ -33,8 +33,14 @@ constexpr uint32_t v4l2_in_max_buffers = 8;
 
 struct V4l2In {
   int fd;
+  // The geometry the *camera* delivers -- not the geometry of the frames
+  // handed back by v4l2_in_read_frame(), which are these divided by
+  // downscale. Every format negotiation and raw-buffer size check below
+  // uses these; every write into a VideoFrame uses the frame's own
+  // (already-divided) dimensions.
   uint32_t width;
   uint32_t height;
+  uint32_t downscale;
   uint32_t n_buffers;
   struct {
     void *start;
@@ -248,10 +254,14 @@ static DecodeResult decode_mjpeg_frame(V4l2In *in, const uint8_t *jpeg_data,
     return DECODE_TRANSIENT_FAIL;
   }
 
-  if ((uint32_t)jw != frame->width || (uint32_t)jh != frame->height) {
+  // Compared against the *capture* geometry, not the frame's: with
+  // downscale > 1 the frame is deliberately smaller than what the camera
+  // sends, so frame->width would be the wrong yardstick for "did the
+  // camera change format on us".
+  if ((uint32_t)jw != in->width || (uint32_t)jh != in->height) {
     printf("v4l2_in: frame dimensions changed mid-stream: got %dx%d, "
            "expected %ux%u\n",
-           jw, jh, frame->width, frame->height);
+           jw, jh, in->width, in->height);
     return DECODE_FORMAT_MISMATCH;
   }
   if (jsubsamp != TJSAMP_422) {
@@ -267,6 +277,17 @@ static DecodeResult decode_mjpeg_frame(V4l2In *in, const uint8_t *jpeg_data,
   // no intermediate buffer. This is the entire reason for requiring 4:2:2:
   // libjpeg-turbo's plane layout for a 4:2:2 source matches VideoFrame's
   // I422 layout exactly, so there's nothing to convert.
+  //
+  // When downscale > 1, frame->width/height are already the divided values
+  // and libjpeg-turbo scales during decompression to hit them -- it does
+  // this by discarding high-frequency DCT coefficients rather than by
+  // decoding fully and resampling, so a half-size decode is meaningfully
+  // cheaper than a full one, not just cheaper downstream. config.c
+  // restricts downscale to 1/2/4/8 precisely so the ratio is always one
+  // libjpeg-turbo supports exactly: asked for an unsupported ratio it
+  // quietly returns the largest supported size that *fits*, which would
+  // leave a smaller image sitting in a larger frame with stale bytes
+  // around it rather than failing.
   uint8_t *planes[3] = {frame->raw_planes[0], frame->raw_planes[1],
                         frame->raw_planes[2]};
   int strides[3] = {(int)frame->stride[0], (int)frame->stride[1],
@@ -288,9 +309,75 @@ static DecodeResult decode_mjpeg_frame(V4l2In *in, const uint8_t *jpeg_data,
 // subsampling, just interleaved instead of planar. No decode needed, only
 // a deinterleave: split those 4 bytes into VideoFrame's three separate
 // planes.
+// Box-averages each NxN block of a packed YUYV frame straight into the
+// frame's planar I422 buffers, so downscaling costs one pass rather than a
+// deinterleave followed by a separate resample.
+//
+// Kept entirely separate from the N == 1 path below rather than
+// generalizing that loop: N == 1 is both the common case and the one whose
+// NEON kernel has been verified bit-exact under qemu, and folding a
+// runtime divisor into it would have meant re-verifying that work to buy
+// nothing (a box average with N == 1 is just a copy).
+//
+// Chroma indexing is the one part that isn't a direct translation of the
+// luma loop. Output chroma sample cx covers output pixels 2*cx and 2*cx+1,
+// hence source pixels [2*cx*N, 2*cx*N + 2N), which is exactly the N
+// four-byte YUYV groups [cx*N, cx*N + N) -- each group carrying one U (at
+// byte 1) and one V (at byte 3). So U and V average N*N samples apiece,
+// the same count as luma, just gathered a group at a time.
+static void downscale_yuyv_frame(const uint8_t *yuyv, VideoFrame *frame,
+                                 uint32_t cap_width, uint32_t n) {
+  const size_t src_stride = (size_t)cap_width * 2;
+  const uint32_t half = n * n / 2; // rounding term for the averages below
+
+  uint8_t *y_plane = frame->raw_planes[0];
+  uint8_t *u_plane = frame->raw_planes[1];
+  uint8_t *v_plane = frame->raw_planes[2];
+  const size_t y_stride = frame->stride[0];
+  const size_t c_stride = frame->stride[1]; // == stride[2]
+  const uint32_t out_w = frame->width;
+  const uint32_t chroma_w = out_w / 2; // exact: config.c validated evenness
+
+#pragma omp parallel for
+  for (uint32_t oy = 0; oy < frame->height; ++oy) {
+    const uint8_t *src_block = yuyv + (size_t)oy * n * src_stride;
+    uint8_t *y_row = y_plane + (size_t)oy * y_stride;
+
+    for (uint32_t ox = 0; ox < out_w; ++ox) {
+      uint32_t sum = 0;
+      for (uint32_t dy = 0; dy < n; ++dy) {
+        const uint8_t *r = src_block + (size_t)dy * src_stride;
+        for (uint32_t dx = 0; dx < n; ++dx)
+          sum += r[(size_t)(ox * n + dx) * 2];
+      }
+      y_row[ox] = (uint8_t)((sum + half) / (n * n));
+    }
+
+    uint8_t *u_row = u_plane + (size_t)oy * c_stride;
+    uint8_t *v_row = v_plane + (size_t)oy * c_stride;
+    for (uint32_t cx = 0; cx < chroma_w; ++cx) {
+      uint32_t u_sum = 0, v_sum = 0;
+      for (uint32_t dy = 0; dy < n; ++dy) {
+        const uint8_t *r = src_block + (size_t)dy * src_stride;
+        for (uint32_t g = 0; g < n; ++g) {
+          const uint8_t *grp = r + (size_t)(cx * n + g) * 4;
+          u_sum += grp[1];
+          v_sum += grp[3];
+        }
+      }
+      u_row[cx] = (uint8_t)((u_sum + half) / (n * n));
+      v_row[cx] = (uint8_t)((v_sum + half) / (n * n));
+    }
+  }
+}
+
 static DecodeResult unpack_yuyv_frame(const uint8_t *yuyv, size_t yuyv_size,
-                                      VideoFrame *frame) {
-  size_t expected = (size_t)frame->width * frame->height * 2;
+                                      VideoFrame *frame, uint32_t cap_width,
+                                      uint32_t cap_height, uint32_t downscale) {
+  // Sized from the capture geometry, not the frame's: with downscale > 1
+  // the driver still hands over full-resolution bytes, and it is only the
+  // output that shrinks.
+  size_t expected = (size_t)cap_width * cap_height * 2;
   if (yuyv_size < expected) {
     // Unlike a JPEG payload, YUYV has no self-describing length -- a short
     // buffer here means the driver hasn't handed over a full frame yet
@@ -299,6 +386,11 @@ static DecodeResult unpack_yuyv_frame(const uint8_t *yuyv, size_t yuyv_size,
     printf("v4l2_in: YUYV frame too short: got %zu bytes, expected %zu\n",
            yuyv_size, expected);
     return DECODE_TRANSIENT_FAIL;
+  }
+
+  if (downscale > 1) {
+    downscale_yuyv_frame(yuyv, frame, cap_width, downscale);
+    return DECODE_OK;
   }
 
   uint8_t *y_plane = frame->raw_planes[0];
@@ -389,7 +481,9 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
     const uint8_t *data = (const uint8_t *)in->buffers[buf.index].start;
     DecodeResult result = (in->capture_format == V4L2_PIX_FMT_MJPEG)
                              ? decode_mjpeg_frame(in, data, buf.bytesused, frame)
-                             : unpack_yuyv_frame(data, buf.bytesused, frame);
+                             : unpack_yuyv_frame(data, buf.bytesused, frame,
+                                                 in->width, in->height,
+                                                 in->downscale);
 
     // The buffer goes back to the driver regardless of decode outcome --
     // skip this and streaming stalls silently once every buffer has been
@@ -479,7 +573,7 @@ static bool try_set_format(int fd, uint32_t fourcc, uint32_t width,
 }
 
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
-                     uint32_t framerate_hint) {
+                     uint32_t framerate_hint, uint32_t downscale) {
   int fd = open(path, O_RDWR | O_NONBLOCK);
   if (fd < 0) {
     switch (errno) {
@@ -592,6 +686,7 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
   in->fd = fd;
   in->width = fmt.fmt.pix.width;
   in->height = fmt.fmt.pix.height;
+  in->downscale = downscale ? downscale : 1;
   in->n_buffers = req.count;
   in->capture_format = capture_format;
 
@@ -647,7 +742,13 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
   // successful. This is what turns "camera's JPEG isn't actually 4:2:2"
   // into one clear failure right here, instead of a confusing per-frame
   // failure loop once producer_loop is already running.
-  VideoFrame *probe = vf_create(in->width, in->height, 0);
+  // Sized like every other frame this will fill -- at the *output*
+  // geometry, not the capture geometry -- so the probe exercises the same
+  // scaled-decode/box-average path the real frames take. Probing at full
+  // size would leave the downscale path itself untested until the first
+  // real frame, which is exactly what this probe exists to avoid.
+  VideoFrame *probe =
+      vf_create(in->width / in->downscale, in->height / in->downscale, 0);
   if (!probe) {
     printf("Failed to allocate probe frame\n");
     v4l2_in_close(in);

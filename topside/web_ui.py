@@ -150,6 +150,7 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   button { font-size: 13px; padding: 4px 10px; cursor: pointer; }
   #apply { font-size: 15px; padding: 8px 20px; margin-top: 16px; }
   #status { margin-top: 10px; font-size: 13px; white-space: pre-wrap; }
+  .readonly { font-size: 13px; opacity: 0.75; font-family: monospace; }
   #status.ok { color: #8f8; }
   #status.err { color: #f88; }
   label.field { display: block; margin: 6px 0; }
@@ -175,6 +176,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     <label class="field">JPEG quality (1-100)
       <input type="number" id="stream_quality" min="1" max="100" value="60">
     </label>
+
+    <h2>Geometry</h2>
+    <!-- Read-only on purpose: eeye only reads these at startup, so a
+         control here would look live and quietly not be. Edit the drone's
+         eeye_config.json and restart eeye to change it. -->
+    <div id="geometry" class="readonly">-</div>
 
     <button id="apply" type="button">Apply</button>
     <div id="status"></div>
@@ -308,6 +315,15 @@ function addStage(stage) {
 
 document.getElementById("add-stage").addEventListener("click", () => addStage());
 
+// Geometry (capture_width/capture_height/downscale) is startup-only on the
+// drone, so this UI deliberately doesn't offer it as a control -- but it
+// must still be carried through untouched. buildConfig() writes the whole
+// config file, so anything not echoed back here is effectively deleted:
+// without this, the first slider tweak would silently drop the operator's
+// downscale, and the drone would come back up at full resolution on its
+// next restart, saturating the tether.
+let carriedGeometry = {};
+
 function buildConfig() {
   const chain = [];
   for (const row of stagesEl.children) {
@@ -323,6 +339,7 @@ function buildConfig() {
     record_path: document.getElementById("record_path").value,
     stream_frame_interval: Number(document.getElementById("stream_frame_interval").value),
     stream_quality: Number(document.getElementById("stream_quality").value),
+    ...carriedGeometry,
   };
 }
 
@@ -333,6 +350,21 @@ function loadConfig(cfg) {
   document.getElementById("record_path").value = cfg.record_path || "";
   document.getElementById("stream_frame_interval").value = cfg.stream_frame_interval || 0;
   document.getElementById("stream_quality").value = cfg.stream_quality || 60;
+
+  // Only carry keys the drone's config actually had. Writing back defaults
+  // it never set would itself be a geometry change from eeye's point of
+  // view, which is exactly the spurious "restart to apply" warning this is
+  // meant to avoid.
+  carriedGeometry = {};
+  for (const k of ["capture_width", "capture_height", "downscale"]) {
+    if (cfg[k] !== undefined) carriedGeometry[k] = cfg[k];
+  }
+
+  const cw = cfg.capture_width || 1280, chh = cfg.capture_height || 720;
+  const ds = cfg.downscale || 1;
+  document.getElementById("geometry").textContent =
+    ds > 1 ? `${cw}x${chh} capture, ${ds}x downscale -> ${cw / ds}x${chh / ds} pipeline`
+           : `${cw}x${chh}, no downscaling`;
 }
 
 async function refreshFromDrone() {

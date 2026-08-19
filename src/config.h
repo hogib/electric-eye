@@ -90,6 +90,41 @@ typedef struct {
   // other u8 config field, but values above 100 are clamped by turbojpeg
   // itself, so this field doesn't separately validate that range.
   uint8_t stream_quality;
+
+  // --- Geometry: the one group of fields here that is NOT hot-reloadable ---
+  //
+  // Read once, at startup, by config_load_once(); the running pipeline
+  // never re-reads them. They still live in Config (rather than in some
+  // separate startup-only struct) for one concrete reason: parse_config
+  // treats an unknown key as a hard error, so the watcher has to
+  // understand these keys anyway or every reload of a geometry-carrying
+  // file would fail outright. config_publish() compares them against the
+  // startup values on each reload and warns when they differ, so a change
+  // is visibly ignored rather than silently so.
+  //
+  // Changing them live would mean draining and reallocating the frame pool
+  // while three threads hold frames from it, plus renegotiating the format
+  // on both V4L2 devices -- and v4l2loopback can't change format at all
+  // while a consumer has the device open. Restart is the honest answer.
+
+  // What to ask the camera for. The camera must grant these exactly (see
+  // try_set_format in v4l2_in.c) -- they are not a hint.
+  uint16_t capture_width;
+  uint16_t capture_height;
+
+  // Integer divisor applied to the captured frame before anything else
+  // touches it: the frame pool, the whole effect chain, the v4l2loopback
+  // output, and the preview JPEG all run at capture/downscale. 1 means no
+  // downscaling.
+  //
+  // Restricted to 1, 2, 4, or 8 rather than an arbitrary target
+  // resolution, because both capture paths need the ratio to be exact:
+  // the MJPEG path hands it to libjpeg-turbo, which only scales by one of
+  // 16 discrete factors and silently picks the largest one that *fits* a
+  // requested size (so an unsupported ratio would quietly leave a smaller
+  // image in a larger frame), and the YUYV path box-averages NxN source
+  // blocks, which only divides evenly for an integer N.
+  uint8_t downscale;
 } Config;
 
 /*
@@ -107,7 +142,10 @@ typedef struct {
  *     ],
  *     "record_path": "/opt/electric-eye/recordings/session.raw",
  *     "stream_frame_interval": 3,
- *     "stream_quality": 60
+ *     "stream_quality": 60,
+ *     "capture_width": 1280,
+ *     "capture_height": 720,
+ *     "downscale": 2
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -130,6 +168,10 @@ typedef struct {
  * stream tap -- see stream_server.h -- is off); N sends every Nth
  * post-effects frame to whoever is currently connected. "stream_quality" is
  * optional (default 60), the JPEG quality (1-100) used for that tap.
+ * "capture_width"/"capture_height" (default 1280x720) and "downscale"
+ * (default 1; must be 1, 2, 4, or 8) are the geometry fields -- unlike
+ * everything above, they only take effect at startup, and a reload that
+ * changes them warns and keeps running at the original size.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be
@@ -172,6 +214,37 @@ typedef struct ConfigWatcher ConfigWatcher;
 ConfigWatcher *config_watch_start(const char *path, atomic_bool *is_running);
 
 void config_watch_stop(ConfigWatcher *watcher);
+
+/*
+ * Reads `path` once, before any thread exists, purely to answer "what
+ * geometry should this run use?" -- see Config's geometry fields. Fills
+ * *out with the parsed config on success.
+ *
+ * Returns false only if the file exists but is invalid: that is fatal at
+ * startup (unlike the same failure during a live reload, which keeps the
+ * previous config and carries on) because there is no previous geometry to
+ * fall back to, and guessing one would mean allocating a frame pool the
+ * operator never asked for. A file that simply doesn't exist is *not* a
+ * failure -- *out gets the defaults and this returns true, matching how
+ * config_watch_start treats a missing file.
+ *
+ * Also records the geometry it read, so config_publish() can warn on any
+ * later reload that tries to change it.
+ */
+bool config_load_once(const char *path, Config *out);
+
+/*
+ * The pipeline geometry implied by a Config's capture_width/capture_height
+ * and downscale: the size of every frame in the pool, and so the size the
+ * effect chain, the v4l2loopback output, and the preview JPEG all run at.
+ *
+ * Kept as one function rather than open-coded divisions at each call site
+ * so the rounding can never drift between them -- config_load_once has
+ * already validated that the division is exact, so this is a plain divide
+ * with no rounding to disagree about.
+ */
+void config_output_geometry(const Config *cfg, uint32_t *out_width,
+                            uint32_t *out_height);
 
 /*
  * The live config, as of whenever this is called. Call once per frame, not

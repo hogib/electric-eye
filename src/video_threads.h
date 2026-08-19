@@ -13,6 +13,11 @@ static inline void sleep_us(long microseconds) {
   thrd_sleep(&ts, NULL);
 }
 
+// frame_width/frame_height here (as in WorkerArgs and ConsumerArgs) are the
+// *pipeline* geometry -- what every frame in the pool actually is. The
+// producer is the only one of the three that also needs the camera's own
+// geometry, since it is the only one that talks to the camera; everything
+// downstream sees post-downscale frames and nothing else.
 typedef struct {
   const char *filename;
   atomic_bool *is_running;
@@ -20,6 +25,9 @@ typedef struct {
   FrameRingBuffer *ring_buffer_free;
   uint32_t frame_width;
   uint32_t frame_height;
+  uint32_t capture_width;
+  uint32_t capture_height;
+  uint32_t downscale;
 } ProducerArgs;
 
 typedef struct {

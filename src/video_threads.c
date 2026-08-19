@@ -46,8 +46,9 @@ void *producer_loop(void *arg) {
   // genuinely come back. That class of failure is left to exit the process
   // and rely on the systemd unit's Restart= for recovery instead.
   while (atomic_load(args->is_running)) {
-    V4l2In *in = v4l2_in_open(args->filename, args->frame_width,
-                              args->frame_height, CAMERA_FRAMERATE);
+    V4l2In *in = v4l2_in_open(args->filename, args->capture_width,
+                              args->capture_height, CAMERA_FRAMERATE,
+                              args->downscale);
     if (!in) {
       reconnect_attempt++;
       if (reconnect_attempt == 1 ||

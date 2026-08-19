@@ -26,6 +26,11 @@ Built and tested targeting a Raspberry Pi 5 with a USB UVC webcam, but nothing i
   another device write it over the network — and the running pipeline picks up the
   change within ~200ms, no restart. A sibling `.status` file reports back whether each
   attempt was actually accepted (see [Configuring effects](#configuring-effects)).
+- **Configurable resolution with an integer downscale.** Capture at whatever your
+  camera offers, then optionally run the entire pipeline at ½, ¼, or ⅛ of it — the
+  single biggest lever on frame cost and tether bandwidth. On MJPEG the scaling
+  happens *inside* the JPEG decode, so the decode itself gets cheaper too. See
+  [Resolution and downscaling](#resolution-and-downscaling).
 - **Optional live-preview streaming + a topside web UI**, for exactly the case this
   project was built for: the drone is somewhere you can't be, connected by a tether.
   See [Live preview + web control](#live-preview--web-control).
@@ -74,10 +79,14 @@ config push can never land mid-frame.
 
 ## Requirements
 
-- A V4L2 camera that supports MJPEG capture with **4:2:2 chroma subsampling** (this is
-  what most USB UVC webcams provide; verify with
-  `v4l2-ctl --list-formats-ext -d /dev/video0` if unsure — see
-  [Known limitations](#known-limitations)).
+- A V4L2 camera offering either MJPEG with **4:2:2 chroma subsampling** (what most USB
+  UVC webcams provide) or **YUYV**, at the exact resolution you configure. MJPEG is
+  preferred where available and YUYV is the automatic fallback — which matters because
+  many webcams offer MJPEG only at their higher resolutions, so picking a smaller
+  `capture_width`/`capture_height` can land you on YUYV. Both paths are fully
+  supported, including downscaling. Check what yours offers with
+  `v4l2-ctl --list-formats-ext -d /dev/video0`, and see
+  [Known limitations](#known-limitations).
 - `v4l2loopback` (kernel module) — `eeye` loads it itself, but loading a kernel module
   needs `CAP_SYS_MODULE`; see [Loading v4l2loopback](#loading-v4l2loopback) below.
 - `meson`, `ninja`, a C23 compiler (gcc or clang), OpenMP (`libgomp`, ships with gcc).
@@ -116,11 +125,12 @@ meson compile -C builddir
 ./builddir/eeye [config_path]
 ```
 
-`config_path` defaults to `eeye_config.json` in the current directory. The camera
-device (`/dev/video0`), output device (`/dev/video10`), stream port (`9000`),
-resolution (1280×720), and requested framerate (30fps, best-effort) are currently
-compile-time constants in `src/eeye.c` / `src/video_threads.c` — edit and rebuild to
-change them.
+`config_path` defaults to `eeye_config.json` in the current directory. Resolution and
+downscaling come from that config file — see
+[Resolution and downscaling](#resolution-and-downscaling). The camera device
+(`/dev/video0`), output device (`/dev/video10`), stream port (`9000`), and requested
+framerate (30fps, best-effort) are still compile-time constants in `src/eeye.c` /
+`src/video_threads.c` — edit and rebuild to change those.
 
 ### Loading v4l2loopback
 
@@ -151,7 +161,10 @@ running. Every key is optional; anything missing takes the default shown:
   ],
   "record_path": "",
   "stream_frame_interval": 0,
-  "stream_quality": 60
+  "stream_quality": 60,
+  "capture_width": 1280,
+  "capture_height": 720,
+  "downscale": 1
 }
 ```
 
@@ -201,14 +214,64 @@ empty chain (`"chain": []`) is a valid pass-through. Two tint presets to try:
 `"record_path"` — writes the **untouched** camera frame (independent of the effect
 chain) to this path as raw I422, no container, back to back. Empty (or omitted) means
 off. This is genuinely large with no compression — ~53MB/s, ~190GB/hour at 1280×720 —
-fine for short clips; play back with (matching your resolution/framerate):
+fine for short clips.
+
+"Untouched" means untouched *by the effect chain*; `"downscale"` still applies, because
+it happens in the capture decode before the recording tap sees the frame. So the file's
+dimensions are `capture ÷ downscale`, not `capture_width` × `capture_height` — which
+also means downscaling shrinks recordings proportionally (~48GB/hour at `downscale: 2`).
+Play back with those dimensions and your framerate:
 
 ```sh
+# 1280x720 capture with "downscale": 1
 ffplay -f rawvideo -pix_fmt yuv422p -s 1280x720 -r 30 -i FILE
+# ...the same capture with "downscale": 2
+ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE
 ```
 
 `"stream_frame_interval"` / `"stream_quality"` — the live-preview stream tap; see
 [Live preview + web control](#live-preview--web-control).
+
+### Resolution and downscaling
+
+`"capture_width"` / `"capture_height"` (default 1280×720) are what `eeye` asks the
+camera for. The camera has to grant them **exactly** — this is a demand, not a hint —
+so check what yours actually offers:
+
+```sh
+v4l2-ctl --list-formats-ext -d /dev/video0
+```
+
+`"downscale"` (default 1; must be **1, 2, 4, or 8**) shrinks the frame once, on the
+way out of the capture decode, before anything else touches it. Everything downstream
+— the frame pool, the whole effect chain, the v4l2loopback output, and the preview
+JPEG — then runs at `capture ÷ downscale`. It is by far the cheapest way to buy
+headroom for an expensive chain. Measured on the x86_64 dev laptop, capturing 1280×720
+MJPEG with a `blur_strength: 12` + `sobel` chain, all at a steady 30fps:
+
+| `downscale` | pipeline | CPU | preview frame |
+|---|---|---|---|
+| 1 | 1280×720 | 134% | 59.4 KB |
+| 2 | 640×360 | 55% | 16.4 KB |
+| 4 | 320×180 | 34% | 5.1 KB |
+| 8 | 160×90 | 28.5% | 1.9 KB |
+
+It's restricted to those four values rather than an arbitrary target resolution
+because both capture paths need the ratio to be exact. On the MJPEG path the divisor
+is handed to libjpeg-turbo, which scales *during* decompression by discarding
+high-frequency DCT coefficients — so the decode itself gets cheaper, not just the work
+after it — but it supports only a fixed set of ratios and, asked for one it doesn't
+support, silently returns the largest size that fits rather than failing. On the YUYV
+path each output pixel is a box average of an N×N source block, which only divides
+evenly for integer N. Widths must be a multiple of `2 × downscale` (so the I422 chroma
+planes stay exactly half-width) and heights a multiple of `downscale`; anything else
+is rejected at startup, with the required multiples named.
+
+> **These three keys are the only ones that are not hot-reloadable.** They're read once
+> at startup. Changing them in a running config is detected and logged, but ignored
+> until you restart `eeye` — applying them live would mean reallocating the frame pool
+> while three threads hold frames from it, and v4l2loopback can't change format at all
+> while a viewer has the device open.
 
 **Writer contract:** write to a temp file in the same directory, then `rename()` it
 onto the target path (atomic from a reader's point of view). A plain in-place
@@ -307,16 +370,23 @@ retries that internally without a restart.
 
 ## Known limitations
 
-- **Requires 4:2:2 MJPEG from the camera.** Verified at startup by decoding one real
-  frame; if your camera is natively 4:2:0 (common on cheap UVC hardware) or another
+- **MJPEG capture must be 4:2:2.** Verified at startup by decoding one real frame; if
+  your camera's MJPEG is natively 4:2:0 (common on cheap UVC hardware) or another
   subsampling, `eeye` fails clearly at launch rather than producing corrupted video.
-  A general chroma-resampling fallback isn't implemented.
+  A general chroma-resampling fallback isn't implemented. This constrains the MJPEG
+  path only — YUYV is packed 4:2:2 by definition, so the fallback path is unaffected
+  and a 4:2:0-MJPEG camera may still work at a resolution where it offers YUYV.
 - **No Huffman-table (DHT) injection gap** — actually handled: some UVC cameras omit
   the Huffman table from their MJPEG stream, and `src/v4l2_in.c` splices in the
   standard tables when that's detected. Mentioned here only because it's the kind of
   thing worth knowing exists if you're debugging a decode failure on a new camera.
-- **Resolution, framerate, and both device paths are compile-time constants**, not
-  runtime-configurable or auto-negotiated against what the camera actually supports.
+- **Framerate and both device paths are compile-time constants.** Resolution is
+  configurable now (see [Resolution and downscaling](#resolution-and-downscaling)),
+  but it's still a demand rather than a negotiation: `eeye` asks the camera for
+  exactly what the config says and fails at launch if that isn't on offer, instead of
+  enumerating supported sizes and picking the nearest.
+- **Geometry changes need a restart.** `capture_width`/`capture_height`/`downscale`
+  are read once at startup; changing them in a running config is logged and ignored.
 - **Live-preview stream is single-viewer.** `stream_server` accepts one connection at a
   time (last one wins); fine for one `web_ui.py` instance, not a fan-out broadcast.
 - **No authentication** on the stream or config-agent ports — see

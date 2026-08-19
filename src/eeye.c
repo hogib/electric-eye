@@ -23,8 +23,12 @@
 // than pull in _GNU_SOURCE for one symbol.
 extern char **environ;
 
-constexpr uint32_t frame_width = 1280;
-constexpr uint32_t frame_height = 720;
+// Geometry now comes from the config file (capture_width/capture_height/
+// downscale -- see config.h), read once by config_load_once() in main()
+// before any thread starts. The arg structs below therefore leave their
+// frame_* fields zero-initialized and main() fills them in; there is
+// deliberately no compile-time default here to drift out of sync with
+// config_defaults, which is the single source of truth for the fallback.
 
 // virtual_cam_ensure_loaded() is what actually makes virtual_cam_device_path
 // exist; cons_args.outpath below points at the same path.
@@ -82,9 +86,7 @@ static void handle_shutdown_signal(int sig) {
 ProducerArgs prod_args = {.filename = "/dev/video0",
                           .is_running = &is_running,
                           .ring_buffer_in = &ring_buffer_in,
-                          .ring_buffer_free = &ring_buffer_free,
-                          .frame_width = frame_width,
-                          .frame_height = frame_height};
+                          .ring_buffer_free = &ring_buffer_free};
 
 // .config is filled in by main() once config_watch_start() has run --
 // building the watcher needs is_running, which isn't available until then.
@@ -92,8 +94,6 @@ WorkerArgs work_args = {
     .is_running = &is_running,
     .ring_buffer_in = &ring_buffer_in,
     .ring_buffer_out = &ring_buffer_out,
-    .frame_width = frame_width,
-    .frame_height = frame_height,
 };
 
 ConsumerArgs cons_args = {
@@ -101,8 +101,6 @@ ConsumerArgs cons_args = {
     .is_running = &is_running,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
-    .frame_width = frame_width,
-    .frame_height = frame_height,
     .stream_port = stream_server_port,
 };
 
@@ -177,6 +175,41 @@ int main(int argc, char **argv) {
 
   const char *config_path = (argc > 1) ? argv[1] : "eeye_config.json";
 
+  // Geometry has to be settled before anything is sized from it -- the
+  // frame pool below, both V4L2 format negotiations, and every arg struct.
+  // config_watch_start() further down re-reads the same file for the
+  // hot-reloadable fields; this earlier read exists purely because the
+  // watcher's first publish happens after the pool already needs a size.
+  Config startup_config;
+  if (!config_load_once(config_path, &startup_config)) {
+    printf("Error: %s is not usable (see the reason above); refusing to "
+           "start on a guessed geometry.\n",
+           config_path);
+    return 1;
+  }
+
+  uint32_t out_width, out_height;
+  config_output_geometry(&startup_config, &out_width, &out_height);
+
+  prod_args.capture_width = startup_config.capture_width;
+  prod_args.capture_height = startup_config.capture_height;
+  prod_args.downscale = startup_config.downscale;
+  prod_args.frame_width = out_width;
+  prod_args.frame_height = out_height;
+  work_args.frame_width = out_width;
+  work_args.frame_height = out_height;
+  cons_args.frame_width = out_width;
+  cons_args.frame_height = out_height;
+
+  if (startup_config.downscale > 1) {
+    printf("Geometry: capturing %ux%u, downscaling %ux -> pipeline runs at "
+           "%ux%u\n",
+           startup_config.capture_width, startup_config.capture_height,
+           startup_config.downscale, out_width, out_height);
+  } else {
+    printf("Geometry: %ux%u, no downscaling\n", out_width, out_height);
+  }
+
   // Loads v4l2loopback (if not already loaded) so the one-time `sudo
   // modprobe ...` from this file's header comment no longer has to be run
   // by hand before every launch. atexit() -- rather than a call at the
@@ -200,7 +233,7 @@ int main(int argc, char **argv) {
   ring_init(&ring_buffer_free);
 
   const unsigned int pool_size = ring_buffer_size - 1;
-  VideoFrame **pool = vf_pool_create(pool_size, frame_width, frame_height);
+  VideoFrame **pool = vf_pool_create(pool_size, out_width, out_height);
   if (!pool) {
     printf("Error: Failed to allocate frame pool.\n");
     return 1;
