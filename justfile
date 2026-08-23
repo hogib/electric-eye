@@ -1,2 +1,4 @@
+setup:
+    meson setup build-re
 build:
-  meson compile -C builddir
+    meson compile -C build-re
