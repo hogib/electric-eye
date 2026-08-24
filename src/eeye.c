@@ -301,6 +301,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   work_args.config = config_watcher;
+  prod_args.config = config_watcher;
   cons_args.config = config_watcher;
   cons_args.config_path = config_path;
 

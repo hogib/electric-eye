@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "rpicam_in.h"
+#include "camera_ctrl.h"
 #include "jpeg_decode.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -273,7 +274,8 @@ bool rpicam_in_capture(RpicamIn *in, VideoFrame *frame) {
 }
 
 RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
-                         uint32_t framerate_hint, uint32_t downscale) {
+                         uint32_t framerate_hint, uint32_t downscale,
+                         const CameraControls *controls) {
   if (downscale == 0)
     downscale = 1;
 
@@ -288,12 +290,45 @@ RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
   // frame out as soon as it is encoded rather than letting it sit in a
   // stdio buffer, which otherwise adds latency proportional to the buffer
   // size -- exactly the wrong trade for a live pilot's view. -o -: stdout.
-  char *const argv[] = {
-      "rpicam-vid", "--codec",  "mjpeg",      "--width",   width_arg,
-      "--height",   height_arg, "--framerate", fps_arg,    "--quality",
-      quality_arg,  "-t",       "0",          "-n",        "--flush",
-      "-o",         "-",        NULL,
-  };
+  // Room for the fixed flags above plus whatever camera controls add.
+  // rpicam takes controls as spawn-time arguments rather than as
+  // something settable on a running process, which is why they are built
+  // here and why changing them means restarting the child.
+  char *argv[48];
+  char ctrl_storage[512];
+  size_t argc = 0;
+  argv[argc++] = "rpicam-vid";
+  argv[argc++] = "--codec";
+  argv[argc++] = "mjpeg";
+  argv[argc++] = "--width";
+  argv[argc++] = width_arg;
+  argv[argc++] = "--height";
+  argv[argc++] = height_arg;
+  argv[argc++] = "--framerate";
+  argv[argc++] = fps_arg;
+  argv[argc++] = "--quality";
+  argv[argc++] = quality_arg;
+  argv[argc++] = "-t";
+  argv[argc++] = "0";
+  argv[argc++] = "-n";
+  argv[argc++] = "--flush";
+
+  if (controls && camera_ctrl_any_set(controls)) {
+    int extra = camera_ctrl_rpicam_args(
+        controls, argv + argc, (sizeof argv / sizeof argv[0]) - argc - 3,
+        ctrl_storage, sizeof ctrl_storage);
+    if (extra < 0) {
+      // Truncating would silently hand the camera a different
+      // configuration than the operator asked for.
+      printf("rpicam_in: too many camera controls to pass; ignoring them\n");
+    } else {
+      argc += (size_t)extra;
+    }
+  }
+
+  argv[argc++] = "-o";
+  argv[argc++] = "-";
+  argv[argc] = NULL;
 
   int pipefd[2];
   if (pipe(pipefd) != 0) {

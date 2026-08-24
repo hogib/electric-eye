@@ -99,4 +99,12 @@ bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
  */
 bool v4l2_in_capture(V4l2In *in, VideoFrame *frame);
 
+/*
+ * The underlying device fd, for camera_ctrl_apply() -- controls are
+ * applied to the same open device the frames come from, and re-applied
+ * after every reconnect (a replugged camera comes back at its defaults).
+ * Returns -1 for a NULL handle.
+ */
+int v4l2_in_fd(const V4l2In *in);
+
 void v4l2_in_close(V4l2In *in);

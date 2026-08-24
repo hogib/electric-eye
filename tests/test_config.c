@@ -107,6 +107,90 @@ static void test_effect_parameters_round_trip(void) {
   CHECK_EQ_INT(c.stages[0].log_threshold, 25);
 }
 
+// Camera controls are a nested object where every field is optional and
+// "absent" must mean "leave the camera alone" -- not 0, which for
+// brightness would be mid-range and for contrast the minimum.
+static void test_camera_controls_default_to_unset(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK(!camera_ctrl_any_set(&c.camera));
+  CHECK_EQ_INT(c.camera.brightness, camera_ctrl_unset);
+  CHECK_EQ_INT(c.camera.exposure, camera_ctrl_unset);
+
+  // An empty object is valid and still changes nothing.
+  CHECK(parse("{\"camera\":{}}", &c));
+  CHECK(!camera_ctrl_any_set(&c.camera));
+
+  // Mentioning one field must not disturb the others.
+  CHECK(parse("{\"camera\":{\"brightness\":10}}", &c));
+  CHECK_EQ_INT(c.camera.brightness, 10);
+  CHECK_EQ_INT(c.camera.contrast, camera_ctrl_unset);
+  CHECK_EQ_INT(c.camera.exposure, camera_ctrl_unset);
+}
+
+static void test_camera_controls_round_trip(void) {
+  Config c;
+  CHECK(parse("{\"camera\":{\"auto_exposure\":false,\"exposure\":25000,"
+              "\"gain\":40,\"auto_white_balance\":false,"
+              "\"white_balance\":3200,\"brightness\":-20,"
+              "\"contrast\":120,\"saturation\":80,\"sharpness\":100}}",
+              &c));
+  CHECK_EQ_INT(c.camera.auto_exposure, 0);
+  CHECK_EQ_INT(c.camera.exposure, 25000);
+  CHECK_EQ_INT(c.camera.gain, 40);
+  CHECK_EQ_INT(c.camera.auto_white_balance, 0);
+  CHECK_EQ_INT(c.camera.white_balance, 3200);
+  CHECK_EQ_INT(c.camera.brightness, -20);
+  CHECK_EQ_INT(c.camera.contrast, 120);
+  CHECK_EQ_INT(c.camera.saturation, 80);
+  CHECK_EQ_INT(c.camera.sharpness, 100);
+}
+
+// Explicit zeros and negatives are real values, not "unset" -- the
+// distinction the sentinel exists to preserve.
+static void test_camera_explicit_zero_is_kept(void) {
+  Config c;
+  CHECK(parse("{\"camera\":{\"gain\":0,\"brightness\":0}}", &c));
+  CHECK(camera_ctrl_any_set(&c.camera));
+  CHECK_EQ_INT(c.camera.gain, 0);
+  CHECK_EQ_INT(c.camera.brightness, 0);
+  CHECK(c.camera.gain != camera_ctrl_unset);
+
+  CHECK(parse("{\"camera\":{\"brightness\":-100}}", &c));
+  CHECK_EQ_INT(c.camera.brightness, -100);
+}
+
+static void test_camera_rejects_bad_values(void) {
+  Config c;
+  // Out of the documented range.
+  CHECK(!parse("{\"camera\":{\"brightness\":200}}", &c));
+  CHECK(!parse("{\"camera\":{\"brightness\":-200}}", &c));
+  CHECK(!parse("{\"camera\":{\"gain\":101}}", &c));
+  CHECK(!parse("{\"camera\":{\"contrast\":300}}", &c));
+  CHECK(!parse("{\"camera\":{\"white_balance\":50}}", &c));  // not Kelvin
+  CHECK(!parse("{\"camera\":{\"exposure\":0}}", &c));        // zero shutter
+  // Wrong types.
+  CHECK(!parse("{\"camera\":{\"auto_exposure\":1}}", &c));   // needs a bool
+  CHECK(!parse("{\"camera\":{\"brightness\":true}}", &c));
+  // Unknown key inside the object, same loud-typo policy as elsewhere.
+  CHECK(!parse("{\"camera\":{\"exposureee\":100}}", &c));
+  CHECK(!parse("{\"camera\":{\"iso\":400}}", &c));
+  // Malformed object.
+  CHECK(!parse("{\"camera\":{\"gain\":10}", &c));
+  CHECK(!parse("{\"camera\":[]}", &c));
+}
+
+// Boundary values must be accepted -- an off-by-one would reject a legal
+// config.
+static void test_camera_boundaries_accepted(void) {
+  Config c;
+  CHECK(parse("{\"camera\":{\"brightness\":100}}", &c));
+  CHECK(parse("{\"camera\":{\"brightness\":-100}}", &c));
+  CHECK(parse("{\"camera\":{\"gain\":100}}", &c));
+  CHECK(parse("{\"camera\":{\"contrast\":0}}", &c));
+  CHECK(parse("{\"camera\":{\"contrast\":200}}", &c));
+}
+
 // stream_raw is the first bool-valued key. A bool parser that accepted
 // numbers, or silently defaulted a malformed value to false, would turn a
 // typo into "the raw toggle just doesn't work".
@@ -373,6 +457,11 @@ int main(void) {
   RUN_TEST(test_log_parameter_validation);
   RUN_TEST(test_canny_threshold_defaults);
   RUN_TEST(test_stream_raw_bool_parsing);
+  RUN_TEST(test_camera_controls_default_to_unset);
+  RUN_TEST(test_camera_controls_round_trip);
+  RUN_TEST(test_camera_explicit_zero_is_kept);
+  RUN_TEST(test_camera_rejects_bad_values);
+  RUN_TEST(test_camera_boundaries_accepted);
   RUN_TEST(test_readme_tint_presets_parse);
   RUN_TEST(test_unknown_keys_are_hard_errors);
   RUN_TEST(test_malformed_json_is_rejected);

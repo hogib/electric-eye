@@ -1,4 +1,5 @@
 #pragma once
+#include "camera_ctrl.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -111,6 +112,13 @@ typedef struct {
   // container; see video_threads.c's own note on how to play it back.
   char record_path[max_record_path_len];
 
+  // Camera controls -- exposure, gain, white balance and friends. Unlike
+  // the geometry fields these ARE hot-reloadable: light changes as the
+  // drone descends, and restarting to adjust exposure mid-dive is not an
+  // option. Every field defaults to "unset", meaning leave the camera
+  // alone; see camera_ctrl.h for why that is a sentinel rather than 0.
+  CameraControls camera;
+
   // Bypass the effect chain for the *preview stream only*: send the
   // untouched camera frame instead of the processed one. The virtual
   // camera and the recording tap are unaffected.
@@ -194,6 +202,7 @@ typedef struct {
  *     "record_path": "/opt/electric-eye/recordings/session.raw",
  *     "stream_frame_interval": 3,
  *     "stream_raw": false,
+ *     "camera": {"auto_exposure": false, "exposure": 25000},
  *     "stream_quality": 60,
  *     "capture_width": 1280,
  *     "capture_height": 720,
@@ -218,6 +227,12 @@ typedef struct {
  * actual content (see color_light in point_opps.h). An empty chain ([])
  * is a valid pass-through.
  * "record_path" is optional; omit it (or set "") to leave recording off.
+ * "camera" is optional; it carries camera controls (auto_exposure,
+ * exposure in microseconds, gain, auto_white_balance, white_balance in
+ * Kelvin, brightness, contrast, saturation, sharpness). Any field left
+ * out leaves that control as the camera had it. These are hot-reloadable.
+ * See camera_ctrl.h for the units and ranges, which are deliberately
+ * device-independent so one config works on both capture backends.
  * "stream_raw" is optional (default false); true sends the untouched
  * camera frame to the preview stream instead of the processed one, leaving
  * the virtual camera and recording untouched.

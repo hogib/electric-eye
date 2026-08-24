@@ -1,5 +1,6 @@
 #include "video_threads.h"
 #include "effect_chain.h"
+#include "camera_ctrl.h"
 #include "frame_ring_buffer.h"
 #include "health.h"
 #include "stream_server.h"
@@ -44,13 +45,33 @@ typedef struct {
 static bool capture_open(const ProducerArgs *args, CaptureHandle *h) {
   *h = (CaptureHandle){0};
   if (args->capture_source == CAPTURE_RPICAM) {
+    const Config *cfg = config_current(args->config);
     h->rpicam = rpicam_in_open(args->capture_width, args->capture_height,
-                               CAMERA_FRAMERATE, args->downscale);
+                               CAMERA_FRAMERATE, args->downscale,
+                               &cfg->camera);
     return h->rpicam != NULL;
   }
   h->v4l2 = v4l2_in_open(args->filename, args->capture_width,
                          args->capture_height, CAMERA_FRAMERATE,
                          args->downscale);
+  return h->v4l2 != NULL;
+}
+
+// Pushes camera controls to whichever backend is open.
+//
+// V4L2 takes them as ioctls on the live device, so they apply instantly.
+// rpicam-vid takes them as spawn-time CLI flags, so a change there needs
+// the child restarted -- handled by the caller, since it is a visible
+// ~1s gap in the video rather than something to do silently.
+static void capture_apply_controls(CaptureHandle *h, const CameraControls *c) {
+  if (h->v4l2 && camera_ctrl_any_set(c))
+    camera_ctrl_apply(v4l2_in_fd(h->v4l2), c);
+}
+
+// Whether this backend can take a control change without being restarted.
+// V4L2 can (they are ioctls on the live device); rpicam cannot, since it
+// takes them as command-line arguments to a child process.
+static bool capture_controls_are_live(const CaptureHandle *h) {
   return h->v4l2 != NULL;
 }
 
@@ -71,6 +92,17 @@ void *producer_loop(void *arg) {
   ProducerArgs *args = (ProducerArgs *)arg;
   int64_t pts = 0;
   int reconnect_attempt = 0;
+  // The controls last pushed to the camera, so a reloaded config only
+  // costs ioctls when something actually changed -- re-issuing them every
+  // frame would be pointless syscall traffic at 30fps.
+  CameraControls last_controls;
+  camera_ctrl_init(&last_controls);
+  bool have_last_controls = false;
+  // Set when a control change forces the rpicam child to be respawned, so
+  // the reconnect path below knows this was deliberate rather than a
+  // camera failure -- otherwise it would log a scary "capture failed" and
+  // count it against the retry budget.
+  bool controls_need_restart = false;
 
   // Outer loop: own the camera device for as long as it stays usable, then
   // let go and retry. This covers both "no camera yet at startup" (USB
@@ -104,6 +136,20 @@ void *producer_loop(void *arg) {
     }
 
     reconnect_attempt = 0;
+    controls_need_restart = false;
+    // Apply controls to the freshly-opened device. This has to happen on
+    // every open, not just the first: producer_loop reopens the camera
+    // from scratch on every reconnect, so a camera unplugged and
+    // replugged mid-dive comes back at its factory defaults -- exposure
+    // silently reverting is exactly the kind of thing nobody notices
+    // until the footage is useless.
+    {
+      const Config *cfg = config_current(args->config);
+      capture_apply_controls(&in, &cfg->camera);
+      last_controls = cfg->camera;
+      have_last_controls = true;
+    }
+
     if (args->capture_source == CAPTURE_RPICAM)
       printf("Camera connected: Pi camera module (via rpicam-vid)\n");
     else
@@ -115,6 +161,30 @@ void *producer_loop(void *arg) {
       if (!ring_pop_wait(args->ring_buffer_free, (void **)&frame,
                         args->is_running))
         break; // shutting down while waiting for a free buffer
+
+      // Controls are hot-reloadable: light changes as the drone descends,
+      // and surfacing to adjust exposure is not an option.
+      {
+        const Config *cfg = config_current(args->config);
+        if (!have_last_controls ||
+            !camera_ctrl_equal(&last_controls, &cfg->camera)) {
+          if (capture_controls_are_live(&in)) {
+            capture_apply_controls(&in, &cfg->camera);
+            last_controls = cfg->camera;
+            have_last_controls = true;
+          } else {
+            // rpicam bakes controls into its child's command line, so the
+            // only way to change them is to respawn it. Announced rather
+            // than done silently: it is a visible ~1s gap in the video,
+            // and an operator nudging a slider deserves to know why the
+            // picture blinked.
+            printf("Camera controls changed; restarting rpicam-vid to "
+                   "apply them (brief gap in video)...\n");
+            controls_need_restart = true;
+            break; // drop to the reconnect loop, which reopens with them
+          }
+        }
+      }
 
       frame->pts = pts++;
 
@@ -137,6 +207,11 @@ void *producer_loop(void *arg) {
     }
 
     capture_close(&in);
+
+    // A deliberate respawn for new controls should not pay the reconnect
+    // backoff -- that delay exists for a camera that genuinely went away.
+    if (controls_need_restart)
+      continue;
   }
 
   return NULL;

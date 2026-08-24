@@ -27,6 +27,9 @@ typedef struct {
   // to a child process.
   CaptureSource capture_source;
   atomic_bool *is_running;
+  // Camera controls are hot-reloadable, so the producer needs the live
+  // config too -- it is the only thread that holds the camera device.
+  const ConfigWatcher *config;
   FrameRingBuffer *ring_buffer_in;
   FrameRingBuffer *ring_buffer_free;
   uint32_t frame_width;

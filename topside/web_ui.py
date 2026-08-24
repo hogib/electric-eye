@@ -407,6 +407,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   #capturemsg.err { color: #f88; }
   #capturemsg.ok { color: #6f6; }
 
+  /* A manual control greyed out while its auto mode is on, mirroring the
+     hardware's own dependency -- the camera would reject it anyway, so
+     showing it as live would be a lie. */
+  label.field.gated { opacity: 0.4; }
+  label.field .val { float: right; font-family: monospace; opacity: 0.8; }
+
   #recstate { margin: 4px 0 2px; font-size: 13px; }
   #recstate.active { color: #6f6; }
   #recstate.failed { color: #f66; font-weight: bold; }
@@ -439,6 +445,46 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     </label>
     <div class="readonly">Recorded topside, H.264. Follows the preview —
       so the raw toggle below decides whether effects are burned in.</div>
+
+    <h2>Camera</h2>
+    <div class="readonly">Sensor settings, applied live. Auto modes must be
+      off before their manual value takes effect — the drone reports it if
+      you forget.</div>
+    <label class="field">
+      <input type="checkbox" id="cam_auto_exposure" checked>
+      Auto exposure
+    </label>
+    <label class="field" id="wrap_exposure">
+      Exposure (µs) <span class="val" id="v_exposure">20000</span>
+      <input type="range" id="cam_exposure" min="200" max="200000" step="200"
+             value="20000">
+    </label>
+    <label class="field">
+      Gain <span class="val" id="v_gain">0</span>
+      <input type="range" id="cam_gain" min="0" max="100" value="0">
+    </label>
+    <label class="field">
+      <input type="checkbox" id="cam_auto_white_balance" checked>
+      Auto white balance
+    </label>
+    <label class="field" id="wrap_white_balance">
+      White balance (K) <span class="val" id="v_white_balance">4600</span>
+      <input type="range" id="cam_white_balance" min="2800" max="6500"
+             step="100" value="4600">
+    </label>
+    <label class="field">
+      Brightness <span class="val" id="v_brightness">0</span>
+      <input type="range" id="cam_brightness" min="-100" max="100" value="0">
+    </label>
+    <label class="field">
+      Contrast <span class="val" id="v_contrast">100</span>
+      <input type="range" id="cam_contrast" min="0" max="200" value="100">
+    </label>
+    <label class="field">
+      Saturation <span class="val" id="v_saturation">100</span>
+      <input type="range" id="cam_saturation" min="0" max="200" value="100">
+    </label>
+    <div id="cam_note" class="readonly"></div>
 
     <h2>Preview</h2>
     <label class="field">
@@ -626,6 +672,8 @@ function buildConfig() {
     record_path: document.getElementById("record_path").value,
     stream_frame_interval: Number(document.getElementById("stream_frame_interval").value),
     stream_raw: document.getElementById("stream_raw").checked,
+    ...(Object.keys(buildCameraObject()).length
+        ? {camera: buildCameraObject()} : {}),
     stream_quality: Number(document.getElementById("stream_quality").value),
     ...carriedGeometry,
   };
@@ -638,6 +686,28 @@ function loadConfig(cfg) {
   document.getElementById("record_path").value = cfg.record_path || "";
   document.getElementById("stream_frame_interval").value = cfg.stream_frame_interval || 0;
   document.getElementById("stream_raw").checked = !!cfg.stream_raw;
+
+  // Seed the camera controls from whatever the drone has, and mark those
+  // fields as touched so a later change keeps sending them. Fields the
+  // drone does not mention stay untouched, so this page never starts
+  // pushing values nobody chose.
+  const cam = cfg.camera || {};
+  for (const name of CAM_TOGGLES) {
+    if (cam[name] !== undefined) {
+      camEl(name).checked = !!cam[name];
+      camTouched.add(name);
+    }
+  }
+  for (const name of CAM_SLIDERS) {
+    if (cam[name] !== undefined) {
+      camEl(name).value = cam[name];
+      document.getElementById("v_" + name).textContent = cam[name];
+      camTouched.add(name);
+    }
+  }
+  updateCamGating();
+  document.getElementById("cam_note").textContent =
+    Object.keys(cam).length ? "" : "Camera is using its own defaults.";
   document.getElementById("stream_quality").value = cfg.stream_quality || 60;
 
   // Only carry keys the drone's config actually had. Writing back defaults
@@ -682,7 +752,10 @@ async function refreshFromDrone() {
 // reports it instead of waiting indefinitely.
 const APPLY_TIMEOUT_MS = 8000;
 
-document.getElementById("apply").addEventListener("click", async () => {
+// Extracted from the Apply button so the camera sliders can push the same
+// way -- a camera change has to reach the drone immediately to be worth
+// having, rather than waiting for someone to also press Apply.
+async function applyConfig() {
   const status = document.getElementById("status");
   status.textContent = "Applying...";
   status.className = "";
@@ -726,7 +799,73 @@ document.getElementById("apply").addEventListener("click", async () => {
   } finally {
     clearTimeout(timer);
   }
-});
+}
+
+document.getElementById("apply").addEventListener("click", applyConfig);
+
+// --- Camera controls -------------------------------------------------
+//
+// Sent as a "camera" object, and only for fields the operator has
+// actually touched: on the drone, an absent field means "leave this
+// control alone", so writing every slider's current position would
+// overwrite settings nobody asked to change.
+const CAM_SLIDERS = ["exposure", "gain", "white_balance", "brightness",
+                     "contrast", "saturation"];
+const CAM_TOGGLES = ["auto_exposure", "auto_white_balance"];
+// Which fields this session has deliberately set. Starts empty so a page
+// load does not immediately push a full set of defaults at the camera.
+let camTouched = new Set();
+
+function camEl(name) { return document.getElementById("cam_" + name); }
+
+function updateCamGating() {
+  // A manual control is inert while its auto mode is on -- the camera
+  // rejects it outright (with EPERM, which the drone translates into a
+  // readable message). Reflecting that here means the UI never looks like
+  // it is doing something it is not.
+  const pairs = [["auto_exposure", "exposure"],
+                 ["auto_white_balance", "white_balance"]];
+  for (const [auto, manual] of pairs) {
+    const on = camEl(auto).checked;
+    const wrap = document.getElementById("wrap_" + manual);
+    if (wrap) wrap.className = on ? "field gated" : "field";
+    camEl(manual).disabled = on;
+  }
+}
+
+function buildCameraObject() {
+  const cam = {};
+  for (const name of CAM_TOGGLES) {
+    if (camTouched.has(name)) cam[name] = camEl(name).checked;
+  }
+  for (const name of CAM_SLIDERS) {
+    if (camTouched.has(name)) cam[name] = Number(camEl(name).value);
+  }
+  return cam;
+}
+
+for (const name of CAM_SLIDERS) {
+  const el = camEl(name);
+  const out = document.getElementById("v_" + name);
+  el.addEventListener("input", () => { out.textContent = el.value; });
+  el.addEventListener("change", () => {
+    camTouched.add(name);
+    applyConfig();
+  });
+}
+for (const name of CAM_TOGGLES) {
+  camEl(name).addEventListener("change", () => {
+    camTouched.add(name);
+    // Turning auto off is only useful alongside a manual value, and the
+    // drone needs both in the same push -- sending the toggle alone would
+    // leave the camera in manual mode at whatever it happened to hold.
+    if (!camEl(name).checked) {
+      camTouched.add(name === "auto_exposure" ? "exposure" : "white_balance");
+    }
+    updateCamGating();
+    applyConfig();
+  });
+}
 
 // --- Capture controls ------------------------------------------------
 const btnRecord = document.getElementById("btn-record");

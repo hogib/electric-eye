@@ -1,4 +1,5 @@
 #pragma once
+#include "camera_ctrl.h"
 #include "video_frame.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -42,6 +43,11 @@ typedef struct RpicamIn RpicamIn;
  * returning, so a wrong geometry or a missing camera fails once, here,
  * rather than as a confusing per-frame decode loop later.
  *
+ * `controls` may be NULL. Unlike V4L2, rpicam takes camera controls as
+ * spawn-time arguments rather than as ioctls on a live device, so they
+ * are baked into the child's command line here -- changing them means
+ * restarting the child, which producer_loop handles.
+ *
  * `downscale` follows the same contract as v4l2_in_open(): frames handed
  * back are width/downscale x height/downscale. It is applied during JPEG
  * decompression (see jpeg_decode.h), not as a separate pass.
@@ -49,7 +55,8 @@ typedef struct RpicamIn RpicamIn;
  * Returns NULL on failure, having already reported the reason.
  */
 RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
-                         uint32_t framerate_hint, uint32_t downscale);
+                         uint32_t framerate_hint, uint32_t downscale,
+                         const CameraControls *controls);
 
 /*
  * Reads and decodes the next complete JPEG into frame->raw_planes.

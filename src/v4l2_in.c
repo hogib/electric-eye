@@ -254,6 +254,8 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
   return false;
 }
 
+int v4l2_in_fd(const V4l2In *in) { return in ? in->fd : -1; }
+
 void v4l2_in_close(V4l2In *in) {
   if (!in)
     return;

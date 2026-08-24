@@ -74,6 +74,7 @@ endif
 
 src = [
     'src/eeye.c',
+    'src/camera_ctrl.c',
     'src/config.c',
     'src/conv.c',
     'src/effect_chain.c',
@@ -113,19 +114,26 @@ test_inc = include_directories('src', 'tests')
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
 # frame pool, so those get linked in alongside.
 test_extra_sources = {
-    'config': [],
+    'config': ['src/camera_ctrl.c'],
     'ring_buffer': [],
-    'jpeg_framing': ['src/jpeg_decode.c', 'src/video_frame.c'],
+    'jpeg_framing': [
+        'src/camera_ctrl.c',
+        'src/jpeg_decode.c',
+        'src/video_frame.c',
+    ],
     'negotiation': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'jpeg_decode': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'log_edges': ['src/conv.c', 'src/video_frame.c'],
     'canny': ['src/conv.c', 'src/video_frame.c'],
     'health': [],
+    'camera_ctrl': [],
     'effect_chain': [
+        'src/camera_ctrl.c',
         'src/conv.c',
         'src/point_opps.c',
         'src/video_frame.c',
-        'src/config.c',
+        'src/camera_ctrl.c',
+    'src/config.c',
     ],
 }
 

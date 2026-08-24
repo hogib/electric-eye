@@ -50,6 +50,19 @@ static const Config config_defaults = {
     .capture_height = 720,
     .downscale = 1, // full resolution: what this ran at before the field existed
     .capture_source = CAPTURE_AUTO,
+    // Every camera control unset -- "leave the camera alone". Spelled out
+    // here rather than fixed up at each use of config_defaults, since a
+    // zero-initialized CameraControls would mean "force every control to
+    // its minimum", which is emphatically not the default anyone wants.
+    .camera = {.auto_exposure = camera_ctrl_unset,
+               .auto_white_balance = camera_ctrl_unset,
+               .exposure = camera_ctrl_unset,
+               .gain = camera_ctrl_unset,
+               .white_balance = camera_ctrl_unset,
+               .brightness = camera_ctrl_unset,
+               .contrast = camera_ctrl_unset,
+               .saturation = camera_ctrl_unset,
+               .sharpness = camera_ctrl_unset},
 };
 
 // The geometry actually in force, captured by config_load_once() before any
@@ -174,6 +187,43 @@ static bool parse_u8(Cursor *c, uint8_t *out) {
   }
 
   *out = (uint8_t)v;
+  return true;
+}
+
+// Signed, and wider than the u8/u16 parsers above: brightness is
+// -100..100 and exposure is in microseconds, which passes 65535 at a
+// fortieth of a second.
+static bool parse_i32(Cursor *c, int32_t *out) {
+  size_t start = c->pos;
+  if (c->pos < c->len && c->s[c->pos] == '-')
+    c->pos++;
+
+  bool any_digit = false;
+  while (c->pos < c->len && c->s[c->pos] >= '0' && c->s[c->pos] <= '9') {
+    c->pos++;
+    any_digit = true;
+  }
+  if (!any_digit) {
+    c->pos = start;
+    return false;
+  }
+
+  char buf[32];
+  size_t n = c->pos - start;
+  if (n >= sizeof buf) {
+    c->pos = start;
+    return false;
+  }
+  memcpy(buf, c->s + start, n);
+  buf[n] = '\0';
+
+  char *end = NULL;
+  long v = strtol(buf, &end, 10);
+  if (end == buf || *end != '\0' || v < INT32_MIN + 1 || v > INT32_MAX) {
+    c->pos = start;
+    return false;
+  }
+  *out = (int32_t)v;
   return true;
 }
 
@@ -546,6 +596,123 @@ static bool parse_chain(Cursor *c, EffectStage *stages, size_t *stage_count) {
 // ignored typo ("efect" instead of "effect") is a much worse failure mode
 // than the whole reload being rejected and logged -- it would look like the
 // config took effect when it didn't.
+// Parses the "camera" object. Its fields are all optional and all mean
+// "leave this control alone" when absent, so this only ever writes the
+// keys actually present -- see camera_ctrl.h on why that is a sentinel
+// rather than a zero default.
+//
+// Range-checks here are deliberately loose: they reject values that could
+// only be a mistake (a Kelvin temperature of 9, a percentage of 500),
+// while the real per-device clamping happens in camera_ctrl_apply, which
+// is the only place that knows what a given camera actually accepts.
+static bool parse_camera(Cursor *c, CameraControls *out) {
+  if (!cur_expect(c, '{')) {
+    printf("Config: expected '{' for \"camera\"\n");
+    return false;
+  }
+  skip_ws(c);
+
+  char ch;
+  if (cur_peek(c, &ch) && ch == '}') {
+    c->pos++;
+    return true; // an empty object is valid: it changes nothing
+  }
+
+  for (;;) {
+    char key[32];
+    skip_ws(c);
+    if (!parse_string(c, key, sizeof key)) {
+      printf("Config: expected a quoted key in \"camera\"\n");
+      return false;
+    }
+    skip_ws(c);
+    if (!cur_expect(c, ':')) {
+      printf("Config: expected ':' after \"%s\" in \"camera\"\n", key);
+      return false;
+    }
+    skip_ws(c);
+
+    bool ok;
+    int32_t lo = 0, hi = 0;
+    int32_t *target = NULL;
+    if (strcmp(key, "auto_exposure") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->auto_exposure = b ? 1 : 0;
+    } else if (strcmp(key, "auto_white_balance") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->auto_white_balance = b ? 1 : 0;
+    } else if (strcmp(key, "exposure") == 0) {
+      target = &out->exposure;
+      lo = 1;
+      hi = 10000000; // 10s; past any sane video exposure
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "gain") == 0) {
+      target = &out->gain;
+      lo = 0;
+      hi = 100;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "white_balance") == 0) {
+      target = &out->white_balance;
+      lo = 1000;
+      hi = 15000; // Kelvin, generously past any camera's range
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "brightness") == 0) {
+      target = &out->brightness;
+      lo = -100;
+      hi = 100;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "contrast") == 0) {
+      target = &out->contrast;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "saturation") == 0) {
+      target = &out->saturation;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "sharpness") == 0) {
+      target = &out->sharpness;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else {
+      printf("Config: unknown key \"%s\" in \"camera\"\n", key);
+      return false;
+    }
+
+    if (!ok) {
+      printf("Config: invalid value for \"%s\" in \"camera\"\n", key);
+      return false;
+    }
+    if (target && (*target < lo || *target > hi)) {
+      printf("Config: \"%s\" must be between %d and %d (got %d)\n", key, lo,
+             hi, *target);
+      return false;
+    }
+
+    skip_ws(c);
+    if (!cur_peek(c, &ch)) {
+      printf("Config: unterminated \"camera\" object\n");
+      return false;
+    }
+    if (ch == ',') {
+      c->pos++;
+      continue;
+    }
+    if (ch == '}') {
+      c->pos++;
+      return true;
+    }
+    printf("Config: expected ',' or '}' after \"%s\" in \"camera\"\n", key);
+    return false;
+  }
+}
+
 static bool parse_config(const char *buf, size_t len, Config *out) {
   Cursor c = {.s = buf, .len = len, .pos = 0};
   Config parsed = config_defaults;
@@ -588,6 +755,9 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"stream_frame_interval\"\n");
           return false;
         }
+      } else if (strcmp(key, "camera") == 0) {
+        if (!parse_camera(&c, &parsed.camera))
+          return false; // parse_camera already explained why
       } else if (strcmp(key, "stream_raw") == 0) {
         if (!parse_bool(&c, &parsed.stream_raw)) {
           printf("Config: invalid value for \"stream_raw\" (expected true "

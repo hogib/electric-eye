@@ -219,7 +219,8 @@ Every key is optional. Defaults shown:
   "capture_height": 720,
   "downscale": 1,
   "capture_source": "auto",
-  "stream_raw": false
+  "stream_raw": false,
+  "camera": {}
 }
 ```
 
@@ -324,6 +325,59 @@ Width must be a multiple of `2 × downscale` and height a multiple of
 named. Only these four values are allowed because both capture paths need an exact
 ratio — MJPEG scales during JPEG decompression (so the decode itself gets cheaper),
 and YUYV box-averages N×N blocks.
+
+### Camera controls
+
+`"camera"` sets what the sensor does before any effect runs — and underwater
+that matters more than anything in the chain, because no effect can recover
+detail the sensor never captured. Auto exposure hunts badly in low contrast;
+auto white balance gives up once everything is blue-green.
+
+```json
+"camera": {
+  "auto_exposure": false,
+  "exposure": 20000,
+  "gain": 30,
+  "auto_white_balance": false,
+  "white_balance": 3200
+}
+```
+
+Every field is optional, and **anything you leave out is left alone** — so a
+`"camera"` block with one key changes exactly one control.
+
+| key | range | meaning |
+|---|---|---|
+| `auto_exposure` | bool | Must be `false` before `exposure` takes effect |
+| `exposure` | µs | Shutter time. Shorter freezes motion but needs more gain |
+| `gain` | 0–100 | Percent of the sensor's own range; raises brightness and noise together |
+| `auto_white_balance` | bool | Must be `false` before `white_balance` takes effect |
+| `white_balance` | Kelvin | ~2800 (warm) to 6500 (cool) |
+| `brightness` | −100–100 | 0 = neutral |
+| `contrast` | 0–200 | 100 = neutral |
+| `saturation` | 0–200 | 100 = neutral |
+| `sharpness` | 0–200 | 100 = neutral |
+
+These are **hot-reloadable** — adjust them from the UI's Camera section and the
+picture changes immediately, no restart. They are also re-applied after a camera
+reconnect, since a replugged camera comes back at its factory defaults.
+
+The percent-style ranges are deliberate: real cameras disagree about units (this
+project's test webcam runs brightness −64..64 and gain 0..128, another will
+differ), so `eeye` scales onto whatever the device reports and clamps to it. That
+means one config works across cameras and across both capture backends.
+
+**Turn the auto mode off in the same edit as the manual value.** A camera rejects
+a manual exposure while auto exposure is on, and reports it as a *permission*
+error — so `eeye` translates that into what it actually means:
+
+```
+camera: "exposure" was refused because this camera needs its automatic mode
+        turned off first -- set the matching auto_* option to false alongside it
+```
+
+Controls a camera doesn't have are reported once and skipped, not treated as a
+failure. To see what yours offers: `v4l2-ctl -d /dev/video0 --list-ctrls`.
 
 ### Camera source
 
@@ -455,7 +509,11 @@ fine on a shared network.
 - **Onboard recording is uncompressed** (~190 GB/hour), so it is for short clips.
   `tools/eeye-record` encodes topside at ~1.2 GB/hour for anything longer — at
   the preview's framerate and quality, not the camera's.
-- **Pi camera controls beyond resolution and framerate aren't plumbed through.**
+- **Camera controls on the Pi camera backend need a restart to apply.**
+  `rpicam-vid` takes them as command-line arguments, so changing one respawns
+  the child — a ~1s gap in the video, announced in the log. The V4L2 backend
+  applies them instantly. The Pi-side mapping is **unverified on real CSI
+  hardware**; only its argument construction is tested.
 - **Snapshots and topside recordings capture the preview**, so they inherit
   `stream_frame_interval`, `stream_quality`, and `stream_raw`.
 - **Recording from the UI needs `ffmpeg` on the topside machine.** The Record
