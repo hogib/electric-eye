@@ -56,6 +56,7 @@ static void test_every_effect_name_parses(void) {
       {"tint", EFFECT_TINT},           {"sobel", EFFECT_SOBEL},
       {"blur", EFFECT_BLUR},           {"contrast", EFFECT_CONTRAST},
       {"light", EFFECT_LIGHT},         {"log", EFFECT_LOG},
+      {"canny", EFFECT_CANNY},
   };
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
     char json[128];
@@ -104,6 +105,28 @@ static void test_effect_parameters_round_trip(void) {
               &c));
   CHECK_EQ_INT(c.stages[0].log_strength, 3);
   CHECK_EQ_INT(c.stages[0].log_threshold, 25);
+}
+
+// canny's thresholds are seeded to usable defaults rather than 0, which
+// would make it emit an empty map -- the same special-casing light_level
+// gets, and equally easy to lose.
+static void test_canny_threshold_defaults(void) {
+  Config c;
+  CHECK(parse("{\"chain\":[{\"effect\":\"canny\"}]}", &c));
+  CHECK_EQ_INT(c.stages[0].canny_low, 40);
+  CHECK_EQ_INT(c.stages[0].canny_high, 90);
+  CHECK_EQ_INT(c.stages[0].canny_strength, 0); // 0 means 1 pass, see conv.h
+  // Explicit values must survive, including an explicit 0.
+  CHECK(parse("{\"chain\":[{\"effect\":\"canny\",\"canny_low\":0,"
+              "\"canny_high\":255,\"canny_strength\":3}]}",
+              &c));
+  CHECK_EQ_INT(c.stages[0].canny_low, 0);
+  CHECK_EQ_INT(c.stages[0].canny_high, 255);
+  CHECK_EQ_INT(c.stages[0].canny_strength, 3);
+  // Cross-effect parameters stay rejected.
+  CHECK(!parse("{\"chain\":[{\"effect\":\"canny\",\"log_strength\":2}]}",
+               &c));
+  CHECK(!parse("{\"chain\":[{\"effect\":\"log\",\"canny_low\":20}]}", &c));
 }
 
 // log takes its own two parameters and no others -- the per-effect key
@@ -323,6 +346,7 @@ int main(void) {
   RUN_TEST(test_light_level_defaults_neutral);
   RUN_TEST(test_effect_parameters_round_trip);
   RUN_TEST(test_log_parameter_validation);
+  RUN_TEST(test_canny_threshold_defaults);
   RUN_TEST(test_readme_tint_presets_parse);
   RUN_TEST(test_unknown_keys_are_hard_errors);
   RUN_TEST(test_malformed_json_is_rejected);

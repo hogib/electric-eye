@@ -15,6 +15,7 @@ typedef enum {
   EFFECT_CONTRAST,
   EFFECT_LIGHT,
   EFFECT_LOG,
+  EFFECT_CANNY,
 } EffectType;
 
 // Where frames come from. See rpicam_in.h for why a Pi CSI camera needs a
@@ -72,6 +73,19 @@ typedef struct {
   // a zero-crossing to count as an edge. 0 marks every sign change,
   // including noise grazing zero in flat regions.
   uint8_t log_threshold;
+
+  // used when effect == EFFECT_CANNY: Gaussian passes before the gradient.
+  // Unlike the other strength knobs this is never zero -- 0 means 1 --
+  // because the smoothing bounds hysteresis's cost rather than just
+  // setting quality (see conv.h).
+  uint8_t canny_strength;
+
+  // used when effect == EFFECT_CANNY: hysteresis thresholds. At or above
+  // canny_high is an edge outright; between the two only when connected to
+  // one. Defaults (0) would produce an empty map, so parse_effect_stage
+  // seeds them to 40/90 the way it seeds light_level to 128.
+  uint8_t canny_low;
+  uint8_t canny_high;
 } EffectStage;
 
 // Bounds the chain to a fixed-size array rather than something dynamically
@@ -176,8 +190,8 @@ typedef struct {
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
- * none|grayscale|invert|threshold|tint|sobel|blur|contrast|light|log, plus
- * that
+ * none|grayscale|invert|threshold|tint|sobel|blur|contrast|light|log|canny,
+ * plus that
  * effect's own parameters where it takes any (threshold_value for
  * threshold; tint_u/tint_v/tint_strength for tint; sobel_threshold for
  * sobel; blur_strength for blur; light_level for light -- all 0-255).

@@ -225,7 +225,7 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
     const EffectStage *stage = &cfg->stages[i];
 
     if (stage->effect == EFFECT_BLUR || stage->effect == EFFECT_SOBEL ||
-        stage->effect == EFFECT_LOG) {
+        stage->effect == EFFECT_LOG || stage->effect == EFFECT_CANNY) {
       // Neighborhood ops ping-pong between work and spare, never
       // targeting whichever buffer 'cur' already is (that's what's being
       // read). The first neighborhood op in a chain has cur == RAW, so it
@@ -241,6 +241,10 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       if (stage->effect == EFFECT_SOBEL) {
         sobel_edges(src_planes, dst_planes, frame->width, frame->height,
                    frame->stride, stage->sobel_threshold);
+      } else if (stage->effect == EFFECT_CANNY) {
+        canny_edges(src_planes, dst_planes, frame->width, frame->height,
+                    frame->stride, stage->canny_strength, stage->canny_low,
+                    stage->canny_high);
       } else if (stage->effect == EFFECT_LOG) {
         log_edges(src_planes, dst_planes, frame->width, frame->height,
                   frame->stride, stage->log_strength, stage->log_threshold);

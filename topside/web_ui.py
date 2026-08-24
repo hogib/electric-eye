@@ -124,6 +124,15 @@ EFFECT_FIELDS = {
         ["log_strength", 0, 12, 2],
         ["log_threshold", 0, 255, 20],
     ],
+    # Canny. canny_strength is capped like log_strength for the same
+    # reason (Gaussian passes: linear cost, sqrt sigma). The low/high
+    # defaults match parse_effect_stage's seeds in config.c -- the UI
+    # must not offer 0/0, which would produce an empty edge map.
+    "canny": [
+        ["canny_strength", 0, 12, 2],
+        ["canny_low", 0, 255, 40],
+        ["canny_high", 0, 255, 90],
+    ],
     # Range capped well below the field's real 0-255 (repeat-count) domain:
     # each unit is a full extra 5-tap pass over the whole frame, and past
     # ~20 the added blur is visually indistinguishable (effective radius

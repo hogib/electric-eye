@@ -231,6 +231,7 @@ static const char *effect_to_string(EffectType e) {
   case EFFECT_CONTRAST:  return "contrast";
   case EFFECT_LIGHT:     return "light";
   case EFFECT_LOG:       return "log";
+  case EFFECT_CANNY:     return "canny";
   }
   return "?";
 }
@@ -256,6 +257,8 @@ static bool effect_from_string(const char *s, EffectType *out) {
     *out = EFFECT_LIGHT;
   else if (strcmp(s, "log") == 0)
     *out = EFFECT_LOG;
+  else if (strcmp(s, "canny") == 0)
+    *out = EFFECT_CANNY;
   else
     return false;
   return true;
@@ -277,6 +280,9 @@ enum {
   PARAM_LIGHT_LEVEL = 1u << 6,
   PARAM_LOG_STRENGTH = 1u << 7,
   PARAM_LOG_THRESHOLD = 1u << 8,
+  PARAM_CANNY_STRENGTH = 1u << 9,
+  PARAM_CANNY_LOW = 1u << 10,
+  PARAM_CANNY_HIGH = 1u << 11,
 };
 
 // Which parameters each effect actually reads. none/grayscale/invert/
@@ -296,6 +302,8 @@ static uint32_t params_for_effect(EffectType effect) {
     return PARAM_LIGHT_LEVEL;
   case EFFECT_LOG:
     return PARAM_LOG_STRENGTH | PARAM_LOG_THRESHOLD;
+  case EFFECT_CANNY:
+    return PARAM_CANNY_STRENGTH | PARAM_CANNY_LOW | PARAM_CANNY_HIGH;
   case EFFECT_NONE:
   case EFFECT_GRAYSCALE:
   case EFFECT_INVERT:
@@ -316,6 +324,9 @@ static const char *param_name(uint32_t bit) {
   case PARAM_LIGHT_LEVEL:     return "light_level";
   case PARAM_LOG_STRENGTH:    return "log_strength";
   case PARAM_LOG_THRESHOLD:   return "log_threshold";
+  case PARAM_CANNY_STRENGTH:  return "canny_strength";
+  case PARAM_CANNY_LOW:       return "canny_low";
+  case PARAM_CANNY_HIGH:      return "canny_high";
   default:                    return "?";
   }
 }
@@ -329,6 +340,11 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
   // would silently mean "fully dark and desaturated" instead of "no
   // change" -- see EffectStage's own doc comment on light_level.
   parsed.light_level = 128;
+  // Zero thresholds would make canny produce an empty map, so seed usable
+  // defaults rather than a technically-valid but useless setting. Same
+  // reasoning as light_level above.
+  parsed.canny_low = 40;
+  parsed.canny_high = 90;
   bool have_effect = false;
   // Which parameter keys this stage carried, so they can be checked
   // against the effect once it is known -- key order isn't fixed, so a
@@ -393,6 +409,15 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
       } else if (strcmp(key, "log_threshold") == 0) {
         ok = parse_u8(c, &parsed.log_threshold);
         seen_params |= PARAM_LOG_THRESHOLD;
+      } else if (strcmp(key, "canny_strength") == 0) {
+        ok = parse_u8(c, &parsed.canny_strength);
+        seen_params |= PARAM_CANNY_STRENGTH;
+      } else if (strcmp(key, "canny_low") == 0) {
+        ok = parse_u8(c, &parsed.canny_low);
+        seen_params |= PARAM_CANNY_LOW;
+      } else if (strcmp(key, "canny_high") == 0) {
+        ok = parse_u8(c, &parsed.canny_high);
+        seen_params |= PARAM_CANNY_HIGH;
       } else {
         printf("Config: unknown key \"%s\" in a chain stage\n", key);
         return false;

@@ -189,7 +189,7 @@ sees a half-written file.
 `"chain"` is a list of stages **applied in order** — blur-then-sobel differs from
 sobel-then-blur. An empty chain is a valid pass-through. Stages: `none`,
 `grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, `contrast`, `light`,
-`log`.
+`log`, `canny`.
 
 | Key | Effect | Range | Meaning |
 |---|---|---|---|
@@ -202,9 +202,24 @@ sobel-then-blur. An empty chain is a valid pass-through. Stages: `none`,
 | `light_level` | `light` | 0–255 | Brightness *and* saturation together. **Defaults to 128** (neutral); 0 is fully dark |
 | `log_strength` | `log` | 0–255 | Gaussian passes before the Laplacian, so it sets sigma (growing as its square root). 0 and 1 both mean one pass. Higher rejects finer detail — the knob for backscatter |
 | `log_threshold` | `log` | 0–255 | How steep the response must be across a zero-crossing to count as an edge. 0 marks every sign change, noise included |
+| `canny_strength` | `canny` | 0–255 | Gaussian passes. 0 means 1 — the smoothing is never skipped, see below |
+| `canny_low` | `canny` | 0–255 | Weak threshold; kept only where connected to a strong edge. Default 40 |
+| `canny_high` | `canny` | 0–255 | Strong threshold; an edge outright. Default 90 |
 
 `contrast` takes no parameters — it is a full-frame auto luma stretch, recomputed
 every frame. A stage carrying a key its effect doesn't use is a hard parse error.
+
+`canny` is the most selective of the three edge operators: it thins ridges to
+single pixels and then keeps a weak edge **only where it connects to a strong
+one**, so faint real contours survive while equally faint isolated noise does
+not. Tune `canny_high` first (how obvious an edge must be to count at all), then
+`canny_low` (how far a contour is followed once found). A useful starting point
+is roughly a 1:2 or 1:3 ratio — the 40/90 defaults.
+
+Its `canny_strength` is deliberately never zero. The Gaussian is not a quality
+setting there: it is what bounds the cost of the connectivity pass. Measured at
+1280×720, hysteresis on unsmoothed noise costs 10.8 ms against 0.5 ms after a
+single 0.07 ms blur pass.
 
 `log` is Laplacian of Gaussian, rendered as Marr–Hildreth zero-crossings: thin,
 closed 1px contours rather than `sobel`'s thicker gradient ridges. Smooth first
@@ -214,6 +229,21 @@ you care about; raise `log_threshold` when noise is producing speckle.
 
 Sepia: `{"effect": "tint", "tint_u": 90, "tint_v": 150, "tint_strength": 180}`
 Blue: `{"effect": "tint", "tint_u": 190, "tint_v": 100, "tint_strength": 140}`
+
+#### Edge operator cost
+
+Measured on a real 1280×720 camera frame (x86_64 dev laptop; a Pi will be
+slower, but the ratios hold). The 30 fps budget is 33.3 ms/frame:
+
+| operator | cost | output |
+|---|---|---|
+| `sobel` | 0.33 ms | gradient magnitude, ridges several px wide |
+| `log` (strength 1) | 1.56 ms | thin closed contours, no connectivity filter |
+| `canny` (strength 1) | 2.35 ms | thin contours, weak edges kept only if connected |
+
+All three are a small fraction of the budget; pick on output, not cost. Note
+`canny`'s time is content-dependent — a frame that is almost entirely noise
+costs several times more, which is what `canny_strength` exists to control.
 
 ### Resolution
 

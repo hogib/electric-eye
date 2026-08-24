@@ -118,6 +118,7 @@ test_extra_sources = {
     'negotiation': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'jpeg_decode': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'log_edges': ['src/conv.c', 'src/video_frame.c'],
+    'canny': ['src/conv.c', 'src/video_frame.c'],
     'effect_chain': [
         'src/conv.c',
         'src/point_opps.c',
