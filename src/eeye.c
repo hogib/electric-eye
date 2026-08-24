@@ -302,6 +302,7 @@ int main(int argc, char **argv) {
   }
   work_args.config = config_watcher;
   cons_args.config = config_watcher;
+  cons_args.config_path = config_path;
 
   pthread_t producer, worker, consumer, stats;
   if (pthread_create(&producer, NULL, producer_loop, &prod_args) != 0) {

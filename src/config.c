@@ -45,6 +45,7 @@ static const Config config_defaults = {
     .record_path = "",
     .stream_frame_interval = 0, // off by default -- no JPEG work, no socket traffic
     .stream_quality = 60,
+    .stream_raw = false,
     .capture_width = 1280,
     .capture_height = 720,
     .downscale = 1, // full resolution: what this ran at before the field existed
@@ -174,6 +175,24 @@ static bool parse_u8(Cursor *c, uint8_t *out) {
 
   *out = (uint8_t)v;
   return true;
+}
+
+// The only bool-valued key so far. Accepts the two JSON literals and
+// nothing else -- 0/1 would be a reasonable extension but silently
+// accepting a number where a bool belongs is the kind of leniency that
+// hides a typo.
+static bool parse_bool(Cursor *c, bool *out) {
+  if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "true", 4) == 0) {
+    c->pos += 4;
+    *out = true;
+    return true;
+  }
+  if (c->pos + 5 <= c->len && memcmp(c->s + c->pos, "false", 5) == 0) {
+    c->pos += 5;
+    *out = false;
+    return true;
+  }
+  return false;
 }
 
 // Same shape as parse_u8 above, widened for the capture dimensions --
@@ -567,6 +586,12 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
       } else if (strcmp(key, "stream_frame_interval") == 0) {
         if (!parse_u8(&c, &parsed.stream_frame_interval)) {
           printf("Config: invalid value for \"stream_frame_interval\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "stream_raw") == 0) {
+        if (!parse_bool(&c, &parsed.stream_raw)) {
+          printf("Config: invalid value for \"stream_raw\" (expected true "
+                 "or false)\n");
           return false;
         }
       } else if (strcmp(key, "stream_quality") == 0) {

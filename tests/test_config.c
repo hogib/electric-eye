@@ -107,6 +107,31 @@ static void test_effect_parameters_round_trip(void) {
   CHECK_EQ_INT(c.stages[0].log_threshold, 25);
 }
 
+// stream_raw is the first bool-valued key. A bool parser that accepted
+// numbers, or silently defaulted a malformed value to false, would turn a
+// typo into "the raw toggle just doesn't work".
+static void test_stream_raw_bool_parsing(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK(c.stream_raw == false); // default
+  CHECK(parse("{\"stream_raw\":true}", &c));
+  CHECK(c.stream_raw == true);
+  CHECK(parse("{\"stream_raw\":false}", &c));
+  CHECK(c.stream_raw == false);
+  // Anything that isn't a JSON bool must be rejected, not coerced.
+  CHECK(!parse("{\"stream_raw\":1}", &c));
+  CHECK(!parse("{\"stream_raw\":0}", &c));
+  CHECK(!parse("{\"stream_raw\":\"true\"}", &c));
+  CHECK(!parse("{\"stream_raw\":TRUE}", &c));
+  CHECK(!parse("{\"stream_raw\":truthy}", &c));
+  // It is hot-reloadable, so it must coexist with the rest of a config.
+  CHECK(parse("{\"chain\":[{\"effect\":\"sobel\"}],\"stream_raw\":true,"
+              "\"stream_frame_interval\":3}",
+              &c));
+  CHECK(c.stream_raw == true);
+  CHECK_EQ_INT(c.stages[0].effect, EFFECT_SOBEL);
+}
+
 // canny's thresholds are seeded to usable defaults rather than 0, which
 // would make it emit an empty map -- the same special-casing light_level
 // gets, and equally easy to lose.
@@ -347,6 +372,7 @@ int main(void) {
   RUN_TEST(test_effect_parameters_round_trip);
   RUN_TEST(test_log_parameter_validation);
   RUN_TEST(test_canny_threshold_defaults);
+  RUN_TEST(test_stream_raw_bool_parsing);
   RUN_TEST(test_readme_tint_presets_parse);
   RUN_TEST(test_unknown_keys_are_hard_errors);
   RUN_TEST(test_malformed_json_is_rejected);

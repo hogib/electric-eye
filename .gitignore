@@ -58,8 +58,10 @@ dkms.conf
 __pycache__/
 *.pyc
 
-# Runtime-generated config reload status (see config.h/config.c)
+# Runtime-generated config reload status (see config.h/config.c) and
+# health snapshot (see health.h) -- both written beside the config file.
 *.json.status
+*.json.health
 
 # Build
 build/

@@ -78,6 +78,7 @@ src = [
     'src/conv.c',
     'src/effect_chain.c',
     'src/frame_ring_buffer.c',
+    'src/health.c',
     'src/jpeg_decode.c',
     'src/video_frame.c',
     'src/point_opps.c',
@@ -119,6 +120,7 @@ test_extra_sources = {
     'jpeg_decode': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'log_edges': ['src/conv.c', 'src/video_frame.c'],
     'canny': ['src/conv.c', 'src/video_frame.c'],
+    'health': [],
     'effect_chain': [
         'src/conv.c',
         'src/point_opps.c',
@@ -137,6 +139,18 @@ foreach t, extra : test_extra_sources
     )
     test(t, test_exe)
 endforeach
+
+# Topside/drone Python: link staleness and the health relay. Standard
+# library only, so this needs no environment beyond python3 itself.
+python_exe = find_program('python3', required: false)
+if python_exe.found()
+    test(
+        'topside',
+        python_exe,
+        args: [meson.project_source_root() / 'tests/test_topside.py'],
+        timeout: 120,
+    )
+endif
 
 
 

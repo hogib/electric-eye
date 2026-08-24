@@ -54,6 +54,15 @@ class FrameSource:
         self.port = port
         self._frame = None
         self._frame_id = 0
+        # When the most recent frame arrived, and whether the socket to the
+        # drone is currently up. Both exist so a viewer can tell a live
+        # picture from a frozen one: without them the last frame received
+        # sits on screen indefinitely and looks exactly like live video,
+        # which is the worst way for a tether to fail while someone is
+        # flying on it.
+        self._frame_time = None
+        self._connected = False
+        self._frames_seen = 0
         self._cond = threading.Condition()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -64,19 +73,32 @@ class FrameSource:
             except (OSError, ConnectionError) as e:
                 print(f"[frame source] connection to {self.host}:{self.port} "
                       f"lost/failed ({e}); retrying in 2s")
-                time.sleep(2)
+            finally:
+                with self._cond:
+                    self._connected = False
+                    # Wake anyone blocked in wait_for_frame so they can
+                    # re-render with the connection now marked down,
+                    # rather than sitting on a stale frame until the link
+                    # happens to come back.
+                    self._cond.notify_all()
+            time.sleep(2)
 
     def _read_forever(self):
         print(f"[frame source] connecting to {self.host}:{self.port}...")
         with socket.create_connection((self.host, self.port), timeout=5) as sock:
             sock.settimeout(10)  # a stalled drone side shouldn't hang forever
             print("[frame source] connected")
+            with self._cond:
+                self._connected = True
+                self._cond.notify_all()
             while True:
                 (length,) = struct.unpack("!I", self._recv_exact(sock, 4))
                 jpeg = self._recv_exact(sock, length)
                 with self._cond:
                     self._frame = jpeg
                     self._frame_id += 1
+                    self._frames_seen += 1
+                    self._frame_time = time.monotonic()
                     self._cond.notify_all()
 
     @staticmethod
@@ -89,13 +111,44 @@ class FrameSource:
             buf.extend(chunk)
         return bytes(buf)
 
-    def wait_for_frame(self, last_seen_id):
-        """Blocks until a frame newer than last_seen_id is available, then
-        returns (frame_bytes, frame_id)."""
+    def wait_for_frame(self, last_seen_id, timeout=None):
+        """Waits for a frame newer than last_seen_id.
+
+        Returns (frame_bytes, frame_id), or (None, last_seen_id) if the
+        timeout expired with nothing new. The timeout is what lets the
+        MJPEG stream keep emitting parts while the drone is silent -- a
+        browser that stops receiving parts just shows the last one
+        forever, so going quiet is indistinguishable from a still scene.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while self._frame_id == last_seen_id or self._frame is None:
-                self._cond.wait()
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, last_seen_id
+                self._cond.wait(remaining)
             return self._frame, self._frame_id
+
+    def health(self):
+        """Snapshot of link state, for the status endpoint and the overlay.
+
+        age_s is seconds since the last frame arrived -- None if none ever
+        has. Deliberately reported as a number rather than a yes/no so the
+        page can decide what counts as stale; what is acceptable depends
+        on the configured frame interval.
+        """
+        with self._cond:
+            age = (None if self._frame_time is None
+                   else time.monotonic() - self._frame_time)
+            return {
+                "connected": self._connected,
+                "age_s": age,
+                "frames": self._frames_seen,
+                "have_frame": self._frame is not None,
+            }
 
 
 # Mirrors config.h's JSON schema exactly: for each effect, the list of
@@ -175,16 +228,56 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   #status.err { color: #f88; }
   label.field { display: block; margin: 6px 0; }
   input[type=text] { width: 100%; box-sizing: border-box; }
+
+  /* Link/recording state, drawn over the video rather than beside it.
+     A pilot watches the picture, not the sidebar -- a warning they have
+     to look away to notice is a warning they will miss. */
+  #videowrap { position: relative; display: block; }
+  #banner {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 10px 14px; font-weight: bold; font-size: 15px;
+    text-align: center; display: none; z-index: 2;
+  }
+  #banner.stale {
+    display: block; background: rgba(180, 20, 20, 0.92); color: #fff;
+    /* Pulsing, because a frozen picture is otherwise indistinguishable
+       from a still scene -- the motion is the signal. */
+    animation: pulse 1s steps(2, start) infinite;
+  }
+  #banner.warn {
+    display: block; background: rgba(190, 120, 0, 0.92); color: #fff;
+  }
+  @keyframes pulse { 50% { opacity: 0.55; } }
+  /* Desaturate the picture itself while it is stale: whatever the pilot
+     is looking at, it stops looking like live video. */
+  #video.stale { filter: grayscale(1) brightness(0.55); }
+
+  #recstate { margin: 4px 0 2px; font-size: 13px; }
+  #recstate.active { color: #6f6; }
+  #recstate.failed { color: #f66; font-weight: bold; }
+  #recstate.off { opacity: 0.6; }
 </style>
 </head>
 <body>
-  <img id="video" src="/stream">
+  <div id="videowrap">
+    <img id="video" src="/stream">
+    <div id="banner"></div>
+  </div>
   <div id="panel">
     <h2>Effect chain</h2>
     <div id="stages"></div>
     <button id="add-stage" type="button">+ Add stage</button>
 
+    <h2>Preview</h2>
+    <label class="field">
+      <input type="checkbox" id="stream_raw">
+      Show raw camera (bypass effects)
+    </label>
+    <div class="readonly">Preview only — the virtual camera and recording
+      are unaffected.</div>
+
     <h2>Recording (onboard, full quality)</h2>
+    <div id="recstate" class="off">recording: unknown</div>
     <label class="field">Path (blank = off)
       <input type="text" id="record_path" placeholder="/opt/electric-eye/recordings/session.raw">
     </label>
@@ -360,6 +453,7 @@ function buildConfig() {
     chain,
     record_path: document.getElementById("record_path").value,
     stream_frame_interval: Number(document.getElementById("stream_frame_interval").value),
+    stream_raw: document.getElementById("stream_raw").checked,
     stream_quality: Number(document.getElementById("stream_quality").value),
     ...carriedGeometry,
   };
@@ -371,6 +465,7 @@ function loadConfig(cfg) {
   if (stagesEl.children.length === 0) addStage();
   document.getElementById("record_path").value = cfg.record_path || "";
   document.getElementById("stream_frame_interval").value = cfg.stream_frame_interval || 0;
+  document.getElementById("stream_raw").checked = !!cfg.stream_raw;
   document.getElementById("stream_quality").value = cfg.stream_quality || 60;
 
   // Only carry keys the drone's config actually had. Writing back defaults
@@ -461,6 +556,107 @@ document.getElementById("apply").addEventListener("click", async () => {
   }
 });
 
+// --- Link and recording health ---------------------------------------
+//
+// Polled rather than pushed: the MJPEG stream carries no metadata, and a
+// second socket for a handful of bytes a second would be more moving
+// parts than this is worth.
+//
+// STALE_AFTER_S has to clear the configured frame interval -- at
+// stream_frame_interval 3 and 30fps a frame arrives every 100ms, but a
+// slow link legitimately stretches that. 2.5s is well past any normal
+// gap and still fast enough that a pilot notices before flying far on a
+// frozen picture.
+const STALE_AFTER_S = 2.5;
+const banner = document.getElementById("banner");
+const video = document.getElementById("video");
+const recstate = document.getElementById("recstate");
+
+function renderHealth(h) {
+  const link = h.link || {};
+  const drone = h.drone || {};
+
+  // Link first: if the picture is not live, nothing else on screen
+  // matters as much.
+  let stale = false;
+  let message = "";
+  if (!link.have_frame) {
+    stale = true;
+    message = link.connected
+      ? "WAITING FOR VIDEO — connected, no frames yet"
+      : "NO VIDEO — not connected to the drone";
+  } else if (!link.connected) {
+    stale = true;
+    const age = link.age_s === null ? "?" : link.age_s.toFixed(1);
+    message = `LINK LOST — showing a frozen frame from ${age}s ago`;
+  } else if (link.age_s !== null && link.age_s > STALE_AFTER_S) {
+    stale = true;
+    message = `VIDEO STALLED — last frame ${link.age_s.toFixed(1)}s ago`;
+  }
+
+  banner.className = stale ? "stale" : "";
+  banner.textContent = message;
+  video.className = stale ? "stale" : "";
+
+  // Recording. The case this exists for: eeye stopped recording (a full
+  // disk, usually) while the operator still has a path typed in and
+  // believes it is running.
+  const rec = (drone.recording) || {};
+  if (drone.error) {
+    recstate.className = "off";
+    recstate.textContent = "recording: unknown (" + drone.error + ")";
+  } else if (rec.state === "active") {
+    const mb = (rec.bytes / (1024 * 1024)).toFixed(0);
+    let text = `recording: ACTIVE — ${mb} MB written`;
+    if (rec.disk_free_bytes) {
+      const freeMb = rec.disk_free_bytes / (1024 * 1024);
+      text += `, ${freeMb.toFixed(0)} MB free`;
+      // Warn while there is still time to do something about it.
+      if (freeMb < 500 && !stale) {
+        banner.className = "warn";
+        banner.textContent =
+          `DISK NEARLY FULL — ${freeMb.toFixed(0)} MB left`;
+      }
+    }
+    recstate.className = "active";
+    recstate.textContent = text;
+  } else if (rec.state === "failed") {
+    recstate.className = "failed";
+    recstate.textContent = "recording: FAILED — " + (rec.error || "unknown");
+    if (!stale) {
+      banner.className = "warn";
+      banner.textContent = "NOT RECORDING — " + (rec.error || "write failed");
+    }
+  } else {
+    recstate.className = "off";
+    recstate.textContent = "recording: off";
+  }
+
+  // A health file that stopped being updated means eeye is wedged or
+  // gone -- which reads as healthy if you only look at its contents.
+  if (drone.age_s !== undefined && drone.age_s > 5 && !stale) {
+    banner.className = "warn";
+    banner.textContent =
+      `DRONE NOT REPORTING — last health update ${drone.age_s.toFixed(0)}s ago`;
+  }
+}
+
+async function pollHealth() {
+  try {
+    const r = await fetch("/health", { cache: "no-store" });
+    renderHealth(await r.json());
+  } catch (e) {
+    // The topside server itself is unreachable -- the browser cannot
+    // reach the machine it loaded this page from, so nothing on screen
+    // can be trusted to be current.
+    banner.className = "stale";
+    banner.textContent = "TOPSIDE UNREACHABLE — display is frozen";
+    video.className = "stale";
+  }
+}
+setInterval(pollHealth, 1000);
+pollHealth();
+
 refreshFromDrone();
 </script>
 </body>
@@ -508,6 +704,8 @@ def make_handler(source, agent_host, agent_port):
                 self._serve_stream()
             elif self.path == "/config":
                 self._proxy_to_agent("GET")
+            elif self.path == "/health":
+                self._serve_health()
             else:
                 self.send_error(404)
 
@@ -525,6 +723,30 @@ def make_handler(source, agent_host, agent_port):
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_health(self):
+            """Combines the two halves of "is this working".
+
+            The link half is known here (when did a frame last arrive, is
+            the socket up) and the drone half only over there (is
+            recording still running). A viewer needs both, and getting
+            them in one request keeps them from disagreeing about *when*
+            they were true.
+
+            The drone half is best-effort: if the config agent is
+            unreachable, the link half is still worth reporting, and its
+            absence is itself informative.
+            """
+            payload = {"link": source.health()}
+            try:
+                req = urllib.request.Request(f"{agent_base}/health")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    payload["drone"] = json.loads(resp.read())
+            except Exception as e:
+                payload["drone"] = {"error": f"unreachable: {e}"}
+            self._respond(200, "application/json",
+                          json.dumps(payload).encode(),
+                          extra_headers={"Cache-Control": "no-store"})
 
         def _proxy_to_agent(self, method):
             """Forwards GET/POST /config verbatim to the drone's

@@ -1,6 +1,7 @@
 #include "video_threads.h"
 #include "effect_chain.h"
 #include "frame_ring_buffer.h"
+#include "health.h"
 #include "stream_server.h"
 #include "rpicam_in.h"
 #include "v4l2_in.h"
@@ -26,6 +27,10 @@
 // while the daemon keeps quietly retrying underneath.
 #define CAMERA_RECONNECT_LOG_EVERY 15
 #define STATS_LOG_INTERVAL_MS 5000
+// How often consumer_loop republishes its health snapshot. Fast enough
+// that an operator notices a failed recording within a couple of seconds,
+// slow enough that it stays a rounding error against per-frame work.
+#define HEALTH_PUBLISH_INTERVAL_MS 1000
 
 // The two capture backends have identical lifecycles from producer_loop's
 // point of view -- open, capture repeatedly, close -- so they're unified
@@ -202,6 +207,17 @@ void *consumer_loop(void *arg) {
   FILE *record_file = NULL;
   char record_path[max_record_path_len] = "";
 
+  // Health, republished on a timer to "<config_path>.health" so topside
+  // can see what only this process knows -- above all whether recording
+  // is still actually running. See health.h.
+  HealthSnapshot health = {
+      .recording_state = RECORDING_OFF,
+      .camera_connected = true, // reaching this loop means frames are flowing
+      .frame_width = args->frame_width,
+      .frame_height = args->frame_height,
+  };
+  int64_t last_health_pts = -1;
+
   while (atomic_load(args->is_running) ||
          atomic_load_explicit(&args->ring_buffer_out->head,
                               memory_order_relaxed) !=
@@ -228,9 +244,36 @@ void *consumer_loop(void *arg) {
         printf("Recording stopped: %s\n", record_path);
       }
       snprintf(record_path, sizeof record_path, "%s", cfg->record_path);
-      if (record_path[0] != '\0') {
+      if (record_path[0] == '\0') {
+        health.recording_state = RECORDING_OFF;
+        health.recording_path[0] = '\0';
+        health.recording_error[0] = '\0';
+        health.recording_bytes = 0;
+      } else {
+        snprintf(health.recording_path, sizeof health.recording_path, "%s",
+                 record_path);
+        health.recording_bytes = 0;
+
+        // Check for room before opening, not just after failing to write.
+        // Raw I422 at 30fps is ~53MB/s at 1280x720, so "there was space
+        // when I hit record" is worth knowing before the dive rather than
+        // after -- this is reported, not enforced, since how much footage
+        // an operator intends to take is theirs to decide.
+        uint64_t free_bytes = health_disk_free(record_path);
+        size_t frame_bytes = (size_t)args->frame_width *
+                             args->frame_height * 2;
+        if (free_bytes > 0 && frame_bytes > 0) {
+          uint64_t seconds = free_bytes / (frame_bytes * CAMERA_FRAMERATE);
+          printf("Recording: %llu MB free at %s (~%llu seconds at this "
+                 "geometry)\n",
+                 (unsigned long long)(free_bytes / (1024 * 1024)), record_path,
+                 (unsigned long long)seconds);
+        }
+
         record_file = fopen(record_path, "wb");
         if (record_file) {
+          health.recording_state = RECORDING_ACTIVE;
+          health.recording_error[0] = '\0';
           printf("Recording started: %s (raw I422 %ux%u -- play back with: "
                  "ffplay -f rawvideo -pix_fmt yuv422p -s %ux%u -r %d -i %s)\n",
                  record_path, args->frame_width, args->frame_height,
@@ -239,6 +282,9 @@ void *consumer_loop(void *arg) {
         } else {
           printf("Recording failed to start: could not open %s: %s\n",
                  record_path, strerror(errno));
+          health.recording_state = RECORDING_FAILED;
+          snprintf(health.recording_error, sizeof health.recording_error,
+                   "could not open: %s", strerror(errno));
           record_path[0] = '\0'; // don't retry the same failing path every frame
         }
       }
@@ -248,11 +294,19 @@ void *consumer_loop(void *arg) {
       size_t total = frame->plane_sizes[0] + frame->plane_sizes[1] +
                      frame->plane_sizes[2];
       if (fwrite(frame->raw_data, 1, total, record_file) != total) {
+        // Almost always a full disk. This is the case that most needs to
+        // reach topside: the operator asked to record, believes they are
+        // recording, and nothing on their screen would otherwise change.
         printf("Recording write failed (%s); stopping recording.\n",
                strerror(errno));
+        health.recording_state = RECORDING_FAILED;
+        snprintf(health.recording_error, sizeof health.recording_error,
+                 "write failed: %s", strerror(errno));
         fclose(record_file);
         record_file = NULL;
         record_path[0] = '\0';
+      } else {
+        health.recording_bytes += total;
       }
     }
 
@@ -264,7 +318,36 @@ void *consumer_loop(void *arg) {
     // stream_frame_interval == 1.
     if (stream && cfg->stream_frame_interval > 0 &&
         frame->pts % cfg->stream_frame_interval == 0) {
-      stream_server_send_frame(stream, frame, cfg->stream_quality);
+      if (cfg->stream_raw) {
+        // Preview the untouched camera frame instead of the processed
+        // one, so an operator can tell a real object from a filter
+        // artifact without dismantling their chain. Swapped by pointer
+        // rather than by copying: raw_data and pixel_data share this
+        // frame's layout exactly (see video_frame.h), so a shallow view
+        // with the raw planes is all stream_server needs, and it costs
+        // nothing per frame.
+        VideoFrame raw_view = *frame;
+        raw_view.pixel_data = frame->raw_data;
+        raw_view.planes[0] = frame->raw_planes[0];
+        raw_view.planes[1] = frame->raw_planes[1];
+        raw_view.planes[2] = frame->raw_planes[2];
+        stream_server_send_frame(stream, &raw_view, cfg->stream_quality);
+      } else {
+        stream_server_send_frame(stream, frame, cfg->stream_quality);
+      }
+    }
+
+    // Health snapshot, on a timer. pts increments once per frame (see
+    // producer_loop), so it doubles as the clock here rather than needing
+    // a separate one that could drift from the frame rate.
+    const int64_t health_every =
+        (CAMERA_FRAMERATE * HEALTH_PUBLISH_INTERVAL_MS) / 1000;
+    if (health_every > 0 && frame->pts / health_every != last_health_pts) {
+      last_health_pts = frame->pts / health_every;
+      health.frames_captured = (uint64_t)frame->pts;
+      health.disk_free_bytes =
+          health.recording_path[0] ? health_disk_free(health.recording_path) : 0;
+      health_publish(args->config_path, &health);
     }
 
     if (!v4l2_out_write(out, frame)) {

@@ -111,6 +111,17 @@ typedef struct {
   // container; see video_threads.c's own note on how to play it back.
   char record_path[max_record_path_len];
 
+  // Bypass the effect chain for the *preview stream only*: send the
+  // untouched camera frame instead of the processed one. The virtual
+  // camera and the recording tap are unaffected.
+  //
+  // This answers the question an operator cannot otherwise answer from
+  // topside -- "is that thing in the water real, or is it my filter?" --
+  // without having to edit and re-apply the whole chain to find out, and
+  // then edit it back. Hot-reloadable like everything else here, so it is
+  // a toggle rather than a reconfiguration.
+  bool stream_raw;
+
   // Live-preview stream tap (see stream_server.h): every Nth post-effects
   // frame is JPEG-encoded and sent to whichever viewer is currently
   // connected. 0 means the tap is off -- no JPEG work happens at all, not
@@ -182,6 +193,7 @@ typedef struct {
  *     ],
  *     "record_path": "/opt/electric-eye/recordings/session.raw",
  *     "stream_frame_interval": 3,
+ *     "stream_raw": false,
  *     "stream_quality": 60,
  *     "capture_width": 1280,
  *     "capture_height": 720,
@@ -206,6 +218,9 @@ typedef struct {
  * actual content (see color_light in point_opps.h). An empty chain ([])
  * is a valid pass-through.
  * "record_path" is optional; omit it (or set "") to leave recording off.
+ * "stream_raw" is optional (default false); true sends the untouched
+ * camera frame to the preview stream instead of the processed one, leaving
+ * the virtual camera and recording untouched.
  * "stream_frame_interval" is optional (default 0, meaning the live-preview
  * stream tap -- see stream_server.h -- is off); N sends every Nth
  * post-effects frame to whoever is currently connected. "stream_quality" is

@@ -26,6 +26,11 @@ Usage:
 Serves on all interfaces, IPv6 and IPv4 alike (see DualStackHTTPServer
 below -- the IPv6 half is what makes this reachable over a direct cable,
 where link-local is the only addressing available):
+  GET  /health   eeye's own runtime health -- above all whether recording
+                 is actually still running (see src/health.h). Served from
+                 the "<config-path>.health" file eeye republishes on a
+                 timer; a missing or stale file means eeye isn't writing
+                 one, which is itself the answer.
   GET  /config   the current config file's raw contents
   POST /config   replace the file's contents with the request body (must be
                  well-formed JSON; written atomically -- see
@@ -119,6 +124,9 @@ def make_handler(config_path):
             print("[config_agent]", fmt % log_args)
 
         def do_GET(self):
+            if self.path == "/health":
+                self._serve_health()
+                return
             if self.path != "/config":
                 self.send_error(404)
                 return
@@ -170,6 +178,37 @@ def make_handler(config_path):
             self.send_header("Content-Length", str(len(response)))
             self.end_headers()
             self.wfile.write(response)
+
+        def _serve_health(self):
+            """Relays eeye's health file, with the file's own age attached.
+
+            The age matters as much as the contents: a health file that
+            stopped being updated means eeye is wedged or gone, which
+            looks identical to a healthy one if you only read the JSON.
+            Reported rather than judged here -- what counts as too old
+            depends on eeye's publish interval, which topside knows.
+            """
+            health_path = config_path + ".health"
+            try:
+                with open(health_path, "rb") as hf:
+                    raw = hf.read()
+                age = time.time() - os.path.getmtime(health_path)
+                payload = json.loads(raw)
+                payload["age_s"] = round(age, 1)
+                body = json.dumps(payload).encode()
+            except FileNotFoundError:
+                body = json.dumps({
+                    "error": "no health file; is eeye running with this "
+                             "config path?",
+                }).encode()
+            except (OSError, json.JSONDecodeError) as e:
+                body = json.dumps({"error": f"unreadable health file: {e}"}).encode()
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     return Handler
 

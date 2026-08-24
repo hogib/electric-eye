@@ -99,6 +99,44 @@ Logs are the first stop: `journalctl -u eeye -f`, or stdout if running by hand.
 | `neither MJPEG nor YUYV is available at exactly WxH` | Camera doesn't offer that mode and negotiation couldn't substitute one. | `v4l2-ctl --list-formats-ext -d /dev/video0`, then set `capture_width`/`capture_height` to a listed mode |
 | `is not 4:2:2 nor 4:2:0 subsampled` | Unsupported chroma format. | Try a resolution where the camera offers YUYV |
 
+### The picture is frozen but looks live
+
+That was a real hazard and is now surfaced. When frames stop arriving the UI
+desaturates the image and shows a pulsing red banner naming how stale it is:
+
+```
+LINK LOST — showing a frozen frame from 4.0s ago
+```
+
+If you see that, you are **not** looking at live video. `tools/eeye-net check`
+diagnoses which half of the link is down.
+
+### Recording stopped without telling me
+
+It tells you now. The sidebar shows `recording: ACTIVE — 812 MB written,
+4210 MB free`, and turns red with the reason if it stops:
+
+```
+recording: FAILED — write failed: No space left on device
+```
+
+Raw I422 is ~53 MB/s at 1280×720, so a disk fills fast. `eeye` also logs how
+long you have when recording starts:
+
+```
+Recording: 41000 MB free at /data/dive.raw (~780 seconds at this geometry)
+```
+
+`downscale` stretches that — it applies before the recording tap, so
+`downscale: 2` quarters the rate.
+
+### Is that real, or is it my filter?
+
+Tick **Show raw camera (bypass effects)** in the UI, or set `"stream_raw":
+true`. The preview switches to the untouched camera frame while the virtual
+camera and recording keep running the full chain, and it hot-reloads like
+everything else.
+
 ### Black screen in the web UI
 
 Almost always the stream tap being off rather than a network fault — it ships off
@@ -171,7 +209,8 @@ Every key is optional. Defaults shown:
   "capture_width": 1280,
   "capture_height": 720,
   "downscale": 1,
-  "capture_source": "auto"
+  "capture_source": "auto",
+  "stream_raw": false
 }
 ```
 
@@ -314,6 +353,11 @@ ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE   # downscale 2
 `"stream_frame_interval"` — send every Nth frame to a connected viewer. `0`
 disables the tap entirely and no JPEG work happens at all. `"stream_quality"` is
 JPEG quality 1–100.
+
+`"stream_raw"` (default `false`) sends the **untouched** camera frame to the
+preview instead of the processed one, so you can tell a real object from a
+filter artifact without dismantling your chain. Preview only — the virtual
+camera and the recording tap are unaffected.
 
 This is a lossy, throttled preview, independent of `record_path`'s full-quality
 local recording. Nothing valuable rides on it, so push quality and rate down hard
