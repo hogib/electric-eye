@@ -15,6 +15,9 @@ Built and tested targeting a Raspberry Pi 5 with a USB UVC webcam, but nothing i
   time. Capture uses MMAP streaming (`REQBUFS`/`QBUF`/`DQBUF`) and decodes MJPEG
   straight from the driver's DMA buffer via libjpeg-turbo, with zero intermediate
   copies. Output writes directly to the loopback device.
+- **Both camera kinds**: USB/UVC webcams over V4L2, and Raspberry Pi camera modules
+  (CSI) via `rpicam-vid`. Auto-detected by default, or pin one with `capture_source`.
+  See [Pi camera modules](#pi-camera-modules).
 - **Chained effects**, applied in any order you like, each independently
   parameterized: `sobel` (edge detection), `blur`, `grayscale`, `invert`, `threshold`,
   `tint`, `none`. Consecutive point ops (grayscale/invert/threshold/tint) fuse into a
@@ -81,14 +84,18 @@ config push can never land mid-frame.
 
 ## Requirements
 
-- A V4L2 camera offering either MJPEG with **4:2:2 chroma subsampling** (what most USB
-  UVC webcams provide) or **YUYV**, at the exact resolution you configure. MJPEG is
-  preferred where available and YUYV is the automatic fallback — which matters because
-  many webcams offer MJPEG only at their higher resolutions, so picking a smaller
-  `capture_width`/`capture_height` can land you on YUYV. Both paths are fully
-  supported, including downscaling. Check what yours offers with
-  `v4l2-ctl --list-formats-ext -d /dev/video0`, and see
-  [Known limitations](#known-limitations).
+- **A camera**, either of:
+  - A **Raspberry Pi camera module** (the CSI ribbon-cable kind), which needs
+    `rpicam-apps` installed — it ships by default on Raspberry Pi OS. See
+    [Pi camera modules](#pi-camera-modules).
+  - A **V4L2 camera** (USB/UVC webcam) offering either MJPEG with **4:2:2 or 4:2:0
+    chroma subsampling** or **YUYV**, at the exact resolution you configure. MJPEG is
+    preferred where available and YUYV is the automatic fallback — which matters
+    because many webcams offer MJPEG only at their higher resolutions, so picking a
+    smaller `capture_width`/`capture_height` can land you on YUYV. Both paths are
+    fully supported, including downscaling. Check what yours offers with
+    `v4l2-ctl --list-formats-ext -d /dev/video0`, and see
+    [Known limitations](#known-limitations).
 - `v4l2loopback` (kernel module) — `eeye` loads it itself, but loading a kernel module
   needs `CAP_SYS_MODULE`; see [Loading v4l2loopback](#loading-v4l2loopback) below.
 - `meson`, `ninja`, a C23 compiler (gcc or clang), OpenMP (`libgomp`, ships with gcc).
@@ -303,6 +310,57 @@ last valid.
 lets a remote writer (like `pi/config_agent.py` below) confirm a config actually took
 effect instead of just confirming it wrote a file.
 
+### Pi camera modules
+
+Raspberry Pi camera modules (the CSI ribbon-cable ones) work, but they don't go
+through V4L2 the way a USB webcam does. On Pi 5 the `rp1-cfe` driver exposes the
+sensor as **raw Bayer only** — there's no MJPEG or YUYV node to open, and converting
+Bayer into a viewable image (black level, demosaic, white balance, lens shading, tone
+mapping) is the ISP's job, driven by libcamera. Raspberry Pi's own guidance is not to
+drive Pi 5 cameras through V4L2 directly.
+
+So `eeye` uses the supported path: it spawns `rpicam-vid`, asks for MJPEG on stdout,
+and decodes that. This gets the whole ISP chain and the per-sensor tuning files for
+free. It uses MJPEG rather than `--codec yuv420` deliberately — the raw YUV output is
+stride-padded (Y rows to a multiple of 64 bytes, U/V to 32) with no framing in the
+stream, which is a well-known source of "corrupt raw output" reports; MJPEG is
+self-delimiting and carries its own dimensions, so a frame either decodes correctly or
+fails loudly.
+
+`"capture_source"` picks the backend:
+
+| Value | Behavior |
+| --- | --- |
+| `"auto"` (default) | Runs `rpicam-vid --list-cameras`; uses the Pi camera if one is found, else falls back to V4L2. |
+| `"rpicam"` | Always the Pi camera module. Fails at startup if there isn't one. |
+| `"v4l2"` | Always a V4L2 device. Skips the probe entirely. |
+
+Pin it explicitly on a vehicle carrying **both** a CSI camera and a USB webcam —
+otherwise which one you get depends on probe order rather than on what you meant.
+
+```json
+{
+  "chain": [{"effect": "sobel"}],
+  "capture_width": 1280,
+  "capture_height": 720,
+  "downscale": 2,
+  "capture_source": "rpicam"
+}
+```
+
+Like the geometry keys, `capture_source` is read **once at startup** — changing it in
+a running config is logged and ignored.
+
+Two differences from the V4L2 path worth knowing:
+
+- **No resolution negotiation.** The ISP scales to whatever geometry it's asked for
+  rather than offering a fixed mode list, so there's nothing to enumerate. An
+  unsupported geometry fails at the startup probe instead of being quietly substituted.
+- **`rpicam-vid`'s MJPEG is 4:2:0**, not the 4:2:2 most webcams emit. `eeye` handles
+  both (see [Known limitations](#known-limitations)); the practical effect is that
+  chroma is line-doubled during decode.
+
+
 ## Live preview + web control
 
 Two small, optional, stdlib-only Python scripts — `pi/config_agent.py` and
@@ -387,12 +445,13 @@ retries that internally without a restart.
 
 ## Known limitations
 
-- **MJPEG capture must be 4:2:2.** Verified at startup by decoding one real frame; if
-  your camera's MJPEG is natively 4:2:0 (common on cheap UVC hardware) or another
-  subsampling, `eeye` fails clearly at launch rather than producing corrupted video.
-  A general chroma-resampling fallback isn't implemented. This constrains the MJPEG
-  path only — YUYV is packed 4:2:2 by definition, so the fallback path is unaffected
-  and a 4:2:0-MJPEG camera may still work at a resolution where it offers YUYV.
+- **MJPEG capture must be 4:2:2 or 4:2:0.** Verified at startup by decoding one real
+  frame; any other subsampling fails clearly at launch rather than producing corrupted
+  video. 4:2:2 decodes straight into the frame with no conversion; 4:2:0 (what
+  `rpicam-vid` produces, and what some cheap UVC hardware uses) has its half-height
+  chroma line-doubled during decode, which costs one extra pass over the chroma planes
+  and discards nothing the encoder hadn't already discarded. YUYV is packed 4:2:2 by
+  definition, so the fallback path is unaffected.
 - **No Huffman-table (DHT) injection gap** — actually handled: some UVC cameras omit
   the Huffman table from their MJPEG stream, and `src/v4l2_in.c` splices in the
   standard tables when that's detected. Mentioned here only because it's the kind of
@@ -400,6 +459,14 @@ retries that internally without a restart.
 - **Framerate and both device paths are compile-time constants.** Resolution is
   configurable and negotiated (see
   [Resolution and downscaling](#resolution-and-downscaling)).
+- **Pi camera capture goes through `rpicam-vid`, not V4L2 directly.** On Pi 5 the
+  `rp1-cfe` driver exposes the CSI sensor as raw Bayer only, with no MJPEG or YUYV
+  mode to negotiate, and turning Bayer into an image is the ISP's job via libcamera.
+  So that path spawns `rpicam-vid` and reads MJPEG from a pipe. Consequences:
+  `capture_source` is startup-only, `VIDIOC_ENUM_FRAMESIZES` negotiation doesn't
+  apply (the ISP scales to whatever it's asked for, so an unsupported geometry fails
+  at the probe instead of being substituted), and camera controls beyond resolution
+  and framerate aren't plumbed through.
 - **Resolution is negotiated once, at startup.** If the camera is unplugged at launch
   there's nothing to enumerate, so the configured size stays in force and `eeye`
   retries with it; a *different* camera plugged in later is then held to that size
@@ -409,6 +476,7 @@ retries that internally without a restart.
   (`journalctl -u eeye`) for the size actually in use.
 - **Geometry changes need a restart.** `capture_width`/`capture_height`/`downscale`
   are read once at startup; changing them in a running config is logged and ignored.
+  `capture_source` is startup-only for the same reason.
 - **Live-preview stream is single-viewer.** `stream_server` accepts one connection at a
   time (last one wins); fine for one `web_ui.py` instance, not a fan-out broadcast.
 - **No authentication** on the stream or config-agent ports — see

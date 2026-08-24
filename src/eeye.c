@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "frame_ring_buffer.h"
+#include "rpicam_in.h"
 #include "v4l2_in.h"
 #include "video_frame.h"
 #include "video_threads.h"
@@ -192,6 +193,20 @@ int main(int argc, char **argv) {
   uint32_t capture_width = startup_config.capture_width;
   uint32_t capture_height = startup_config.capture_height;
 
+  // Settle CAPTURE_AUTO here, once, rather than in producer_loop: the
+  // reconnect loop there runs repeatedly, and re-probing on every retry
+  // would let the backend silently change mid-session (e.g. a USB webcam
+  // unplugged, then a CSI camera picked up on the next retry) with the
+  // frame pool already sized for the first one.
+  CaptureSource capture_source = startup_config.capture_source;
+  if (capture_source == CAPTURE_AUTO) {
+    capture_source = rpicam_in_available() ? CAPTURE_RPICAM : CAPTURE_V4L2;
+    printf("Capture source: auto-detected %s\n",
+           capture_source == CAPTURE_RPICAM
+               ? "Pi camera module (rpicam-vid)"
+               : "V4L2 device");
+  }
+
   // Ask the camera what it can actually do before anything is sized from
   // the answer. Advisory only: if the camera isn't plugged in yet this
   // leaves the configured size alone and producer_loop's reconnect loop
@@ -200,12 +215,20 @@ int main(int argc, char **argv) {
   // allocated once, up front, and every frame in it has to match whatever
   // size the camera is eventually opened at -- by the time v4l2_in_open
   // runs (on the producer thread) that size is already committed.
-  v4l2_in_negotiate_size(prod_args.filename, &capture_width, &capture_height,
-                         startup_config.downscale);
+  //
+  // V4L2 only: the rpicam backend has no device node to enumerate against
+  // (see rpicam_in.h), and rpicam-vid's ISP scales to whatever geometry it
+  // is asked for rather than offering a fixed mode list, so there is
+  // nothing to negotiate.
+  if (capture_source == CAPTURE_V4L2) {
+    v4l2_in_negotiate_size(prod_args.filename, &capture_width, &capture_height,
+                           startup_config.downscale);
+  }
 
   uint32_t out_width = capture_width / startup_config.downscale;
   uint32_t out_height = capture_height / startup_config.downscale;
 
+  prod_args.capture_source = capture_source;
   prod_args.capture_width = capture_width;
   prod_args.capture_height = capture_height;
   prod_args.downscale = startup_config.downscale;

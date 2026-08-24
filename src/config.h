@@ -16,6 +16,14 @@ typedef enum {
   EFFECT_LIGHT,
 } EffectType;
 
+// Where frames come from. See rpicam_in.h for why a Pi CSI camera needs a
+// separate backend rather than another device path handed to v4l2_in.c.
+typedef enum {
+  CAPTURE_AUTO = 0, // probe for a CSI camera, else V4L2
+  CAPTURE_V4L2,     // a USB/UVC webcam, via v4l2_in.c
+  CAPTURE_RPICAM,   // a Pi CSI camera module, via rpicam_in.c
+} CaptureSource;
+
 // One entry in an effect chain. Every stage carries its own parameters
 // (rather than one shared set for the whole Config) so e.g. two EFFECT_TINT
 // stages in the same chain, or a threshold before a tint, each get their
@@ -125,6 +133,13 @@ typedef struct {
   // image in a larger frame), and the YUYV path box-averages NxN source
   // blocks, which only divides evenly for an integer N.
   uint8_t downscale;
+
+  // Which capture backend to use. "auto" (the default) probes for a Pi CSI
+  // camera via rpicam_in_available() and falls back to V4L2; the explicit
+  // values skip that probe, which is what you want when a machine has both
+  // a ribbon-cable camera and a USB webcam attached and the choice would
+  // otherwise depend on probe order.
+  CaptureSource capture_source;
 } Config;
 
 /*
@@ -145,7 +160,8 @@ typedef struct {
  *     "stream_quality": 60,
  *     "capture_width": 1280,
  *     "capture_height": 720,
- *     "downscale": 2
+ *     "downscale": 2,
+ *     "capture_source": "auto"
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -172,6 +188,9 @@ typedef struct {
  * (default 1; must be 1, 2, 4, or 8) are the geometry fields -- unlike
  * everything above, they only take effect at startup, and a reload that
  * changes them warns and keeps running at the original size.
+ * "capture_source" (default "auto"; one of "auto", "v4l2", "rpicam")
+ * chooses the capture backend and is likewise startup-only -- see
+ * CaptureSource above and rpicam_in.h.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

@@ -20,6 +20,12 @@ static inline void sleep_us(long microseconds) {
 // downstream sees post-downscale frames and nothing else.
 typedef struct {
   const char *filename;
+  // Which backend producer_loop opens. Resolved from config at startup
+  // (CAPTURE_AUTO is settled there, not here), so by the time the producer
+  // thread starts this is always CAPTURE_V4L2 or CAPTURE_RPICAM. `filename`
+  // is unused by the rpicam backend, which has no device path -- it talks
+  // to a child process.
+  CaptureSource capture_source;
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_in;
   FrameRingBuffer *ring_buffer_free;

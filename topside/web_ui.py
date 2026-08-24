@@ -315,13 +315,15 @@ function addStage(stage) {
 
 document.getElementById("add-stage").addEventListener("click", () => addStage());
 
-// Geometry (capture_width/capture_height/downscale) is startup-only on the
-// drone, so this UI deliberately doesn't offer it as a control -- but it
-// must still be carried through untouched. buildConfig() writes the whole
-// config file, so anything not echoed back here is effectively deleted:
-// without this, the first slider tweak would silently drop the operator's
-// downscale, and the drone would come back up at full resolution on its
-// next restart, saturating the tether.
+// Geometry (capture_width/capture_height/downscale) and capture_source are
+// startup-only on the drone, so this UI deliberately doesn't offer them as
+// controls -- but they must still be carried through untouched.
+// buildConfig() writes the whole config file, so anything not echoed back
+// here is effectively deleted: without this, the first slider tweak would
+// silently drop the operator's downscale (the drone would come back up at
+// full resolution on its next restart, saturating the tether) or their
+// capture_source (a drone pinned to one backend would revert to
+// auto-detect, and pick the wrong camera on a vehicle carrying both).
 let carriedGeometry = {};
 
 function buildConfig() {
@@ -356,15 +358,18 @@ function loadConfig(cfg) {
   // view, which is exactly the spurious "restart to apply" warning this is
   // meant to avoid.
   carriedGeometry = {};
-  for (const k of ["capture_width", "capture_height", "downscale"]) {
+  for (const k of ["capture_width", "capture_height", "downscale",
+                   "capture_source"]) {
     if (cfg[k] !== undefined) carriedGeometry[k] = cfg[k];
   }
 
   const cw = cfg.capture_width || 1280, chh = cfg.capture_height || 720;
   const ds = cfg.downscale || 1;
-  document.getElementById("geometry").textContent =
-    ds > 1 ? `${cw}x${chh} capture, ${ds}x downscale -> ${cw / ds}x${chh / ds} pipeline`
-           : `${cw}x${chh}, no downscaling`;
+  const src = cfg.capture_source || "auto";
+  const geom = ds > 1
+    ? `${cw}x${chh} capture, ${ds}x downscale -> ${cw / ds}x${chh / ds} pipeline`
+    : `${cw}x${chh}, no downscaling`;
+  document.getElementById("geometry").textContent = `${geom} (source: ${src})`;
 }
 
 async function refreshFromDrone() {

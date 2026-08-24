@@ -2,6 +2,7 @@
 #include "effect_chain.h"
 #include "frame_ring_buffer.h"
 #include "stream_server.h"
+#include "rpicam_in.h"
 #include "v4l2_in.h"
 #include "v4l2_out.h"
 #include "video_frame.h"
@@ -26,6 +27,41 @@
 #define CAMERA_RECONNECT_LOG_EVERY 15
 #define STATS_LOG_INTERVAL_MS 5000
 
+// The two capture backends have identical lifecycles from producer_loop's
+// point of view -- open, capture repeatedly, close -- so they're unified
+// here rather than duplicating the whole reconnect loop below per backend.
+// Exactly one of the two handles is non-NULL at a time.
+typedef struct {
+  V4l2In *v4l2;
+  RpicamIn *rpicam;
+} CaptureHandle;
+
+static bool capture_open(const ProducerArgs *args, CaptureHandle *h) {
+  *h = (CaptureHandle){0};
+  if (args->capture_source == CAPTURE_RPICAM) {
+    h->rpicam = rpicam_in_open(args->capture_width, args->capture_height,
+                               CAMERA_FRAMERATE, args->downscale);
+    return h->rpicam != NULL;
+  }
+  h->v4l2 = v4l2_in_open(args->filename, args->capture_width,
+                         args->capture_height, CAMERA_FRAMERATE,
+                         args->downscale);
+  return h->v4l2 != NULL;
+}
+
+static bool capture_frame(CaptureHandle *h, VideoFrame *frame) {
+  return h->rpicam ? rpicam_in_capture(h->rpicam, frame)
+                   : v4l2_in_capture(h->v4l2, frame);
+}
+
+static void capture_close(CaptureHandle *h) {
+  if (h->rpicam)
+    rpicam_in_close(h->rpicam);
+  else
+    v4l2_in_close(h->v4l2);
+  *h = (CaptureHandle){0};
+}
+
 void *producer_loop(void *arg) {
   ProducerArgs *args = (ProducerArgs *)arg;
   int64_t pts = 0;
@@ -46,10 +82,8 @@ void *producer_loop(void *arg) {
   // genuinely come back. That class of failure is left to exit the process
   // and rely on the systemd unit's Restart= for recovery instead.
   while (atomic_load(args->is_running)) {
-    V4l2In *in = v4l2_in_open(args->filename, args->capture_width,
-                              args->capture_height, CAMERA_FRAMERATE,
-                              args->downscale);
-    if (!in) {
+    CaptureHandle in;
+    if (!capture_open(args, &in)) {
       reconnect_attempt++;
       if (reconnect_attempt == 1 ||
           reconnect_attempt % CAMERA_RECONNECT_LOG_EVERY == 0) {
@@ -65,7 +99,10 @@ void *producer_loop(void *arg) {
     }
 
     reconnect_attempt = 0;
-    printf("Camera connected: %s\n", args->filename);
+    if (args->capture_source == CAPTURE_RPICAM)
+      printf("Camera connected: Pi camera module (via rpicam-vid)\n");
+    else
+      printf("Camera connected: %s\n", args->filename);
 
     while (atomic_load(args->is_running)) {
       VideoFrame *frame = NULL;
@@ -76,7 +113,7 @@ void *producer_loop(void *arg) {
 
       frame->pts = pts++;
 
-      if (!v4l2_in_capture(in, frame)) {
+      if (!capture_frame(&in, frame)) {
         // v4l2_in_capture already retried transient per-frame decode
         // glitches internally; this is either a device-level error or a
         // persistent format mismatch. Fall back to the reconnect loop
@@ -94,7 +131,7 @@ void *producer_loop(void *arg) {
       ring_push_wait(args->ring_buffer_in, frame, args->is_running);
     }
 
-    v4l2_in_close(in);
+    capture_close(&in);
   }
 
   return NULL;

@@ -48,6 +48,7 @@ static const Config config_defaults = {
     .capture_width = 1280,
     .capture_height = 720,
     .downscale = 1, // full resolution: what this ran at before the field existed
+    .capture_source = CAPTURE_AUTO,
 };
 
 // The geometry actually in force, captured by config_load_once() before any
@@ -449,6 +450,24 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"capture_height\"\n");
           return false;
         }
+      } else if (strcmp(key, "capture_source") == 0) {
+        char src[16];
+        if (!parse_string(&c, src, sizeof src)) {
+          printf("Config: invalid value for \"capture_source\"\n");
+          return false;
+        }
+        if (strcmp(src, "auto") == 0) {
+          parsed.capture_source = CAPTURE_AUTO;
+        } else if (strcmp(src, "v4l2") == 0) {
+          parsed.capture_source = CAPTURE_V4L2;
+        } else if (strcmp(src, "rpicam") == 0) {
+          parsed.capture_source = CAPTURE_RPICAM;
+        } else {
+          printf("Config: unknown \"capture_source\": \"%s\" (expected "
+                 "\"auto\", \"v4l2\", or \"rpicam\")\n",
+                 src);
+          return false;
+        }
       } else if (strcmp(key, "downscale") == 0) {
         if (!parse_u8(&c, &parsed.downscale)) {
           printf("Config: invalid value for \"downscale\"\n");
@@ -505,13 +524,21 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
   // by 2*downscale) keeps that halving exact, so the YUYV box-average and
   // libjpeg-turbo's scaled decode agree on plane sizes instead of
   // disagreeing by a half-sampled edge column.
+  //
+  // Height carries the same doubling for a second, independent reason: a
+  // 4:2:0 source (what rpicam-vid produces) has half-height chroma that
+  // jpeg_decode.c line-doubles into I422's full-height planes, which only
+  // fills the plane exactly when the output height is even. Requiring
+  // capture height to be a multiple of 2*downscale covers both layouts
+  // with one rule rather than making the valid geometries depend on which
+  // camera happens to be attached.
   uint32_t wstep = (uint32_t)parsed.downscale * 2u;
   if (parsed.capture_width % wstep != 0 ||
-      parsed.capture_height % parsed.downscale != 0) {
+      parsed.capture_height % wstep != 0) {
     printf("Config: %ux%u doesn't divide evenly by \"downscale\": %u -- "
-           "width must be a multiple of %u and height a multiple of %u\n",
-           parsed.capture_width, parsed.capture_height, parsed.downscale, wstep,
-           parsed.downscale);
+           "both width and height must be a multiple of %u\n",
+           parsed.capture_width, parsed.capture_height, parsed.downscale,
+           wstep);
     return false;
   }
 
@@ -600,6 +627,20 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
            startup_geometry.capture_width, startup_geometry.capture_height,
            startup_geometry.downscale, parsed->capture_width,
            parsed->capture_height, parsed->downscale);
+  }
+
+  // Same reasoning for capture_source: startup-only, so a change that looks
+  // applied but isn't gets said out loud. Kept as its own check rather than
+  // folded into the geometry one above so the message names the field that
+  // actually changed instead of printing sizes that didn't.
+  if (startup_geometry_valid &&
+      parsed->capture_source != startup_geometry.capture_source) {
+    static const char *const names[] = {"auto", "v4l2", "rpicam"};
+    printf("Config: \"capture_source\" changed (%s -> %s) but it only takes "
+           "effect at startup -- still capturing from the original source. "
+           "Restart eeye to apply it.\n",
+           names[startup_geometry.capture_source],
+           names[parsed->capture_source]);
   }
 
   size_t slot = w->ring_pos % config_ring_size;
