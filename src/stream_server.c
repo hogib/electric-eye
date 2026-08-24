@@ -35,7 +35,17 @@ struct StreamServer {
 };
 
 StreamServer *stream_server_open(uint16_t port) {
-  int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  // AF_INET6 rather than AF_INET, with IPV6_V6ONLY off below: one socket
+  // then accepts both IPv6 and IPv4 clients (the latter arriving as
+  // v4-mapped addresses), so this listens on everything with a single fd.
+  //
+  // This matters for the deployment this project actually targets. On a
+  // direct Ethernet tether there is no DHCP server and no DNS, so the only
+  // addressing that works with zero configuration is IPv6 link-local
+  // (fe80::/64), which every host self-assigns on every live link. An
+  // IPv4-only listener is simply unreachable that way -- which is exactly
+  // why the tether used to need manual address setup on both ends.
+  int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
   if (fd < 0) {
     printf("stream_server: socket() failed: %s\n", strerror(errno));
     return NULL;
@@ -47,10 +57,21 @@ StreamServer *stream_server_open(uint16_t port) {
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
 
-  struct sockaddr_in addr = {0};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
+  // Dual-stack. Linux defaults this off (net.ipv6.bindv6only=0) but that is
+  // a sysctl an operator can flip, so set it explicitly rather than inherit
+  // whatever the host happens to be configured for. Not fatal if it fails:
+  // the socket still serves IPv6, which is the case that needs it most.
+  int v6only = 0;
+  if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only) < 0) {
+    printf("stream_server: could not enable dual-stack on port %u (%s); "
+           "IPv4 clients may not be able to connect\n",
+           port, strerror(errno));
+  }
+
+  struct sockaddr_in6 addr = {0};
+  addr.sin6_family = AF_INET6;
+  addr.sin6_addr = in6addr_any;
+  addr.sin6_port = htons(port);
 
   if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
     printf("stream_server: bind() on port %u failed: %s\n", port,

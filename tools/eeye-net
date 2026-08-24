@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+Find an Electric Eye drone on a directly-connected cable, and check that the
+tether is actually carrying what it should.
+
+Runs on the TOPSIDE machine and probes across the link. It only ever reads:
+nothing here changes the drone, the config, or this machine's network
+settings, so it is safe to run at any time, including mid-dive. Where
+something is wrong it prints the exact command to fix it, for you to run.
+
+    tools/eeye-net discover              search every live link for a drone
+    tools/eeye-net check <host>          full health ladder against one drone
+    tools/eeye-net check                 discover, then check what it finds
+    tools/eeye-net fix                   print setup/remediation commands
+
+Exit codes (so this can gate a pre-dive checklist):
+    0  everything checked is healthy
+    1  degraded -- found the drone, but something is wrong
+    2  no drone found, or no usable link at all
+"""
+import argparse
+import json
+import sys
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import eeye_net as net  # noqa: E402
+
+OK = "  ok  "
+WARN = " warn "
+FAIL = " fail "
+
+
+def say(tag, message, fix=None):
+    # flush=True: discovery and the frame probe each take seconds, and
+    # Python block-buffers stdout when it isn't a terminal. Without this a
+    # redirected run prints nothing until it finishes, which reads as a
+    # hang exactly when someone is trying to diagnose one.
+    print(f"[{tag}] {message}", flush=True)
+    if fix:
+        for line in fix.strip().splitlines():
+            print(f"         {line}", flush=True)
+
+
+def cmd_discover(args):
+    interfaces = [args.interface] if args.interface else net.candidate_interfaces()
+    if not interfaces:
+        say(FAIL, "no usable network interface is up with a cable connected.",
+            "Check the tether is plugged in at both ends and the drone is "
+            "powered.\nip -br link      # look for a wired port in state UP")
+        return 2
+
+    print(f"Searching for a drone on: {', '.join(interfaces)}", flush=True)
+    found = net.discover(stream_port=args.stream_port,
+                         agent_port=args.agent_port,
+                         interfaces=interfaces,
+                         on_progress=lambda m: print(f"  {m}", flush=True))
+    print()
+
+    if not found:
+        say(FAIL, "no drone found.",
+            f"Nothing on any live link answered on port {args.agent_port} "
+            "(config_agent).\n"
+            "On the drone, check it is running:\n"
+            "  systemctl status eeye        # or: pgrep -af config_agent\n"
+            "  python3 pi/config_agent.py --config-path <the same path eeye "
+            "was started with>")
+        return 2
+
+    for drone in found:
+        say(OK, f"drone at {drone['host']} (via {drone['iface']})")
+        _report_stream(drone)
+        print()
+        print("  Start the topside UI with:")
+        print(f"    python3 topside/web_ui.py --drone-host '{drone['host']}'")
+        print("  or let it find the drone itself:")
+        print("    python3 topside/web_ui.py --drone-host auto")
+        print()
+
+    return 0 if all(d["stream_state"] in ("ok", "silent") for d in found) else 1
+
+
+def _report_stream(drone):
+    """Reports the video tap. 'silent' is deliberately not a failure: the tap
+    ships off by default, so a drone with video disabled is correctly
+    configured, just not streaming -- and saying 'fail' there would train
+    the operator to ignore this line."""
+    state = drone["stream_state"]
+    info = drone["stream_info"] or {}
+    if state == "ok":
+        size = ""
+        if "width" in info:
+            size = f", {info['width']}x{info['height']}"
+        say(OK, f"video stream delivering frames ({info.get('bytes', 0)} bytes"
+                f"{size})")
+    elif state == "silent":
+        interval = (drone.get("config") or {}).get("stream_frame_interval")
+        if interval == 0:
+            say(WARN, "video tap is OFF in the config, so the port accepts "
+                      "connections but never sends a frame.",
+                'Turn it on by setting "stream_frame_interval" to 2 or 3 -- '
+                "from the\nHellion's form, or in the drone's eeye_config.json.")
+        else:
+            say(WARN, "connected to the video port, but no frame arrived.",
+                "eeye may not be capturing (camera unplugged?), or the tap is "
+                "off.\nCheck the drone's own log:  journalctl -u eeye -n 50")
+    elif state == "refused":
+        say(FAIL, f"{drone['stream_detail']}",
+            "config_agent is answering but eeye's stream port isn't -- eeye "
+            "itself\nis probably not running.  systemctl status eeye")
+    else:
+        say(FAIL, drone["stream_detail"])
+
+
+def cmd_check(args):
+    host, iface = args.host, args.interface
+
+    if host is None:
+        print("No host given; searching...", flush=True)
+        found = net.discover(stream_port=args.stream_port,
+                             agent_port=args.agent_port,
+                             on_progress=lambda m: print(f"  {m}", flush=True))
+        if not found:
+            print()
+            say(FAIL, "no drone found to check.",
+                "Run `tools/eeye-net discover` for details, or pass a host "
+                "explicitly.")
+            return 2
+        host = found[0]["host"]
+        iface = found[0]["iface"]
+        print(f"Checking {host}\n")
+    elif "%" in host:
+        host, _, iface = host.partition("%")
+
+    failures = 0
+    warnings = 0
+
+    # 1. Link. Checked first because every later failure looks the same when
+    #    the cable simply isn't in -- and that is the likeliest problem in
+    #    the field.
+    if iface:
+        up, detail = net.link_is_up(iface)
+        if up:
+            say(OK, f"link {iface}: {detail}")
+        else:
+            say(FAIL, f"link {iface}: {detail}",
+                "Nothing else can work until the link is up. Check the cable "
+                "at both\nends, and that the drone is powered.")
+            return 2
+
+    # 2. config_agent -- the control path.
+    ok, detail, cfg = net.probe_agent(host, args.agent_port, iface,
+                                      timeout=args.timeout)
+    if ok:
+        say(OK, f"control channel: {detail} on port {args.agent_port}")
+    else:
+        say(FAIL, f"control channel: {detail}",
+            "On the drone:\n"
+            "  python3 pi/config_agent.py --config-path <the same path eeye "
+            "was started with>\n"
+            "If it is running, check nothing else (a firewall) is between "
+            "the two machines.")
+        failures += 1
+        cfg = None
+
+    # 3. Video tap.
+    state, stream_detail, info = net.probe_stream(
+        host, args.stream_port, iface, connect_timeout=args.timeout,
+        frame_timeout=args.frame_timeout)
+    _report_stream({"host": host, "iface": iface, "config": cfg,
+                    "stream_state": state, "stream_detail": stream_detail,
+                    "stream_info": info})
+    if state == "refused" or state == "bad":
+        failures += 1
+    elif state == "silent":
+        warnings += 1
+
+    # 4. The config-path ambiguity. Verified against the real binaries: an
+    #    agent pointed at a file eeye is not watching answers exactly like
+    #    an agent with no eeye behind it at all -- both return
+    #    {"written": true, "eeye_accepted": null}. It is silent, easy to hit
+    #    (the same path has to be passed to two processes by hand), and the
+    #    only symptom is that settings appear to apply and do nothing. So it
+    #    gets called out explicitly rather than left to be discovered.
+    if cfg is not None:
+        mismatch_fix = (
+            "config_agent and eeye were almost certainly given DIFFERENT "
+            "config paths,\nso your edits land in a file eeye never reads --"
+            " they appear to apply and\nthen do nothing. The two paths must "
+            "match exactly:\n"
+            "  pgrep -af 'eeye|config_agent'   # on the drone, compare them")
+
+        if not cfg:
+            # config_agent serves {} when its --config-path does not exist
+            # (see its do_GET). A drone that is actually running has a config
+            # file, so an empty one means the agent is pointed somewhere
+            # wrong -- this is the mismatch, not an absence of evidence.
+            say(FAIL, "config_agent is serving an empty config, which means "
+                      "the file it was given does not exist.", mismatch_fix)
+            failures += 1
+        elif state == "ok" and info and "width" in info:
+            declared_w = cfg.get("capture_width")
+            declared_h = cfg.get("capture_height")
+            downscale = cfg.get("downscale", 1) or 1
+            actual = (info["width"], info["height"])
+            if declared_w and declared_h:
+                expect = (declared_w // downscale, declared_h // downscale)
+                if expect == actual:
+                    say(OK, f"config agrees with the live stream ({actual[0]}x"
+                            f"{actual[1]}) -- agent and eeye are on the same "
+                            "config file")
+                else:
+                    say(FAIL,
+                        f"the config says {expect[0]}x{expect[1]} but the live "
+                        f"stream is {actual[0]}x{actual[1]}.",
+                        mismatch_fix + "\n(If the paths do match, eeye "
+                        "negotiated a different capture size --\ncheck its "
+                        "startup log: journalctl -u eeye | grep Geometry)")
+                    failures += 1
+            else:
+                # Geometry keys are optional: a config that omits them is
+                # valid and runs at eeye's defaults. Nothing to compare, and
+                # nothing wrong -- say so rather than implying a problem.
+                say(WARN, "the drone's config sets no capture geometry, so "
+                          f"there is nothing to cross-check against the live "
+                          f"{actual[0]}x{actual[1]} stream.",
+                    "Not a fault -- eeye is running at its defaults. To make "
+                    "this\nverifiable, set capture_width/capture_height "
+                    "explicitly.")
+                warnings += 1
+        else:
+            say(WARN, "cannot confirm config_agent and eeye share a config "
+                      "path without a live frame to compare against.",
+                "This matters because an agent writing a file eeye isn't "
+                "watching looks\nidentical to a healthy one -- your settings "
+                "would silently do nothing.\nTurn the video tap on and "
+                "re-run, or verify by hand on the drone:\n"
+                "  pgrep -af 'eeye|config_agent'   # the paths must match")
+            warnings += 1
+
+    print()
+    if failures:
+        print(f"{failures} problem(s) found; see the fixes above.")
+        return 1
+    if warnings:
+        print(f"Link healthy, {warnings} thing(s) worth a look above.")
+        return 0
+    print("All checks passed.")
+    return 0
+
+
+def cmd_fix(args):
+    print(__doc__.strip().splitlines()[0])
+    print()
+    print("These are printed, never run. Read them before pasting.")
+    print()
+    print("=" * 68)
+    print("DRONE SIDE -- make the Pi reachable over a bare cable")
+    print("=" * 68)
+    print("""
+A direct cable has no DHCP server, so the drone must not be waiting for one.
+Give its wired port link-local addressing, which needs no server at all:
+
+  sudo nmcli connection add type ethernet con-name eeye-tether ifname '*' \\
+      ipv4.method link-local ipv6.method link-local \\
+      connection.autoconnect yes connection.autoconnect-priority 50
+
+Note ifname '*': binding a profile to one interface name is why a tether
+profile silently stops applying when the port changes (a USB adapter and a
+built-in port have different names).
+
+Make the drone findable by name as well as by address:
+
+  sudo hostnamectl set-hostname eeye-drone
+  sudo systemctl enable --now avahi-daemon
+""")
+    print("=" * 68)
+    print("TOPSIDE SIDE -- this machine")
+    print("=" * 68)
+    print("""
+Same idea for this end of the cable:
+
+  sudo nmcli connection add type ethernet con-name eeye-tether ifname '*' \\
+      ipv4.method link-local ipv6.method link-local \\
+      connection.autoconnect yes connection.autoconnect-priority 50
+
+You do NOT need this to use `discover` -- IPv6 link-local works on any live
+link with no configuration. It only matters for IPv4-only tools.
+
+To resolve eeye-drone.local by name, this machine needs an mDNS resolver.
+Check first:  grep '^hosts:' /etc/nsswitch.conf
+If that line has no 'mdns' entry, either install/enable avahi:
+
+  sudo systemctl enable --now avahi-daemon
+  # then add 'mdns4_minimal [NOTFOUND=return]' before 'dns' in that line
+
+or skip mDNS entirely and use the address `discover` prints -- it needs no
+name resolution at all, which is one less thing to fail in the field.
+""")
+    print("=" * 68)
+    print("IF YOU WANT THE DRONE TO REACH THE INTERNET THROUGH THIS MACHINE")
+    print("=" * 68)
+    print("""
+NetworkManager's shared mode runs a DHCP server and NATs to your uplink:
+
+  sudo nmcli connection modify eeye-tether ipv4.method shared
+
+This needs a DHCP/DNS helper installed (dnsmasq-base on Debian/Ubuntu,
+dnsmasq on Arch) -- without it, shared mode hands out no addresses and the
+link silently fails to come up. Check before relying on it:
+
+  which dnsmasq || echo 'not installed -- shared mode will not work'
+
+Not the default here on purpose: link-local needs no packages at all.
+""")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--stream-port", type=int, default=net.DEFAULT_STREAM_PORT,
+                        help=f"eeye's stream port (default: {net.DEFAULT_STREAM_PORT})")
+    parser.add_argument("--agent-port", type=int, default=net.DEFAULT_AGENT_PORT,
+                        help=f"config_agent's port (default: {net.DEFAULT_AGENT_PORT})")
+    parser.add_argument("--interface", help="only search/use this interface")
+    parser.add_argument("--timeout", type=float, default=2.0,
+                        help="per-connection timeout in seconds (default: 2)")
+    parser.add_argument("--frame-timeout", type=float, default=6.0,
+                        help="how long to wait for a video frame (default: 6)")
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output (discover only)")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("discover", help="search every live link for a drone")
+    check = sub.add_parser("check", help="health-check one drone")
+    check.add_argument("host", nargs="?",
+                       help="drone address; omit to discover one first")
+    sub.add_parser("fix", help="print setup and remediation commands")
+
+    args = parser.parse_args()
+
+    if args.command == "discover":
+        if args.json:
+            found = net.discover(stream_port=args.stream_port,
+                                 agent_port=args.agent_port,
+                                 interfaces=[args.interface] if args.interface
+                                 else None)
+            print(json.dumps(found, indent=2))
+            return 0 if found else 2
+        return cmd_discover(args)
+    if args.command == "check":
+        return cmd_check(args)
+    if args.command == "fix":
+        return cmd_fix(args)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

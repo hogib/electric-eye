@@ -23,7 +23,9 @@ Only needs the Python standard library -- nothing to install.
 Usage:
     python3 config_agent.py --config-path /opt/electric-eye/eeye_config.json
 
-Serves, on all interfaces:
+Serves on all interfaces, IPv6 and IPv4 alike (see DualStackHTTPServer
+below -- the IPv6 half is what makes this reachable over a direct cable,
+where link-local is the only addressing available):
   GET  /config   the current config file's raw contents
   POST /config   replace the file's contents with the request body (must be
                  well-formed JSON; written atomically -- see
@@ -36,6 +38,7 @@ import argparse
 import http.server
 import json
 import os
+import socket
 import time
 
 
@@ -80,6 +83,34 @@ def wait_for_reload_status(config_path, previous_mtime, timeout=2.0):
                       # but guard anyway); keep polling
         time.sleep(0.1)
     return None
+
+
+class DualStackHTTPServer(http.server.ThreadingHTTPServer):
+    """Listens on IPv6 *and* IPv4 from one socket.
+
+    The stock ThreadingHTTPServer is AF_INET only, which makes it
+    unreachable over IPv6 link-local (fe80::/64) -- and link-local is the
+    only addressing that works with no configuration at all on a direct
+    Ethernet tether, where there is no DHCP server and no DNS. Binding "::"
+    with IPV6_V6ONLY off accepts both families, so an IPv4 client on a
+    normal LAN keeps working exactly as before.
+
+    Mirrors the same change in src/stream_server.c, so both of the drone's
+    ports behave identically.
+    """
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        # Not fatal if it fails: the socket still serves IPv6, which is the
+        # case that needs it most. Linux defaults this off already
+        # (net.ipv6.bindv6only=0), but that is an operator-flippable sysctl,
+        # so set it explicitly rather than inherit whatever the host has.
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError as e:
+            print(f"[config_agent] could not enable dual-stack ({e}); "
+                  "IPv4 clients may not be able to connect")
+        super().server_bind()
 
 
 def make_handler(config_path):
@@ -157,8 +188,8 @@ def main():
     )
     args = parser.parse_args()
 
-    server = http.server.ThreadingHTTPServer(
-        ("0.0.0.0", args.port), make_handler(args.config_path)
+    server = DualStackHTTPServer(
+        ("::", args.port), make_handler(args.config_path)
     )
     print(f"config_agent listening on :{args.port}, writing to {args.config_path}")
     server.serve_forever()

@@ -31,7 +31,9 @@ Then point a browser at http://<this machine's own IP>:8080/
 import argparse
 import http.server
 import json
+import os
 import socket
+import sys
 import struct
 import threading
 import time
@@ -448,8 +450,18 @@ refreshFromDrone();
 """
 
 
+def agent_base_url(host, port):
+    """An IPv6 literal has to be bracketed inside a URL, or the colons in
+    the address are read as the port separator. Link-local addresses also
+    carry a %interface scope, which urllib accepts either raw or
+    percent-encoded -- verified both against a live agent."""
+    if ":" in host and not host.startswith("["):
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
 def make_handler(source, agent_host, agent_port):
-    agent_base = f"http://{agent_host}:{agent_port}"
+    agent_base = agent_base_url(agent_host, agent_port)
     index_html = INDEX_HTML_TEMPLATE.replace(
         "__EFFECT_FIELDS_JSON__", json.dumps(EFFECT_FIELDS)
     ).encode()
@@ -548,13 +560,59 @@ def make_handler(source, agent_host, agent_port):
     return Handler
 
 
+def discover_drone(stream_port, agent_port):
+    """Finds the drone on a directly-connected cable, for --drone-host auto.
+
+    Exists so the field workflow is just `python3 topside/web_ui.py
+    --drone-host auto` with nothing to look up or type: on a bare tether
+    there is no DHCP and no DNS, so the address is whatever link-local the
+    drone happened to self-assign, and it is not worth an operator reading
+    it off a screen before every dive.
+
+    Resolves once, at startup, rather than re-discovering on every
+    reconnect: FrameSource already retries a known host indefinitely, and
+    re-running discovery inside that loop would let the UI silently latch
+    onto a *different* machine mid-session if one appeared on the link.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "tools"))
+    try:
+        import eeye_net
+    except ImportError:
+        print("--drone-host auto needs tools/eeye_net.py, which isn't next to "
+              "this script; pass the drone's address explicitly instead.")
+        return None
+
+    # flush=True throughout: discovery takes a few seconds per link, and
+    # Python block-buffers stdout whenever it isn't a terminal (a log file,
+    # journald, an ssh pipe). Without this the operator sees nothing at all
+    # while it works and reasonably concludes it has hung.
+    print("Searching for the drone on directly-connected links...", flush=True)
+    found = eeye_net.discover(stream_port=stream_port, agent_port=agent_port,
+                              on_progress=lambda m: print(f"  {m}", flush=True))
+    if not found:
+        print("No drone found. Check the tether is plugged in at both ends "
+              "and the\ndrone is powered, then run `tools/eeye-net discover` "
+              "for details.", flush=True)
+        return None
+    if len(found) > 1:
+        print(f"Found {len(found)} drones; using the first. Pass --drone-host "
+              "explicitly to pick:", flush=True)
+        for d in found:
+            print(f"    {d['host']}", flush=True)
+    host = found[0]["host"]
+    print(f"Using drone at {host}", flush=True)
+    return host
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--drone-host", required=True,
-        help="IP/hostname of the drone's Pi over the tether",
+        help="IP/hostname of the drone's Pi over the tether, or 'auto' to "
+             "find it on the directly-connected cable (see tools/eeye-net)",
     )
     parser.add_argument(
         "--drone-stream-port", type=int, default=9000,
@@ -572,14 +630,20 @@ def main():
     )
     args = parser.parse_args()
 
-    source = FrameSource(args.drone_host, args.drone_stream_port)
+    drone_host = args.drone_host
+    if drone_host == "auto":
+        drone_host = discover_drone(args.drone_stream_port, args.drone_agent_port)
+        if drone_host is None:
+            return 2
+
+    source = FrameSource(drone_host, args.drone_stream_port)
     server = http.server.ThreadingHTTPServer(
         ("0.0.0.0", args.http_port),
-        make_handler(source, args.drone_host, args.drone_agent_port),
+        make_handler(source, drone_host, args.drone_agent_port),
     )
     print(f"Serving control UI on http://0.0.0.0:{args.http_port}/")
     server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

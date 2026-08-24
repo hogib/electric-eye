@@ -388,8 +388,13 @@ python3 pi/config_agent.py --config-path eeye_config.json
 **On the topside machine:**
 
 ```sh
-python3 topside/web_ui.py --drone-host <drone's IP over the tether>
+python3 topside/web_ui.py --drone-host auto
 ```
+
+`auto` finds the drone on whatever cable is plugged in — see
+[Direct-cable tether](#direct-cable-tether). Pass an explicit
+`--drone-host <address>` instead if you already know it, or if more than one
+drone is on the link.
 
 Then open `http://<topside machine's IP>:8080/` in a browser. The Hellion's page shows
 the live feed and a form for the effect chain, recording path, and stream settings;
@@ -410,9 +415,93 @@ throttled *preview* only, independent of `record_path`'s full-quality local reco
 down hard over a constrained link, or up if your tether has the bandwidth (see the
 comments in `src/stream_server.c`).
 
+Both drone-side ports listen on IPv6 and IPv4 from one socket, so they work over a
+link-local address on a bare cable and over ordinary IPv4 on a LAN, with no
+switch between the two.
+
 **No authentication on any of this.** Fine on a private point-to-point tether; would
 not be fine on a shared or untrusted network — don't expose these ports beyond that
 without adding some.
+
+### Direct-cable tether
+
+The deployment case this targets has **no topside network at all**: the drone's
+Pi and the topside machine are joined by one Ethernet cable, with no router, no
+DHCP server, and no DNS. Nothing needs configuring for that to work.
+
+Both of the drone's ports listen on IPv6 as well as IPv4, and every host
+self-assigns an IPv6 link-local address (`fe80::/64`) on any live link with no
+server involved — so a bare cable is already a working network the moment both
+ends are powered. `tools/eeye-net` finds the drone over it:
+
+```sh
+tools/eeye-net discover
+```
+
+```
+Searching for a drone on: enp0s31f6
+  searching enp0s31f6...
+    found a drone at fe80::ba27:ebff:fe4a:1c2d%enp0s31f6
+
+[  ok  ] drone at fe80::ba27:ebff:fe4a:1c2d%enp0s31f6 (via enp0s31f6)
+[  ok  ] video stream delivering frames (17629 bytes, 640x480)
+
+  Start the topside UI with:
+    python3 topside/web_ui.py --drone-host 'fe80::ba27:ebff:fe4a:1c2d%enp0s31f6'
+  or let it find the drone itself:
+    python3 topside/web_ui.py --drone-host auto
+```
+
+The address is the drone's own link-local one; the `%interface` suffix is part
+of it, not decoration — every link has its own `fe80::/64`, so the interface is
+what disambiguates which cable to use. Keep the quotes: `%` is a shell
+metacharacter in some contexts.
+
+#### Checking the link
+
+```sh
+tools/eeye-net check            # discovers a drone, then checks it
+tools/eeye-net check <address>  # check one specific drone
+```
+
+It walks the whole path — link carrier, control channel, video, and whether the
+two drone-side processes actually agree on a config file — and prints the exact
+command to fix whatever it finds. It **only reads**: nothing it does changes the
+drone, the config, or this machine's network settings, so it is safe to run at
+any time, including mid-dive.
+
+Exit codes suit a pre-dive checklist: `0` healthy, `1` degraded, `2` no drone
+found.
+
+Two failures it exists to catch, because neither is visible any other way:
+
+- **The video port accepts your connection and then sends nothing.** That is
+  what `"stream_frame_interval": 0` (the default — the tap ships off) looks like
+  from outside. A plain port check calls it healthy while you stare at a black
+  screen. `check` reads an actual frame, so it can tell "connected but silent"
+  from "nothing listening" and names which.
+- **`config_agent` and `eeye` given different config paths.** Your edits then
+  land in a file `eeye` never reads: the UI reports success and nothing happens.
+  Both processes look perfectly healthy — the agent's own reply is byte-identical
+  to the healthy case. `check` cross-checks the config's declared geometry
+  against the live stream's actual dimensions, which disagree exactly when the
+  paths do.
+
+#### One-time setup, if you want it
+
+Not required for the above — link-local needs no setup at all — but useful if
+IPv4-only tools are involved, or you want the drone reachable by name:
+
+```sh
+tools/eeye-net fix
+```
+
+prints (never runs) the `nmcli`, hostname, and mDNS commands for both ends.
+The important detail it encodes: create the profile with `ifname '*'` rather
+than binding it to one interface name, or it silently stops applying the day
+the port changes — a USB Ethernet adapter and a built-in port have different
+names.
+
 
 ## Viewing the output
 
