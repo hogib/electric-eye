@@ -354,11 +354,17 @@ static void consider_size(SizeChoice *best, uint32_t w, uint32_t h,
                           uint32_t downscale) {
   if (w == 0 || h == 0)
     return;
-  // The same rule config.c applies to the requested size. Enforced here
-  // too because it is the *negotiated* size the I422 chroma halving and
-  // the YUYV box average actually run on -- a mode that fails it would
-  // produce a frame whose chroma planes don't line up with its luma.
-  if (w % (downscale * 2u) != 0 || h % downscale != 0)
+  // The same rule config.c applies to the requested size, and it has to
+  // stay the same rule: this is the *negotiated* size the I422 chroma
+  // halving and the YUYV box average actually run on, so a mode accepted
+  // here but rejected there would produce a frame whose chroma planes
+  // don't line up with its luma.
+  //
+  // Both dimensions, not just width: height doubled along with width when
+  // 4:2:0 support landed, because that path line-doubles half-height
+  // chroma into full-height planes, which only lands exactly on an even
+  // output height.
+  if (w % (downscale * 2u) != 0 || h % (downscale * 2u) != 0)
     return;
 
   bool exact = (w == want_w && h == want_h);

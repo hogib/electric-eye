@@ -217,6 +217,23 @@ static bool parse_u16(Cursor *c, uint16_t *out) {
   return true;
 }
 
+// Only for error messages -- the parser itself never needs to go this
+// direction. Kept beside effect_from_string so the two can't drift.
+static const char *effect_to_string(EffectType e) {
+  switch (e) {
+  case EFFECT_NONE:      return "none";
+  case EFFECT_GRAYSCALE: return "grayscale";
+  case EFFECT_INVERT:    return "invert";
+  case EFFECT_THRESHOLD: return "threshold";
+  case EFFECT_TINT:      return "tint";
+  case EFFECT_SOBEL:     return "sobel";
+  case EFFECT_BLUR:      return "blur";
+  case EFFECT_CONTRAST:  return "contrast";
+  case EFFECT_LIGHT:     return "light";
+  }
+  return "?";
+}
+
 static bool effect_from_string(const char *s, EffectType *out) {
   if (strcmp(s, "none") == 0)
     *out = EFFECT_NONE;
@@ -245,6 +262,55 @@ static bool effect_from_string(const char *s, EffectType *out) {
 // parse_config's own key loop and its "unknown key is a hard error"
 // policy (a stage carrying a key its effect doesn't use, e.g. tint_u on a
 // blur stage, is rejected rather than silently ignored).
+// One bit per optional stage parameter, so a stage's keys can be checked
+// against its effect after the whole object is parsed.
+enum {
+  PARAM_THRESHOLD_VALUE = 1u << 0,
+  PARAM_TINT_U = 1u << 1,
+  PARAM_TINT_V = 1u << 2,
+  PARAM_TINT_STRENGTH = 1u << 3,
+  PARAM_SOBEL_THRESHOLD = 1u << 4,
+  PARAM_BLUR_STRENGTH = 1u << 5,
+  PARAM_LIGHT_LEVEL = 1u << 6,
+};
+
+// Which parameters each effect actually reads. none/grayscale/invert/
+// contrast take none at all: contrast is a full-frame auto stretch with
+// nothing to tune, and the others are fixed transforms.
+static uint32_t params_for_effect(EffectType effect) {
+  switch (effect) {
+  case EFFECT_THRESHOLD:
+    return PARAM_THRESHOLD_VALUE;
+  case EFFECT_TINT:
+    return PARAM_TINT_U | PARAM_TINT_V | PARAM_TINT_STRENGTH;
+  case EFFECT_SOBEL:
+    return PARAM_SOBEL_THRESHOLD;
+  case EFFECT_BLUR:
+    return PARAM_BLUR_STRENGTH;
+  case EFFECT_LIGHT:
+    return PARAM_LIGHT_LEVEL;
+  case EFFECT_NONE:
+  case EFFECT_GRAYSCALE:
+  case EFFECT_INVERT:
+  case EFFECT_CONTRAST:
+    return 0;
+  }
+  return 0;
+}
+
+static const char *param_name(uint32_t bit) {
+  switch (bit) {
+  case PARAM_THRESHOLD_VALUE: return "threshold_value";
+  case PARAM_TINT_U:          return "tint_u";
+  case PARAM_TINT_V:          return "tint_v";
+  case PARAM_TINT_STRENGTH:   return "tint_strength";
+  case PARAM_SOBEL_THRESHOLD: return "sobel_threshold";
+  case PARAM_BLUR_STRENGTH:   return "blur_strength";
+  case PARAM_LIGHT_LEVEL:     return "light_level";
+  default:                    return "?";
+  }
+}
+
 static bool parse_effect_stage(Cursor *c, EffectStage *out) {
   EffectStage parsed = {0};
   // Every other field's natural zero-init default happens to already mean
@@ -255,6 +321,10 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
   // change" -- see EffectStage's own doc comment on light_level.
   parsed.light_level = 128;
   bool have_effect = false;
+  // Which parameter keys this stage carried, so they can be checked
+  // against the effect once it is known -- key order isn't fixed, so a
+  // parameter may well be parsed before "effect" is.
+  uint32_t seen_params = 0;
 
   if (!cur_expect(c, '{')) {
     printf("Config: expected '{' to start a chain stage\n");
@@ -289,18 +359,25 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
         have_effect = ok;
       } else if (strcmp(key, "threshold_value") == 0) {
         ok = parse_u8(c, &parsed.threshold_value);
+        seen_params |= PARAM_THRESHOLD_VALUE;
       } else if (strcmp(key, "tint_u") == 0) {
         ok = parse_u8(c, &parsed.tint_u);
+        seen_params |= PARAM_TINT_U;
       } else if (strcmp(key, "tint_v") == 0) {
         ok = parse_u8(c, &parsed.tint_v);
+        seen_params |= PARAM_TINT_V;
       } else if (strcmp(key, "tint_strength") == 0) {
         ok = parse_u8(c, &parsed.tint_strength);
+        seen_params |= PARAM_TINT_STRENGTH;
       } else if (strcmp(key, "sobel_threshold") == 0) {
         ok = parse_u8(c, &parsed.sobel_threshold);
+        seen_params |= PARAM_SOBEL_THRESHOLD;
       } else if (strcmp(key, "blur_strength") == 0) {
         ok = parse_u8(c, &parsed.blur_strength);
+        seen_params |= PARAM_BLUR_STRENGTH;
       } else if (strcmp(key, "light_level") == 0) {
         ok = parse_u8(c, &parsed.light_level);
+        seen_params |= PARAM_LIGHT_LEVEL;
       } else {
         printf("Config: unknown key \"%s\" in a chain stage\n", key);
         return false;
@@ -332,6 +409,23 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
 
   if (!have_effect) {
     printf("Config: chain stage missing required \"effect\" key\n");
+    return false;
+  }
+
+  // A parameter that belongs to a different effect is a typo, not a
+  // harmless extra -- accepting it silently means an operator sets a value
+  // that never takes effect and has nothing to tell them so. Same
+  // reasoning as the unknown-key error above; this is the case where the
+  // key is spelled correctly but attached to the wrong stage.
+  uint32_t stray = seen_params & ~params_for_effect(parsed.effect);
+  if (stray) {
+    for (uint32_t bit = 1; bit; bit <<= 1) {
+      if (stray & bit) {
+        printf("Config: \"%s\" is not a parameter of the \"%s\" effect\n",
+               param_name(bit), effect_to_string(parsed.effect));
+        break;
+      }
+    }
     return false;
   }
 

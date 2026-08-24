@@ -99,6 +99,36 @@ executable(
     dependencies: [m_dep, turbojpeg_dep, omp_dep, thread_dep],
 )
 
+# Unit tests. Each includes the translation unit it exercises directly
+# (rather than linking against it) so the file-static helpers -- the config
+# parser, the JPEG frame splitter, the negotiation ranker -- are reachable
+# without widening their visibility in the shipping build just to test them.
+#
+# Run with: meson test -C builddir
+test_deps = [m_dep, turbojpeg_dep, omp_dep, thread_dep]
+test_inc = include_directories('src', 'tests')
+
+# Extra translation units each test needs beyond the one it includes:
+# rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
+# frame pool, so those get linked in alongside.
+test_extra_sources = {
+    'config': [],
+    'ring_buffer': [],
+    'jpeg_framing': ['src/jpeg_decode.c', 'src/video_frame.c'],
+    'negotiation': ['src/jpeg_decode.c', 'src/video_frame.c'],
+}
+
+foreach t, extra : test_extra_sources
+    test_exe = executable(
+        'test_' + t,
+        sources: ['tests/test_' + t + '.c'] + extra,
+        include_directories: test_inc,
+        dependencies: test_deps,
+        build_by_default: false,
+    )
+    test(t, test_exe)
+endforeach
+
 
 
 
