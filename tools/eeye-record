@@ -264,19 +264,47 @@ def main():
     print("Stop with Ctrl+C.\n")
 
     cmd = build_ffmpeg_command(args, stream_url)
-    # SIGINT goes to ffmpeg so it finalizes the container rather than
-    # leaving an unplayable file; this process just waits for it.
+
+    # ffmpeg must receive SIGINT so it finalizes the container instead of
+    # leaving an unplayable file. It shares this process's group, so a
+    # Ctrl+C at a terminal already reaches it directly -- and that is the
+    # subtlety: without the handler below, Python would *also* raise
+    # KeyboardInterrupt here and race ffmpeg's own shutdown, with the
+    # parent exiting first and leaving the encoder still writing.
+    #
+    # Handling the signal explicitly makes the order deterministic: note
+    # that a stop was requested, then wait for ffmpeg to finish
+    # finalizing on its own.
     proc = subprocess.Popen(cmd)
-    try:
-        proc.wait()
-    except KeyboardInterrupt:
-        print("\nStopping; finalizing the file...")
-        try:
-            proc.send_signal(signal.SIGINT)
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
+    stopping = {"requested": False}
+
+    def on_interrupt(_signum, _frame):
+        if not stopping["requested"]:
+            stopping["requested"] = True
+            print("\nStopping; finalizing the file...", flush=True)
+            # ffmpeg already got this signal via the process group. Send
+            # it again only if it somehow did not (e.g. started in its own
+            # group by a caller), which is harmless -- a second SIGINT
+            # during finalization makes ffmpeg exit faster, not corrupt.
+            if proc.poll() is None and os.getpgid(proc.pid) != os.getpgid(0):
+                proc.send_signal(signal.SIGINT)
+
+    signal.signal(signal.SIGINT, on_interrupt)
+    signal.signal(signal.SIGTERM, on_interrupt)
+
+    # wait() is interrupted by the handler above, so loop until the child
+    # is genuinely gone rather than assuming one wait() call suffices.
+    deadline = None
+    while proc.poll() is None:
+        if stopping["requested"] and deadline is None:
+            deadline = time.monotonic() + 20
+        if deadline is not None and time.monotonic() > deadline:
+            print("ffmpeg did not finish finalizing; killing it.",
+                  file=sys.stderr)
             proc.kill()
             proc.wait()
+            break
+        time.sleep(0.1)
 
     written = []
     if args.split:

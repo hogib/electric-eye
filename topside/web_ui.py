@@ -32,7 +32,10 @@ import argparse
 import http.server
 import json
 import os
+import shutil
+import signal
 import socket
+import subprocess
 import sys
 import struct
 import threading
@@ -132,6 +135,13 @@ class FrameSource:
                 self._cond.wait(remaining)
             return self._frame, self._frame_id
 
+    def latest_frame(self):
+        """The most recent frame, without waiting for a new one -- a
+        snapshot should capture what the operator is looking at right now,
+        not whatever arrives next."""
+        with self._cond:
+            return self._frame
+
     def health(self):
         """Snapshot of link state, for the status endpoint and the overlay.
 
@@ -149,6 +159,130 @@ class FrameSource:
                 "frames": self._frames_seen,
                 "have_frame": self._frame is not None,
             }
+
+
+class Recorder:
+    """Starts and stops tools/eeye-record on behalf of the browser.
+
+    The browser cannot spawn a process, so this side owns the ffmpeg
+    child. One recording at a time, deliberately: two encoders reading the
+    same stream would double the CPU cost for two files of identical
+    content, and "am I recording?" should have one answer.
+
+    Stopping sends SIGINT rather than killing, so ffmpeg finalizes the
+    container -- a killed encoder leaves an unplayable file, which is the
+    worst possible outcome for footage someone just spent a dive
+    collecting.
+    """
+
+    def __init__(self, script_path, ui_port, output_dir):
+        self.script_path = script_path
+        self.ui_port = ui_port
+        self.output_dir = output_dir
+        self._proc = None
+        self._path = None
+        self._started_at = None
+        self._error = None
+        self._lock = threading.Lock()
+
+    def available(self):
+        return (self.script_path and os.path.exists(self.script_path)
+                and shutil.which("ffmpeg") is not None)
+
+    def start(self, quality="medium", split=None):
+        with self._lock:
+            if self._proc and self._proc.poll() is None:
+                return False, "already recording"
+            if not self.available():
+                return False, ("tools/eeye-record or ffmpeg is missing on "
+                               "this machine")
+
+            os.makedirs(self.output_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            name = f"dive-{stamp}-%03d.mp4" if split else f"dive-{stamp}.mp4"
+            out_path = os.path.join(self.output_dir, name)
+
+            cmd = [sys.executable, self.script_path,
+                   "-o", out_path,
+                   "--ui-port", str(self.ui_port),
+                   "--quality", quality]
+            if split:
+                cmd += ["--split", split]
+
+            try:
+                # Its stdout/stderr go to this process's, so recorder
+                # problems land in the same log an operator is already
+                # watching rather than somewhere they have to go find.
+                # start_new_session puts the recorder and its ffmpeg child
+                # in their own process group, which is what makes stopping
+                # reliable: stop() signals the whole group and so reaches
+                # ffmpeg directly. Signalling only the direct child leaves
+                # ffmpeg running -- still writing to a file the UI has
+                # already reported as stopped, and never finalized.
+                self._proc = subprocess.Popen(cmd, start_new_session=True)
+            except OSError as e:
+                self._error = str(e)
+                return False, f"could not start the recorder: {e}"
+
+            self._path = out_path
+            self._started_at = time.monotonic()
+            self._error = None
+            print(f"[recorder] started -> {out_path}")
+            return True, os.path.basename(out_path)
+
+    def stop(self):
+        with self._lock:
+            if not self._proc or self._proc.poll() is not None:
+                return False, "not recording"
+            print("[recorder] stopping; finalizing the file...")
+            try:
+                # The whole group, so ffmpeg itself gets the SIGINT and
+                # finalizes the container. ffmpeg never sees a signal sent
+                # only to its parent, and an unfinalized mp4 has no moov
+                # atom -- it will not play at all, which is the worst
+                # outcome for footage someone just spent a dive
+                # collecting.
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
+                self._proc.wait(timeout=25)
+            except subprocess.TimeoutExpired:
+                print("[recorder] did not exit in time; killing it")
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                except OSError:
+                    self._proc.kill()
+                self._proc.wait()
+            except (OSError, ProcessLookupError) as e:
+                return False, str(e)
+            self._proc = None
+            return True, os.path.basename(self._path or "")
+
+    def status(self):
+        with self._lock:
+            running = bool(self._proc and self._proc.poll() is None)
+            # A recorder that exited on its own (bad arguments, ffmpeg
+            # missing, the stream tap off) has to be distinguishable from
+            # one that was never started, or the button just silently
+            # fails to latch.
+            exited_badly = (self._proc is not None
+                            and self._proc.poll() not in (None, 0))
+            info = {
+                "available": self.available(),
+                "recording": running,
+                "file": os.path.basename(self._path) if self._path else None,
+                "elapsed_s": (round(time.monotonic() - self._started_at, 1)
+                              if running and self._started_at else None),
+                "error": self._error,
+            }
+            if exited_badly and not running:
+                info["error"] = (self._error
+                                 or f"recorder exited with code "
+                                    f"{self._proc.poll()}")
+            if running and self._path and not self._path.count("%"):
+                try:
+                    info["bytes"] = os.path.getsize(self._path)
+                except OSError:
+                    pass
+            return info
 
 
 # Mirrors config.h's JSON schema exactly: for each effect, the list of
@@ -252,6 +386,27 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
      is looking at, it stops looking like live video. */
   #video.stale { filter: grayscale(1) brightness(0.55); }
 
+  /* Capture controls. Deliberately large and separated from the effect
+     form: these are the two things someone reaches for in a hurry, often
+     one-handed on a boat, and they must not sit among the sliders where a
+     mis-tap changes the image instead. */
+  #capture { display: flex; gap: 8px; margin: 8px 0; }
+  #capture button {
+    flex: 1; padding: 12px 8px; font-size: 15px; font-weight: bold;
+    border: none; border-radius: 4px; cursor: pointer;
+    background: #3a3a3a; color: #eee;
+  }
+  #capture button:hover:enabled { background: #4a4a4a; }
+  #capture button:disabled { opacity: 0.45; cursor: default; }
+  #btn-record.on { background: #b02020; color: #fff; }
+  /* Pulses only while actually recording, so the state is readable from
+     across a deck without reading the label. */
+  #btn-record.on { animation: recpulse 1.4s ease-in-out infinite; }
+  @keyframes recpulse { 50% { background: #7a1616; } }
+  #capturemsg { font-size: 13px; min-height: 18px; margin-bottom: 4px; }
+  #capturemsg.err { color: #f88; }
+  #capturemsg.ok { color: #6f6; }
+
   #recstate { margin: 4px 0 2px; font-size: 13px; }
   #recstate.active { color: #6f6; }
   #recstate.failed { color: #f66; font-weight: bold; }
@@ -267,6 +422,23 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
     <h2>Effect chain</h2>
     <div id="stages"></div>
     <button id="add-stage" type="button">+ Add stage</button>
+
+    <h2>Capture</h2>
+    <div id="capture">
+      <button id="btn-record" type="button">● Record</button>
+      <button id="btn-snap" type="button">◉ Snapshot</button>
+    </div>
+    <div id="capturemsg"></div>
+    <label class="field">
+      Recording quality
+      <select id="rec_quality">
+        <option value="low">low (~0.6 GB/hour)</option>
+        <option value="medium" selected>medium (~1.2 GB/hour)</option>
+        <option value="high">high (~3 GB/hour)</option>
+      </select>
+    </label>
+    <div class="readonly">Recorded topside, H.264. Follows the preview —
+      so the raw toggle below decides whether effects are burned in.</div>
 
     <h2>Preview</h2>
     <label class="field">
@@ -556,6 +728,96 @@ document.getElementById("apply").addEventListener("click", async () => {
   }
 });
 
+// --- Capture controls ------------------------------------------------
+const btnRecord = document.getElementById("btn-record");
+const btnSnap = document.getElementById("btn-snap");
+const captureMsg = document.getElementById("capturemsg");
+const recQuality = document.getElementById("rec_quality");
+// Tracked so the poll can restyle the button without fighting a click
+// that is still in flight -- the server is the authority on whether a
+// recording is running, but a half-second of lag should not make the
+// button flicker back and forth.
+let recording = false;
+let recordBusy = false;
+
+function setCaptureMsg(text, cls) {
+  captureMsg.textContent = text;
+  captureMsg.className = cls || "";
+}
+
+btnRecord.addEventListener("click", async () => {
+  if (recordBusy) return;
+  recordBusy = true;
+  btnRecord.disabled = true;
+  const action = recording ? "stop" : "start";
+  setCaptureMsg(action === "start" ? "Starting..." : "Finalizing...");
+  try {
+    const r = await fetch("/record", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        action,
+        quality: recQuality.value,
+      }),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      setCaptureMsg(action === "start" ? "Recording to " + j.detail
+                                       : "Saved " + j.detail, "ok");
+    } else {
+      setCaptureMsg(j.detail || "failed", "err");
+    }
+  } catch (e) {
+    setCaptureMsg("Request failed: " + e, "err");
+  } finally {
+    recordBusy = false;
+    btnRecord.disabled = false;
+  }
+});
+
+btnSnap.addEventListener("click", async () => {
+  btnSnap.disabled = true;
+  try {
+    const r = await fetch("/snapshot", {method: "POST"});
+    const j = await r.json();
+    if (r.ok) {
+      setCaptureMsg(`Saved ${j.file} (${(j.bytes / 1024).toFixed(0)} KB)`,
+                    "ok");
+    } else {
+      setCaptureMsg(j.error || "snapshot failed", "err");
+    }
+  } catch (e) {
+    setCaptureMsg("Request failed: " + e, "err");
+  } finally {
+    btnSnap.disabled = false;
+  }
+});
+
+function renderRecorder(rec) {
+  if (!rec) return;
+  if (!rec.available) {
+    btnRecord.disabled = true;
+    btnRecord.title = "tools/eeye-record or ffmpeg not found on the "
+                    + "topside machine";
+    return;
+  }
+  recording = !!rec.recording;
+  btnRecord.className = recording ? "on" : "";
+  if (recording) {
+    const mins = Math.floor((rec.elapsed_s || 0) / 60);
+    const secs = Math.floor((rec.elapsed_s || 0) % 60);
+    const clock = `${mins}:${String(secs).padStart(2, "0")}`;
+    let label = `■ Stop  ${clock}`;
+    if (rec.bytes) label += `  ${(rec.bytes / 1e6).toFixed(0)} MB`;
+    btnRecord.textContent = label;
+  } else {
+    btnRecord.textContent = "● Record";
+    // A recorder that died on its own has to say so -- otherwise the
+    // button just quietly un-latches and the dive goes unrecorded.
+    if (rec.error && !recordBusy) setCaptureMsg(rec.error, "err");
+  }
+}
+
 // --- Link and recording health ---------------------------------------
 //
 // Polled rather than pushed: the MJPEG stream carries no metadata, and a
@@ -575,6 +837,7 @@ const recstate = document.getElementById("recstate");
 function renderHealth(h) {
   const link = h.link || {};
   const drone = h.drone || {};
+  renderRecorder(h.recorder);
 
   // Link first: if the picture is not live, nothing else on screen
   // matters as much.
@@ -674,7 +937,7 @@ def agent_base_url(host, port):
     return f"http://{host}:{port}"
 
 
-def make_handler(source, agent_host, agent_port):
+def make_handler(source, agent_host, agent_port, recorder, snapshot_dir):
     agent_base = agent_base_url(agent_host, agent_port)
     index_html = INDEX_HTML_TEMPLATE.replace(
         "__EFFECT_FIELDS_JSON__", json.dumps(EFFECT_FIELDS)
@@ -712,6 +975,10 @@ def make_handler(source, agent_host, agent_port):
         def do_POST(self):
             if self.path == "/config":
                 self._proxy_to_agent("POST")
+            elif self.path == "/snapshot":
+                self._save_snapshot()
+            elif self.path == "/record":
+                self._record_command()
             else:
                 self.send_error(404)
 
@@ -723,6 +990,57 @@ def make_handler(source, agent_host, agent_port):
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def _save_snapshot(self):
+            """Writes the current frame to a .jpg and reports the name.
+
+            Saved byte-for-byte as received rather than re-encoded: the
+            frame is already a JPEG, so decoding and re-encoding it would
+            cost quality for nothing. That does mean a snapshot inherits
+            stream_quality -- and shows effects or raw depending on
+            stream_raw, exactly like the preview it is a still of.
+            """
+            frame = source.latest_frame()
+            if frame is None:
+                self._respond(503, "application/json",
+                              json.dumps({"error": "no frame available yet"}
+                                         ).encode())
+                return
+            try:
+                os.makedirs(snapshot_dir, exist_ok=True)
+                # Millisecond precision: burst-clicking the button should
+                # not silently overwrite the previous shot.
+                name = time.strftime("snap-%Y%m%d-%H%M%S")
+                name += f"-{int(time.time() * 1000) % 1000:03d}.jpg"
+                path = os.path.join(snapshot_dir, name)
+                with open(path, "wb") as f:
+                    f.write(frame)
+            except OSError as e:
+                self._respond(500, "application/json",
+                              json.dumps({"error": str(e)}).encode())
+                return
+            print(f"[snapshot] {path} ({len(frame)} bytes)")
+            self._respond(200, "application/json",
+                          json.dumps({"file": name,
+                                      "bytes": len(frame)}).encode())
+
+        def _record_command(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                body = json.loads(self.rfile.read(length)) if length else {}
+            except json.JSONDecodeError:
+                body = {}
+            action = body.get("action")
+            if action == "start":
+                ok, detail = recorder.start(
+                    quality=body.get("quality", "medium"),
+                    split=body.get("split") or None)
+            elif action == "stop":
+                ok, detail = recorder.stop()
+            else:
+                ok, detail = False, "unknown action"
+            self._respond(200 if ok else 409, "application/json",
+                          json.dumps({"ok": ok, "detail": detail}).encode())
 
         def _serve_health(self):
             """Combines the two halves of "is this working".
@@ -737,7 +1055,8 @@ def make_handler(source, agent_host, agent_port):
             unreachable, the link half is still worth reporting, and its
             absence is itself informative.
             """
-            payload = {"link": source.health()}
+            payload = {"link": source.health(),
+                       "recorder": recorder.status()}
             try:
                 req = urllib.request.Request(f"{agent_base}/health")
                 with urllib.request.urlopen(req, timeout=3) as resp:
@@ -868,6 +1187,11 @@ def main():
         "--http-port", type=int, default=8080,
         help="port this script's own web server listens on (default: 8080)",
     )
+    parser.add_argument(
+        "--output-dir", default="captures",
+        help="where recordings and snapshots are written (default: "
+             "./captures)",
+    )
     args = parser.parse_args()
 
     drone_host = args.drone_host
@@ -877,11 +1201,25 @@ def main():
             return 2
 
     source = FrameSource(drone_host, args.drone_stream_port)
+
+    # tools/eeye-record lives beside this script, one directory up.
+    record_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "tools",
+        "eeye-record")
+    record_script = os.path.normpath(record_script)
+    recorder = Recorder(record_script, args.http_port, args.output_dir)
+    if not recorder.available():
+        print("Note: recording from the UI is unavailable "
+              "(tools/eeye-record or ffmpeg not found). Everything else "
+              "works; snapshots are unaffected.")
+
     server = http.server.ThreadingHTTPServer(
         ("0.0.0.0", args.http_port),
-        make_handler(source, drone_host, args.drone_agent_port),
+        make_handler(source, drone_host, args.drone_agent_port, recorder,
+                     args.output_dir),
     )
     print(f"Serving control UI on http://0.0.0.0:{args.http_port}/")
+    print(f"Recordings and snapshots -> {os.path.abspath(args.output_dir)}")
     server.serve_forever()
 
 

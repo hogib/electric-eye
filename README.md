@@ -68,7 +68,15 @@ python3 pi/config_agent.py --config-path eeye_config.json
 ```sh
 tools/eeye-net check                          # pre-dive: is everything talking?
 python3 topside/web_ui.py --drone-host auto   # then open http://localhost:8080/
-tools/eeye-record --split 10m                 # optional: record the dive, encoded
+```
+
+The page has the live feed, **Record** and **Snapshot** buttons, and the effect
+chain. Recordings and stills land in `./captures` (`--output-dir` to change it).
+Recording can also be driven from the command line, which is what the button
+runs underneath:
+
+```sh
+tools/eeye-record --split 10m                 # a new file every 10 minutes
 ```
 
 `check` walks the whole path — cable carrier, control channel, video, and whether
@@ -444,10 +452,18 @@ fine on a shared network.
   later is held to the original size. Replugging the same one is fine.
 - **The web UI shows the config's geometry, not the negotiated one.** Check
   `eeye`'s startup log for what is actually in use.
-- **Recording is uncompressed.** Fine for short clips.
+- **Onboard recording is uncompressed** (~190 GB/hour), so it is for short clips.
+  `tools/eeye-record` encodes topside at ~1.2 GB/hour for anything longer — at
+  the preview's framerate and quality, not the camera's.
 - **Pi camera controls beyond resolution and framerate aren't plumbed through.**
-- **Verified on real Pi hardware with a USB camera.** The Pi camera module backend
-  and the web UI over a real tether have not been.
+- **Snapshots and topside recordings capture the preview**, so they inherit
+  `stream_frame_interval`, `stream_quality`, and `stream_raw`.
+- **Recording from the UI needs `ffmpeg` on the topside machine.** The Record
+  button disables itself and says so when it is missing; everything else,
+  snapshots included, works without it.
+- **Verified on real Pi hardware with a USB camera.** The Pi camera module backend,
+  the web UI over a real tether, and the stale-link/recording-failure indicators
+  have not been.
 
 ## Development
 

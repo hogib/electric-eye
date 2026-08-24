@@ -234,6 +234,104 @@ class TestAgentHealthRelay(unittest.TestCase):
         self.assertIn("error", h)
 
 
+class TestRecorder(unittest.TestCase):
+    """The recorder controller behind the UI's Record button.
+
+    The bug these guard against, found in testing: stop() signalled only
+    the direct child, so ffmpeg kept running and kept writing to a file
+    the UI had already reported as stopped -- and because it never
+    finalized, the resulting mp4 had no moov atom and would not play at
+    all.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        # A stand-in for tools/eeye-record that spawns a grandchild, so
+        # the process-group behaviour is what is actually exercised.
+        self.script = os.path.join(self.dir, "fake-record")
+        with open(self.script, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import subprocess, sys, time, os\n"
+                "out = sys.argv[sys.argv.index('-o') + 1]\n"
+                "# Grandchild: writes continuously until signalled, the\n"
+                "# same shape as ffmpeg under the real recorder.\n"
+                "child = subprocess.Popen([sys.executable, '-c',\n"
+                "    \"import sys,time\\n\"\n"
+                "    \"f=open(sys.argv[1],'ab')\\n\"\n"
+                "    \"import signal,os\\n\"\n"
+                "    \"signal.signal(signal.SIGINT, lambda *a: os._exit(0))\\n\"\n"
+                "    \"\\nwhile True:\\n    f.write(b'x'*1000); f.flush(); time.sleep(0.05)\",\n"
+                "    out])\n"
+                "# Exit quietly on SIGINT: an uncaught KeyboardInterrupt\n"
+                "# traceback here is expected behaviour, but it clutters\n"
+                "# the test output enough to hide a real failure.\n"
+                "import signal\n"
+                "signal.signal(signal.SIGINT, lambda *a: os._exit(0))\n"
+                "try:\n"
+                "    child.wait()\n"
+                "except KeyboardInterrupt:\n"
+                "    os._exit(0)\n"
+            )
+        os.chmod(self.script, 0o755)
+
+    def make_recorder(self):
+        r = web_ui.Recorder(self.script, 8080, self.dir)
+        # available() also checks for ffmpeg; the fake script does not
+        # need it, so bypass that one check rather than skipping the test
+        # on machines without ffmpeg installed.
+        r.available = lambda: True
+        return r
+
+    def test_start_then_status_reports_recording(self):
+        r = self.make_recorder()
+        ok, detail = r.start()
+        self.assertTrue(ok, detail)
+        time.sleep(0.5)
+        st = r.status()
+        self.assertTrue(st["recording"])
+        self.assertIsNotNone(st["file"])
+        r.stop()
+
+    def test_stop_actually_stops_the_grandchild(self):
+        """The regression test: after stop() returns, nothing may still be
+        writing to the file."""
+        r = self.make_recorder()
+        ok, _ = r.start()
+        self.assertTrue(ok)
+        time.sleep(0.6)
+        path = r._path
+        r.stop()
+
+        size_after_stop = os.path.getsize(path)
+        time.sleep(0.8)
+        self.assertEqual(os.path.getsize(path), size_after_stop,
+                         "file kept growing after stop() returned")
+        self.assertFalse(r.status()["recording"])
+
+    def test_double_start_is_refused(self):
+        r = self.make_recorder()
+        self.assertTrue(r.start()[0])
+        ok, detail = r.start()
+        self.assertFalse(ok)
+        self.assertIn("already", detail)
+        r.stop()
+
+    def test_stop_without_start_is_refused(self):
+        r = self.make_recorder()
+        ok, detail = r.stop()
+        self.assertFalse(ok)
+        self.assertIn("not recording", detail)
+
+    def test_unavailable_recorder_reports_rather_than_crashing(self):
+        r = web_ui.Recorder("/nonexistent/eeye-record", 8080, self.dir)
+        self.assertFalse(r.available())
+        ok, detail = r.start()
+        self.assertFalse(ok)
+        self.assertIn("missing", detail)
+        self.assertFalse(r.status()["available"])
+
+
 class TestAgentBaseUrl(unittest.TestCase):
     """IPv6 literals must be bracketed in a URL or the colons read as a
     port separator -- link-local addresses are the normal case on a bare
