@@ -68,6 +68,7 @@ python3 pi/config_agent.py --config-path eeye_config.json
 ```sh
 tools/eeye-net check                          # pre-dive: is everything talking?
 python3 topside/web_ui.py --drone-host auto   # then open http://localhost:8080/
+tools/eeye-record --split 10m                 # optional: record the dive, encoded
 ```
 
 `check` walks the whole path — cable carrier, control channel, video, and whether
@@ -337,16 +338,52 @@ during decode.
 
 ### Recording
 
-`"record_path"` writes the camera frame **before the effect chain** as raw I422,
-no container. Empty means off.
+Two options, and for a whole dive you almost certainly want the second.
 
-Large: ~53MB/s (~190GB/hour) at 1280×720. `downscale` applies (it happens during
-capture decode, upstream of this tap), so recordings shrink proportionally —
-~48GB/hour at `downscale: 2`. Play back at `capture ÷ downscale`:
+**Topside, encoded (`tools/eeye-record`)** — ~1.2 GB/hour, and costs the drone
+nothing, since it re-uses frames already being sent for the preview:
+
+```sh
+tools/eeye-record                          # H.264 to dive-<timestamp>.mp4
+tools/eeye-record --raw --split 10m        # raw camera, a new file every 10min
+tools/eeye-record --quality high -o run.mp4
+```
+
+It records the **preview stream**, so what you get depends on two drone-side
+settings — framerate is `30 ÷ stream_frame_interval`, quality is
+`stream_quality`, and `stream_raw` decides whether effects are burned in. The
+tool prints exactly what it is about to capture before it starts:
+
+```
+Source         : processed image (effects burned in), ~15 fps, JPEG quality 75
+```
+
+`--raw` / `--effects` flip `stream_raw` on the drone for you. It connects
+through `web_ui.py` rather than to the drone directly, because the drone serves
+one viewer at a time — connecting straight to it would kick the pilot off
+their video.
+
+**Onboard, uncompressed (`"record_path"`)** — writes the camera frame **before
+the effect chain** as raw I422, no container. Empty means off. This is the
+full-rate, full-quality, effect-free source, and it is enormous: ~53 MB/s,
+~190 GB/hour at 1280×720. Use it for short clips where the compression or the
+dropped frames of the topside path would matter.
+
+`downscale` applies (it happens during capture decode, upstream of this tap),
+so recordings shrink proportionally — ~48 GB/hour at `downscale: 2`. Play back
+at `capture ÷ downscale`:
 
 ```sh
 ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE   # downscale 2
 ```
+
+| | topside (`eeye-record`) | onboard (`record_path`) |
+|---|---|---|
+| size | ~1.2 GB/hour | ~190 GB/hour |
+| framerate | `30 ÷ stream_frame_interval` | full capture rate |
+| quality | JPEG then H.264 | untouched |
+| effects | follows `stream_raw` | always excluded |
+| costs the drone | nothing extra | disk write per frame |
 
 ### Live preview
 

@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+Record the drone's video topside, encoded, instead of raw on the drone.
+
+WHY THIS EXISTS
+---------------
+eeye's own `record_path` writes raw I422 with no compression: ~55 MB/s,
+~199 GB/hour at 1280x720. That is fine for short clips and impractical for
+a dive. This records the same imagery topside as H.264 at roughly
+1.2 GB/hour -- about 165x smaller -- and costs the drone nothing, because
+the frames are already being sent for the live preview. The drone's SD card
+stops being the constraint.
+
+WHAT IT ACTUALLY RECORDS, AND WHY THAT MATTERS
+----------------------------------------------
+This records the *preview stream*, which is not the same thing as what the
+drone sees:
+
+  - Framerate is the capture rate divided by "stream_frame_interval". At
+    the default interval of 3 and 30fps capture, that is 10fps.
+  - Quality is "stream_quality" (JPEG), then re-encoded here. Encoding
+    already-lossy JPEG loses a little more.
+  - Whether effects are burned in depends on "stream_raw": false records
+    the processed image, true records the untouched camera.
+
+So this is the right tool for a dive log, review footage, or anything you
+need to actually keep. It is NOT a substitute for eeye's own tap when you
+need full-rate, full-quality, effect-free source material -- use
+record_path for that, briefly.
+
+It connects to web_ui.py rather than to the drone directly, deliberately:
+the drone's stream_server accepts one viewer at a time and the newest
+connection displaces the previous one, so a recorder talking to the drone
+would kick the pilot off their own video. web_ui.py already fans its
+single drone connection out to any number of consumers, and this is one
+more of them.
+
+Usage:
+    tools/eeye-record                              # to ./dive-<timestamp>.mp4
+    tools/eeye-record -o dive.mp4 --raw            # record the raw camera
+    tools/eeye-record --quality high --split 10m
+"""
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# CRF is the quality/size dial for x264: lower is better and bigger, and
+# each +6 roughly halves the bitrate. These three are chosen for what they
+# mean underwater rather than as round numbers -- "low" still has to be
+# good enough to identify what you saw.
+QUALITY_PRESETS = {
+    "low": {"crf": 30, "preset": "veryfast"},
+    "medium": {"crf": 23, "preset": "veryfast"},
+    "high": {"crf": 18, "preset": "medium"},
+}
+
+
+def parse_duration(text):
+    """Accepts 90, 90s, 15m, 2h -- a dive is measured in minutes, and
+    making someone convert that to seconds is a pointless chance to get it
+    wrong."""
+    text = str(text).strip().lower()
+    if not text:
+        raise ValueError("empty duration")
+    units = {"s": 1, "m": 60, "h": 3600}
+    if text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(float(text))
+
+
+def fetch_status(base_url, timeout=3):
+    """What the topside server knows about the link and the drone. Used to
+    warn before recording rather than after, since 'the tether was down
+    for the first four minutes' is worth knowing at the time."""
+    try:
+        with urllib.request.urlopen(f"{base_url}/health", timeout=timeout) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+
+
+def fetch_config(base_url, timeout=3):
+    try:
+        with urllib.request.urlopen(f"{base_url}/config", timeout=timeout) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+
+
+def describe_source(cfg, capture_fps=30):
+    """Spells out what is about to be recorded, in the operator's terms.
+
+    Printed rather than merely inferred because the two settings that
+    decide it -- stream_frame_interval and stream_raw -- live on the drone
+    and are easy to forget, and both are invisible in the resulting file.
+    """
+    if not cfg:
+        return "unknown (could not read the drone's config)"
+    interval = cfg.get("stream_frame_interval", 0) or 0
+    if interval == 0:
+        return ("STREAM TAP IS OFF -- nothing will be recorded until "
+                '"stream_frame_interval" is set to 1 or more')
+    fps = capture_fps / interval
+    what = "raw camera (effects bypassed)" if cfg.get("stream_raw") else \
+           "processed image (effects burned in)"
+    quality = cfg.get("stream_quality", 60)
+    return f"{what}, ~{fps:g} fps, JPEG quality {quality}"
+
+
+def build_ffmpeg_command(args, url):
+    """MJPEG in, H.264 out.
+
+    -use_wallclock_as_timestamps: the multipart stream carries no
+    timestamps of its own, so without this ffmpeg assumes a constant rate
+    and any hitch in the tether silently shifts the whole recording out of
+    sync with reality. Wallclock timing keeps the file honest about when
+    things happened, which for a dive log is the entire point.
+    """
+    quality = QUALITY_PRESETS[args.quality]
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-use_wallclock_as_timestamps", "1",
+        "-f", "mjpeg", "-i", url,
+        "-c:v", args.codec,
+        "-preset", quality["preset"],
+        "-crf", str(quality["crf"]),
+        # yuv420p rather than the source's 4:2:2: it is what every player
+        # and browser can decode, and chroma detail is not what anyone is
+        # squinting at in this footage.
+        "-pix_fmt", "yuv420p",
+        # +faststart puts the index at the front, so a partially written
+        # file is still playable -- which matters when a recording ends by
+        # the boat losing power rather than by someone pressing stop.
+        "-movflags", "+faststart",
+    ]
+    if args.duration:
+        cmd += ["-t", str(parse_duration(args.duration))]
+    if args.split:
+        seconds = parse_duration(args.split)
+        # Segmenting caps how much a single corrupted file can cost, and
+        # makes long dives navigable.
+        cmd += [
+            "-f", "segment",
+            "-segment_time", str(seconds),
+            "-reset_timestamps", "1",
+            "-segment_format", "mp4",
+            args.output,
+        ]
+    else:
+        cmd += [args.output]
+    return cmd
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-o", "--output",
+                        help="output file; %%03d in the name when splitting "
+                             "(default: dive-<timestamp>.mp4)")
+    parser.add_argument("--ui-host", default="127.0.0.1",
+                        help="where web_ui.py is running (default: localhost)")
+    parser.add_argument("--ui-port", type=int, default=8080,
+                        help="web_ui.py's port (default: 8080)")
+    parser.add_argument("--quality", choices=sorted(QUALITY_PRESETS),
+                        default="medium",
+                        help="low ~0.6, medium ~1.2, high ~3 GB/hour "
+                             "(default: medium)")
+    parser.add_argument("--codec", default="libx264",
+                        help="ffmpeg video encoder (default: libx264)")
+    parser.add_argument("--duration",
+                        help="stop after this long, e.g. 45m")
+    parser.add_argument("--split",
+                        help="start a new file every interval, e.g. 10m")
+    parser.add_argument("--raw", action="store_true",
+                        help="switch the drone's preview to the raw camera "
+                             "first, so effects are not burned in")
+    parser.add_argument("--effects", action="store_true",
+                        help="switch the drone's preview to the processed "
+                             "image first")
+    args = parser.parse_args()
+
+    if args.raw and args.effects:
+        parser.error("--raw and --effects are opposites; pass at most one")
+
+    if not shutil.which("ffmpeg"):
+        print("ffmpeg not found. Install it (apt install ffmpeg) -- this "
+              "script is a wrapper around it.", file=sys.stderr)
+        return 2
+
+    if not args.output:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        args.output = (f"dive-{stamp}-%03d.mp4" if args.split
+                       else f"dive-{stamp}.mp4")
+    elif args.split and "%" not in args.output:
+        root, ext = os.path.splitext(args.output)
+        args.output = f"{root}-%03d{ext or '.mp4'}"
+        print(f"Splitting, so writing numbered files: {args.output}")
+
+    base_url = f"http://{args.ui_host}:{args.ui_port}"
+    stream_url = f"{base_url}/stream"
+
+    # Flip the drone's preview source first if asked. Done through the
+    # same UI proxy the browser uses, so there is one path that writes
+    # config rather than two that can disagree.
+    if args.raw or args.effects:
+        cfg = fetch_config(base_url)
+        if cfg is None:
+            print("Could not read the drone's config to change stream_raw; "
+                  "recording whatever the preview is currently showing.",
+                  file=sys.stderr)
+        else:
+            cfg["stream_raw"] = bool(args.raw)
+            try:
+                req = urllib.request.Request(
+                    f"{base_url}/config",
+                    data=json.dumps(cfg).encode(), method="POST",
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    verdict = json.loads(r.read())
+                if verdict.get("eeye_accepted") is not True:
+                    print("Warning: the drone did not confirm the "
+                          "stream_raw change; recording anyway.",
+                          file=sys.stderr)
+                else:
+                    time.sleep(0.5)  # let a frame or two of the new source arrive
+            except (urllib.error.URLError, OSError) as e:
+                print(f"Could not change stream_raw ({e}); recording "
+                      "whatever the preview is currently showing.",
+                      file=sys.stderr)
+
+    health = fetch_status(base_url)
+    if health is None:
+        print(f"Cannot reach web_ui.py at {base_url}. Start it first:\n"
+              "  python3 topside/web_ui.py --drone-host auto", file=sys.stderr)
+        return 2
+
+    link = health.get("link", {})
+    if not link.get("have_frame"):
+        print("No video is arriving from the drone yet -- recording would "
+              "capture nothing.\nCheck `tools/eeye-net check` first.",
+              file=sys.stderr)
+        return 1
+    if not link.get("connected"):
+        print("Warning: the link to the drone is currently down; the "
+              "recording will start empty and fill in if it recovers.",
+              file=sys.stderr)
+
+    cfg = fetch_config(base_url)
+    print(f"Recording from : {stream_url}")
+    print(f"Source         : {describe_source(cfg)}")
+    print(f"Writing to     : {args.output}")
+    print(f"Quality        : {args.quality} "
+          f"(crf {QUALITY_PRESETS[args.quality]['crf']}, {args.codec})")
+    if args.split:
+        print(f"Splitting every: {args.split}")
+    print("Stop with Ctrl+C.\n")
+
+    cmd = build_ffmpeg_command(args, stream_url)
+    # SIGINT goes to ffmpeg so it finalizes the container rather than
+    # leaving an unplayable file; this process just waits for it.
+    proc = subprocess.Popen(cmd)
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\nStopping; finalizing the file...")
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    written = []
+    if args.split:
+        root = args.output.split("%")[0]
+        directory = os.path.dirname(root) or "."
+        base = os.path.basename(root)
+        if os.path.isdir(directory):
+            written = sorted(f for f in os.listdir(directory)
+                             if f.startswith(base))
+        for name in written:
+            size = os.path.getsize(os.path.join(directory, name))
+            print(f"  {name}: {size / 1e6:.1f} MB")
+    elif os.path.exists(args.output):
+        size = os.path.getsize(args.output)
+        print(f"  {args.output}: {size / 1e6:.1f} MB")
+        if size < 1024:
+            print("  (suspiciously small -- was the stream tap on?)")
+
+    return proc.returncode if proc.returncode and proc.returncode > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

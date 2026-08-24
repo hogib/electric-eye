@@ -150,6 +150,12 @@ if python_exe.found()
         args: [meson.project_source_root() / 'tests/test_topside.py'],
         timeout: 120,
     )
+    test(
+        'record',
+        python_exe,
+        args: [meson.project_source_root() / 'tests/test_record.py'],
+        timeout: 60,
+    )
 endif
 
 
