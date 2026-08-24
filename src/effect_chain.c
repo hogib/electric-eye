@@ -224,7 +224,8 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   while (i < cfg->stage_count) {
     const EffectStage *stage = &cfg->stages[i];
 
-    if (stage->effect == EFFECT_BLUR || stage->effect == EFFECT_SOBEL) {
+    if (stage->effect == EFFECT_BLUR || stage->effect == EFFECT_SOBEL ||
+        stage->effect == EFFECT_LOG) {
       // Neighborhood ops ping-pong between work and spare, never
       // targeting whichever buffer 'cur' already is (that's what's being
       // read). The first neighborhood op in a chain has cur == RAW, so it
@@ -240,6 +241,9 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       if (stage->effect == EFFECT_SOBEL) {
         sobel_edges(src_planes, dst_planes, frame->width, frame->height,
                    frame->stride, stage->sobel_threshold);
+      } else if (stage->effect == EFFECT_LOG) {
+        log_edges(src_planes, dst_planes, frame->width, frame->height,
+                  frame->stride, stage->log_strength, stage->log_threshold);
       } else {
         gaussian_blur(src_planes, dst_planes, frame->width, frame->height,
                      frame->stride, stage->blur_strength);

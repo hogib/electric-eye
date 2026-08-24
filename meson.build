@@ -116,6 +116,14 @@ test_extra_sources = {
     'ring_buffer': [],
     'jpeg_framing': ['src/jpeg_decode.c', 'src/video_frame.c'],
     'negotiation': ['src/jpeg_decode.c', 'src/video_frame.c'],
+    'jpeg_decode': ['src/jpeg_decode.c', 'src/video_frame.c'],
+    'log_edges': ['src/conv.c', 'src/video_frame.c'],
+    'effect_chain': [
+        'src/conv.c',
+        'src/point_opps.c',
+        'src/video_frame.c',
+        'src/config.c',
+    ],
 }
 
 foreach t, extra : test_extra_sources

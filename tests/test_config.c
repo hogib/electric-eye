@@ -55,7 +55,7 @@ static void test_every_effect_name_parses(void) {
       {"invert", EFFECT_INVERT},       {"threshold", EFFECT_THRESHOLD},
       {"tint", EFFECT_TINT},           {"sobel", EFFECT_SOBEL},
       {"blur", EFFECT_BLUR},           {"contrast", EFFECT_CONTRAST},
-      {"light", EFFECT_LIGHT},
+      {"light", EFFECT_LIGHT},         {"log", EFFECT_LOG},
   };
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
     char json[128];
@@ -98,6 +98,31 @@ static void test_effect_parameters_round_trip(void) {
 
   CHECK(parse("{\"chain\":[{\"effect\":\"sobel\",\"sobel_threshold\":60}]}", &c));
   CHECK_EQ_INT(c.stages[0].sobel_threshold, 60);
+
+  CHECK(parse("{\"chain\":[{\"effect\":\"log\",\"log_strength\":3,"
+              "\"log_threshold\":25}]}",
+              &c));
+  CHECK_EQ_INT(c.stages[0].log_strength, 3);
+  CHECK_EQ_INT(c.stages[0].log_threshold, 25);
+}
+
+// log takes its own two parameters and no others -- the per-effect key
+// check has to know about a newly added effect, or it silently accepts
+// anything on it.
+static void test_log_parameter_validation(void) {
+  Config c;
+  CHECK(parse("{\"chain\":[{\"effect\":\"log\"}]}", &c)); // both optional
+  CHECK_EQ_INT(c.stages[0].log_strength, 0);
+  CHECK_EQ_INT(c.stages[0].log_threshold, 0);
+  // Another effect's parameter on a log stage is an error...
+  CHECK(!parse("{\"chain\":[{\"effect\":\"log\",\"tint_u\":90}]}", &c));
+  CHECK(!parse("{\"chain\":[{\"effect\":\"log\",\"blur_strength\":4}]}",
+               &c));
+  // ...and log's parameters on another effect are equally an error.
+  CHECK(!parse("{\"chain\":[{\"effect\":\"blur\",\"log_strength\":3}]}",
+               &c));
+  CHECK(!parse("{\"chain\":[{\"effect\":\"sobel\",\"log_threshold\":3}]}",
+               &c));
 }
 
 // The README documents both presets verbatim; they must parse as printed.
@@ -297,6 +322,7 @@ int main(void) {
   RUN_TEST(test_every_effect_name_parses);
   RUN_TEST(test_light_level_defaults_neutral);
   RUN_TEST(test_effect_parameters_round_trip);
+  RUN_TEST(test_log_parameter_validation);
   RUN_TEST(test_readme_tint_presets_parse);
   RUN_TEST(test_unknown_keys_are_hard_errors);
   RUN_TEST(test_malformed_json_is_rejected);

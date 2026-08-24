@@ -115,6 +115,15 @@ EFFECT_FIELDS = {
         ["tint_strength", 0, 255, 180],
     ],
     "sobel": [["sobel_threshold", 0, 255, 0]],
+    # Laplacian of Gaussian, rendered as zero-crossings. log_strength is
+    # capped well below 255 for the same reason blur_strength is: it is
+    # Gaussian passes, so cost is linear while sigma only grows as its
+    # square root -- past a handful of passes you are paying frame time
+    # for smoothing you cannot see.
+    "log": [
+        ["log_strength", 0, 12, 2],
+        ["log_threshold", 0, 255, 20],
+    ],
     # Range capped well below the field's real 0-255 (repeat-count) domain:
     # each unit is a full extra 5-tap pass over the whole frame, and past
     # ~20 the added blur is visually indistinguishable (effective radius

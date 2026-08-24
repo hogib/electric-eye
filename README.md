@@ -188,7 +188,8 @@ sees a half-written file.
 
 `"chain"` is a list of stages **applied in order** — blur-then-sobel differs from
 sobel-then-blur. An empty chain is a valid pass-through. Stages: `none`,
-`grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, `contrast`, `light`.
+`grayscale`, `invert`, `threshold`, `tint`, `sobel`, `blur`, `contrast`, `light`,
+`log`.
 
 | Key | Effect | Range | Meaning |
 |---|---|---|---|
@@ -199,9 +200,17 @@ sobel-then-blur. An empty chain is a valid pass-through. Stages: `none`,
 | `sobel_threshold` | `sobel` | 0–255 | Gradients below this clamp to 0 — suppresses noise edges |
 | `blur_strength` | `blur` | 0–255 | Blur passes. 0 and 1 both mean one pass. Past ~20, cost keeps rising but visible blur barely does |
 | `light_level` | `light` | 0–255 | Brightness *and* saturation together. **Defaults to 128** (neutral); 0 is fully dark |
+| `log_strength` | `log` | 0–255 | Gaussian passes before the Laplacian, so it sets sigma (growing as its square root). 0 and 1 both mean one pass. Higher rejects finer detail — the knob for backscatter |
+| `log_threshold` | `log` | 0–255 | How steep the response must be across a zero-crossing to count as an edge. 0 marks every sign change, noise included |
 
 `contrast` takes no parameters — it is a full-frame auto luma stretch, recomputed
 every frame. A stage carrying a key its effect doesn't use is a hard parse error.
+
+`log` is Laplacian of Gaussian, rendered as Marr–Hildreth zero-crossings: thin,
+closed 1px contours rather than `sobel`'s thicker gradient ridges. Smooth first
+(`log_strength`), then take the second derivative and mark where it crosses zero
+(`log_threshold`). Raise `log_strength` when fine texture is drowning the edges
+you care about; raise `log_threshold` when noise is producing speckle.
 
 Sepia: `{"effect": "tint", "tint_u": 90, "tint_v": 150, "tint_strength": 180}`
 Blue: `{"effect": "tint", "tint_u": 190, "tint_v": 100, "tint_strength": 140}`

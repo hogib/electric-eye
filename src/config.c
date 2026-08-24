@@ -230,6 +230,7 @@ static const char *effect_to_string(EffectType e) {
   case EFFECT_BLUR:      return "blur";
   case EFFECT_CONTRAST:  return "contrast";
   case EFFECT_LIGHT:     return "light";
+  case EFFECT_LOG:       return "log";
   }
   return "?";
 }
@@ -253,6 +254,8 @@ static bool effect_from_string(const char *s, EffectType *out) {
     *out = EFFECT_CONTRAST;
   else if (strcmp(s, "light") == 0)
     *out = EFFECT_LIGHT;
+  else if (strcmp(s, "log") == 0)
+    *out = EFFECT_LOG;
   else
     return false;
   return true;
@@ -272,6 +275,8 @@ enum {
   PARAM_SOBEL_THRESHOLD = 1u << 4,
   PARAM_BLUR_STRENGTH = 1u << 5,
   PARAM_LIGHT_LEVEL = 1u << 6,
+  PARAM_LOG_STRENGTH = 1u << 7,
+  PARAM_LOG_THRESHOLD = 1u << 8,
 };
 
 // Which parameters each effect actually reads. none/grayscale/invert/
@@ -289,6 +294,8 @@ static uint32_t params_for_effect(EffectType effect) {
     return PARAM_BLUR_STRENGTH;
   case EFFECT_LIGHT:
     return PARAM_LIGHT_LEVEL;
+  case EFFECT_LOG:
+    return PARAM_LOG_STRENGTH | PARAM_LOG_THRESHOLD;
   case EFFECT_NONE:
   case EFFECT_GRAYSCALE:
   case EFFECT_INVERT:
@@ -307,6 +314,8 @@ static const char *param_name(uint32_t bit) {
   case PARAM_SOBEL_THRESHOLD: return "sobel_threshold";
   case PARAM_BLUR_STRENGTH:   return "blur_strength";
   case PARAM_LIGHT_LEVEL:     return "light_level";
+  case PARAM_LOG_STRENGTH:    return "log_strength";
+  case PARAM_LOG_THRESHOLD:   return "log_threshold";
   default:                    return "?";
   }
 }
@@ -378,6 +387,12 @@ static bool parse_effect_stage(Cursor *c, EffectStage *out) {
       } else if (strcmp(key, "light_level") == 0) {
         ok = parse_u8(c, &parsed.light_level);
         seen_params |= PARAM_LIGHT_LEVEL;
+      } else if (strcmp(key, "log_strength") == 0) {
+        ok = parse_u8(c, &parsed.log_strength);
+        seen_params |= PARAM_LOG_STRENGTH;
+      } else if (strcmp(key, "log_threshold") == 0) {
+        ok = parse_u8(c, &parsed.log_threshold);
+        seen_params |= PARAM_LOG_THRESHOLD;
       } else {
         printf("Config: unknown key \"%s\" in a chain stage\n", key);
         return false;

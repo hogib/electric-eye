@@ -14,6 +14,7 @@ typedef enum {
   EFFECT_BLUR,
   EFFECT_CONTRAST,
   EFFECT_LIGHT,
+  EFFECT_LOG,
 } EffectType;
 
 // Where frames come from. See rpicam_in.h for why a Pi CSI camera needs a
@@ -61,6 +62,16 @@ typedef struct {
   // Above 128: brighter and more saturated, up to roughly double
   // saturation at 255.
   uint8_t light_level;
+
+  // used when effect == EFFECT_LOG: Gaussian passes before the Laplacian,
+  // so this sets sigma (growing as sqrt(strength)). 0 and 1 both mean a
+  // single pass, same as blur_strength.
+  uint8_t log_strength;
+
+  // used when effect == EFFECT_LOG: how steep the response must be across
+  // a zero-crossing to count as an edge. 0 marks every sign change,
+  // including noise grazing zero in flat regions.
+  uint8_t log_threshold;
 } EffectStage;
 
 // Bounds the chain to a fixed-size array rather than something dynamically
@@ -165,7 +176,8 @@ typedef struct {
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
- * none|grayscale|invert|threshold|tint|sobel|blur|contrast|light, plus that
+ * none|grayscale|invert|threshold|tint|sobel|blur|contrast|light|log, plus
+ * that
  * effect's own parameters where it takes any (threshold_value for
  * threshold; tint_u/tint_v/tint_strength for tint; sobel_threshold for
  * sobel; blur_strength for blur; light_level for light -- all 0-255).

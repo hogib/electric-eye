@@ -601,3 +601,149 @@ void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes
   blur_plane_repeated_auto(src_planes[2], dst_planes[2], chroma_width, height,
                            stride[2], passes);
 }
+
+// --- Laplacian of Gaussian (Marr-Hildreth zero-crossing edges) --------
+//
+// Two stages, in the order the name implies: smooth with a Gaussian, then
+// take the Laplacian (the 2nd derivative). Edges are where that response
+// crosses zero, which is what gives this its characteristic output --
+// thin, closed contours, rather than Sobel's thicker gradient ridges.
+//
+// Sigma comes from repeating the existing 5-tap blur rather than from a
+// wider one-shot LoG kernel. Repeated blur passes compose into a wider
+// effective Gaussian (sigma grows as sqrt(passes)), so this reuses a
+// kernel that is already NEON-accelerated and verified bit-exact against
+// its scalar form, instead of introducing a second, separately-tuned
+// smoothing path that would need all of that again.
+//
+// Why not a single fixed 5x5 LoG kernel: sigma would then be hardcoded,
+// and how much fine detail survives is exactly the knob worth having --
+// underwater, backscatter and suspended particulate are high-frequency
+// noise that a wider sigma rejects.
+
+// The Laplacian is signed and, unlike Sobel's magnitude, its *sign* is the
+// entire point -- a zero-crossing is where neighbouring responses differ
+// in sign. So this keeps int16_t rather than clamping into uint8_t.
+//
+// Range: the 3x3 kernel below has a center weight of -4 and four +1
+// neighbours, so with 0..255 inputs the response spans -1020..1020, which
+// int16_t holds comfortably.
+static int16_t *log_response;
+static size_t log_response_cap;
+static uint8_t *log_blurred;
+static size_t log_blurred_cap;
+
+// 4-neighbour Laplacian ([[0,1,0],[1,-4,1],[0,1,0]]) rather than the
+// 8-neighbour variant: after Gaussian smoothing the two are visually
+// near-identical, and this one needs 4 loads per pixel instead of 8.
+static inline int16_t laplacian4(int32_t up, int32_t left, int32_t center,
+                                 int32_t right, int32_t down) {
+  return (int16_t)(up + left + right + down - 4 * center);
+}
+
+// A zero-crossing between two responses, with a slope test. Comparing
+// signs alone marks a crossing wherever the response merely grazes zero,
+// which in a smooth region is just sensor noise -- so the magnitude of the
+// jump across the crossing has to clear `threshold` too. That difference
+// is the local gradient steepness, which is precisely what distinguishes a
+// real edge from noise wobbling around zero.
+static inline bool crosses_zero(int16_t a, int16_t b, int32_t threshold) {
+  if ((a < 0 && b < 0) || (a > 0 && b > 0))
+    return false;
+  if (a == 0 && b == 0)
+    return false; // a flat zero region is not an edge
+  int32_t jump = (int32_t)a - (int32_t)b;
+  if (jump < 0)
+    jump = -jump;
+  return jump >= threshold;
+}
+
+void log_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
+               uint32_t width, uint32_t height, const size_t stride_arr[3],
+               uint8_t strength, uint8_t threshold) {
+  if (!src_planes[0] || !dst_planes[0])
+    return;
+
+  const size_t stride = stride_arr[0];
+  const size_t pixels = (size_t)width * height;
+
+  if (log_blurred_cap < pixels) {
+    uint8_t *grown = realloc(log_blurred, pixels);
+    if (!grown)
+      return; // leave dst untouched rather than crash, as blur_plane does
+    log_blurred = grown;
+    log_blurred_cap = pixels;
+  }
+  if (log_response_cap < pixels) {
+    int16_t *grown = realloc(log_response, pixels * sizeof *log_response);
+    if (!grown)
+      return;
+    log_response = grown;
+    log_response_cap = pixels;
+  }
+
+  // Stage 1: Gaussian. 0 and 1 both mean a single pass, matching
+  // blur_strength's documented behaviour so the two knobs read the same
+  // way. The blurred plane is tightly packed (width-spaced, no stride
+  // padding) since it never leaves this function.
+  const uint32_t passes = strength == 0 ? 1 : strength;
+  blur_plane_repeated(src_planes[0], log_blurred, width, height, stride,
+                      passes);
+
+  // blur_plane_repeated writes through `stride`, but log_blurred is
+  // allocated tightly packed at width*height. Those agree only when
+  // stride == width, which is how vf_create lays out the luma plane -- but
+  // relying on that silently would corrupt memory the day it stops being
+  // true, so require it explicitly and bail otherwise.
+  if (stride != (size_t)width)
+    return;
+
+  // Stage 2: Laplacian over the blurred plane, into a signed buffer.
+  // Borders replicate rather than zero-pad, for the same reason Sobel's do:
+  // zero-padding manufactures a hard response along the frame edge that
+  // isn't in the scene.
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint32_t y_up = y == 0 ? 0 : y - 1;
+    const uint32_t y_dn = y + 1 >= height ? height - 1 : y + 1;
+    const uint8_t *row_up = log_blurred + (size_t)y_up * width;
+    const uint8_t *row = log_blurred + (size_t)y * width;
+    const uint8_t *row_dn = log_blurred + (size_t)y_dn * width;
+    int16_t *out = log_response + (size_t)y * width;
+
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint32_t x_l = x == 0 ? 0 : x - 1;
+      const uint32_t x_r = x + 1 >= width ? width - 1 : x + 1;
+      out[x] = laplacian4(row_up[x], row[x_l], row[x], row[x_r], row_dn[x]);
+    }
+  }
+
+  // Stage 3: mark zero-crossings. Each pixel is compared against its right
+  // and lower neighbour only -- checking all four would mark both sides of
+  // every crossing, doubling every contour's width and losing the
+  // thin-line property that is the reason to use this operator at all.
+  uint8_t *out_y = dst_planes[0];
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    const int16_t *resp = log_response + (size_t)y * width;
+    const int16_t *resp_dn =
+        log_response + (size_t)(y + 1 >= height ? y : y + 1) * width;
+    uint8_t *out_row = out_y + (size_t)y * stride;
+
+    for (uint32_t x = 0; x < width; ++x) {
+      const int16_t here = resp[x];
+      bool edge = false;
+      if (x + 1 < width)
+        edge = crosses_zero(here, resp[x + 1], threshold);
+      if (!edge && y + 1 < height)
+        edge = crosses_zero(here, resp_dn[x], threshold);
+      out_row[x] = edge ? 255 : 0;
+    }
+  }
+
+  // Same as sobel_edges: the result is a luma-only edge map, so neutralize
+  // chroma rather than carrying through colour that no longer corresponds
+  // to anything in the output.
+  memset(dst_planes[1], 128, stride_arr[1] * height);
+  memset(dst_planes[2], 128, stride_arr[2] * height);
+}
