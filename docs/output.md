@@ -1,0 +1,186 @@
+# Output
+
+Four things happen to a finished frame, all in `consumer_loop`: it goes to the virtual
+camera, and optionally to the recording tap, the preview stream, and the health
+snapshot.
+
+## Virtual camera (`v4l2_out.c`, `virtual_cam.c`)
+
+The primary output. Frames are written to a v4l2loopback device (`/dev/video10` by
+default) that any application can open like a normal webcam.
+
+### Why `write()` and not MMAP
+
+The capture side uses MMAP streaming; the output side deliberately does not. For a
+device that is simply pushing already-formatted frames, `write()` costs one syscall per
+frame and needs no buffer negotiation. On the capture side MMAP genuinely matters,
+because it lets the driver DMA directly into memory we already own.
+
+This was investigated and explicitly rejected as an optimization: v4l2loopback shares
+one buffer between `write()` and its MMAP output path, so MMAP would not have saved a
+copy. Checked against the driver source before writing any code.
+
+**A failed write is fatal to the run.** Unlike a missing camera, a loopback device that
+went away or rejected a frame is not something retrying fixes, so `consumer_loop` stops
+the whole pipeline rather than spinning on a dead device. Recovery is the systemd
+unit's `Restart=`.
+
+### Loading the module
+
+`virtual_cam_ensure_loaded()` runs `modprobe` (via fork/exec, not `system()`, so a
+caller-controlled `card_label` is never shell-interpreted).
+
+Two non-obvious behaviors:
+
+- **`modprobe` succeeding does not mean `/dev/videoN` exists yet.** udev creates the
+  node asynchronously and can lag module insertion by tens of milliseconds. The code
+  polls for the path (up to 2s, 50ms steps) rather than letting that race surface as a
+  confusing `ENOENT` deep inside `v4l2_out_open()`.
+- **Loading a module needs `CAP_SYS_MODULE`**, which a plain user — even one in the
+  `video` group — does not have. `eeye.service` grants exactly that one capability via
+  `AmbientCapabilities` rather than running the whole daemon as root.
+
+If the module was already loaded before this process started, `eeye` leaves its
+parameters alone and will not unload it on exit. It only unloads a module it loaded
+itself, so it cannot pull the device out from under another consumer.
+
+### The Secure Boot diagnostic
+
+A failed `modprobe` is commonly misread as a permissions problem. On Secure Boot
+systems the far more likely cause is that `v4l2loopback-dkms` built and signed the
+module fine, but the signing key was never enrolled — the kernel then refuses to load
+any unenrolled out-of-tree module with **the exact same EPERM** a missing
+`CAP_SYS_MODULE` produces.
+
+Distinguishing them would ideally mean reading dmesg for the lockdown message, but
+`kernel.dmesg_restrict` (the Debian/Ubuntu default) blocks that for anything short of
+root or `CAP_SYSLOG` — exactly the case `eeye.service` runs under. So the code shells
+out to `mokutil`, which reads EFI variables and needs no special capability, and prints
+MOK enrollment guidance instead of "run as root".
+
+## Preview stream (`stream_server.c`)
+
+A deliberately dumb live-preview tap: JPEG-encodes frames and writes each one,
+length-prefixed, to whichever single client is connected over plain TCP.
+
+**Wire format**, repeated per frame: a 4-byte **big-endian** length, then that many
+bytes of one complete JPEG (SOI…EOI). No HTTP, no framing beyond that header — serving
+it to a browser is the other end's problem.
+
+### Things that will catch you
+
+**Single viewer, last connection wins.** A new connection *replaces* the existing
+client. If two things connect (say, the web UI and a diagnostic script), they will kick
+each other off in a reconnect loop that looks exactly like a flaky link. This is a real
+trap — it caused an hour of misdiagnosis once.
+
+**It costs nothing when nobody is watching.** `stream_server_send_frame()` checks for a
+connected client before doing any JPEG work at all, so an unwatched stream is one idle
+listening socket, not a background encode loop. That is why `stream_frame_interval: 0`
+is a safe default.
+
+**A slow viewer gets dropped after 200ms** (`send_timeout_ms`). This is called from the
+same thread that feeds the local virtual camera, so a stuck network peer must never be
+able to stall that for long.
+
+That timeout interacts with frame size in a way worth doing the arithmetic on. At
+100 Mbit/s:
+
+| `stream_quality` | Frame size | Push time | Margin vs 200ms |
+|---|---|---|---|
+| 100 | 391 KB | 32 ms | 6× |
+| 60 | 38 KB | 3.1 ms | 64× |
+
+Quality 100 is the pathological end of JPEG — size explodes for no visible gain over
+~85. Measured on real hardware: dropping 100 → 60 cut bandwidth 10× and took delivered
+rate from unmeasurable to exactly 10.0 fps.
+
+**Dual-stack.** The listening socket is `AF_INET6` with `IPV6_V6ONLY` off, so one fd
+serves both families. This is not cosmetic: on a direct tether the only zero-config
+addressing is IPv6 link-local, and an IPv4-only listener is simply unreachable that
+way. `SO_REUSEADDR` is set so a restart does not fail to rebind during `TIME_WAIT`.
+
+Nagle is disabled — each frame goes out as two `send()` calls (length prefix, then
+body) and Nagle would hold the tiny first packet waiting to coalesce.
+
+### The raw bypass
+
+`stream_raw: true` sends the **untouched** camera frame to the preview instead of the
+processed one, leaving the virtual camera and recording tap on the full chain.
+
+It answers a question you cannot otherwise answer from topside — "is that thing in the
+water real, or is it my filter?" — without dismantling the chain and putting it back.
+
+Implemented by pointer, not by copying: `raw_data` shares the frame's layout exactly, so
+a shallow `VideoFrame` view with the raw planes is all `stream_server` needs, and it
+costs nothing per frame.
+
+## Recording tap
+
+`record_path` writes the **untouched** camera frame — `raw_data`, independent of the
+effect chain — as raw I422 with no container, frames back to back.
+
+### Size, and why this matters more than it looks
+
+~53 MB/s, ~190 GB/hour at 1280×720. On a real dive this filled a Pi's disk in about
+eight minutes and took the whole machine down. `downscale` applies (it happens during
+capture decode, upstream of this tap), so `downscale: 2` quarters that.
+
+`eeye` reports free space and estimated recording time when a recording starts:
+
+```
+Recording: 41000 MB free at /data/dive.raw (~780 seconds at this geometry)
+```
+
+Play back with the *output* dimensions, i.e. `capture / downscale`:
+
+```sh
+ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE
+```
+
+**`~` is not expanded.** The path goes to `fopen()` with no shell involved, so
+`~/out.raw` tries to create a directory literally named `~`. Use absolute paths.
+
+For anything longer than a short clip, `tools/eeye-record` topside writes H.264 at
+~1.2 GB/hour instead — see [topside.md](topside.md).
+
+### Failure handling
+
+A write failure (almost always a full disk) stops the recording, clears the path so it
+is not retried on every frame, and — importantly — sets the health state to
+`RECORDING_FAILED` with the reason. Without that last part the operator has no way to
+know: the UI still shows the path they typed.
+
+## Health reporting (`health.c`)
+
+`eeye` republishes `<config_path>.health` every second, carrying what only the drone
+knows.
+
+```json
+{
+  "recording": {"state": "active", "path": "/data/dive.raw", "error": "",
+                "bytes": 24166195200, "disk_free_bytes": 27641176064},
+  "camera": {"connected": true, "frames": 13110},
+  "geometry": {"width": 1280, "height": 720}
+}
+```
+
+`state` is one of `off`, `active`, `failed`.
+
+**Why this exists:** when a disk fills mid-dive, `consumer_loop` stops recording and
+clears its path — but the operator's UI still shows the path they typed, so they carry
+on believing they are recording and only discover the gap after surfacing.
+
+Same writer contract as the config status file: **write a temp file in the same
+directory, then `rename()`**, so a reader can never observe it half-written.
+
+Paths are JSON-escaped — a path may legally contain a quote or a backslash, and one
+unescaped byte would make the whole file unparseable to the reader that needs it most.
+
+Best-effort throughout: a failure to write is silent and never fatal. Health reporting
+must not be able to take down the pipeline it reports on.
+
+**`config_agent.py` attaches the file's age** when relaying it, because a health file
+that stopped being updated means `eeye` is wedged or gone — which looks perfectly
+healthy if you only read the contents. Confirmed in testing: after killing `eeye` the
+relayed snapshot still said camera connected, frames frozen.

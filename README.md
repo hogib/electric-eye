@@ -561,7 +561,13 @@ fine on a shared network.
 ```sh
 meson setup builddir       # once, or after meson.build changes
 meson compile -C builddir
+meson test -C builddir     # 12 suites
 ```
+
+**[`docs/`](docs/) has the internal documentation** — architecture, both capture
+backends, the effect chain, the config system, the topside tooling, and recipes for
+adding an operator or a config key. Start at [docs/README.md](docs/README.md), or go
+straight to [docs/extending.md](docs/extending.md) if you are here to change one thing.
 
 `src/` is a flat set of translation units: capture (`v4l2_in`, `rpicam_in`, shared
 MJPEG decode in `jpeg_decode`), output (`v4l2_out`), preview tap (`stream_server`),
