@@ -647,6 +647,39 @@ static inline int16_t laplacian4(int32_t up, int32_t left, int32_t center,
 // jump across the crossing has to clear `threshold` too. That difference
 // is the local gradient steepness, which is precisely what distinguishes a
 // real edge from noise wobbling around zero.
+#if defined(GS_NEON_AARCH64)
+// 8-lane Laplacian: same kernel and the same operand order as
+// laplacian4() below, on pre-widened 16-bit halves. Inputs are 0..255 and
+// the result spans -1020..1020, so int16 has room with no saturation --
+// which is what makes this bit-exact with the scalar version rather than
+// merely close.
+static inline int16x8_t laplacian4_half8(uint16x8_t up, uint16x8_t left,
+                                         uint16x8_t center, uint16x8_t right,
+                                         uint16x8_t down) {
+  uint16x8_t sum = vaddq_u16(vaddq_u16(up, down), vaddq_u16(left, right));
+  // Reinterpreting before the subtract is what lets the result go
+  // negative correctly; both operands are well inside int16's range.
+  int16x8_t acc = vreinterpretq_s16_u16(sum);
+  return vmlsq_n_s16(acc, vreinterpretq_s16_u16(center), 4);
+}
+
+// 8-lane crosses_zero(): returns an all-ones mask per lane where a real
+// crossing was found. Mirrors the scalar predicate exactly, including its
+// two rejections -- matching signs, and a flat pair of zeros.
+static inline uint16x8_t crosses_zero8(int16x8_t a, int16x8_t b,
+                                       int16x8_t threshold) {
+  const int16x8_t zero = vdupq_n_s16(0);
+  uint16x8_t both_neg = vandq_u16(vcltq_s16(a, zero), vcltq_s16(b, zero));
+  uint16x8_t both_pos = vandq_u16(vcgtq_s16(a, zero), vcgtq_s16(b, zero));
+  uint16x8_t both_zero = vandq_u16(vceqq_s16(a, zero), vceqq_s16(b, zero));
+  uint16x8_t reject = vorrq_u16(vorrq_u16(both_neg, both_pos), both_zero);
+  // The slope test: |a - b| is the gradient steepness across the
+  // crossing, which is what separates a real edge from noise grazing zero.
+  uint16x8_t steep = vcgeq_s16(vabdq_s16(a, b), threshold);
+  return vbicq_u16(steep, reject); // steep AND NOT reject
+}
+#endif // GS_NEON_AARCH64
+
 static inline bool crosses_zero(int16_t a, int16_t b, int32_t threshold) {
   if ((a < 0 && b < 0) || (a > 0 && b > 0))
     return false;
@@ -711,7 +744,36 @@ void log_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
     const uint8_t *row_dn = log_blurred + (size_t)y_dn * width;
     int16_t *out = log_response + (size_t)y * width;
 
-    for (uint32_t x = 0; x < width; ++x) {
+    uint32_t x = 0;
+#if defined(GS_NEON_AARCH64)
+    // x == 0 needs the left-edge clamp, so it is left to the scalar
+    // formula below rather than folded into a vector chunk.
+    for (; x < 1 && x < width; ++x) {
+      const uint32_t x_l = x == 0 ? 0 : x - 1;
+      const uint32_t x_r = x + 1 >= width ? width - 1 : x + 1;
+      out[x] = laplacian4(row_up[x], row[x_l], row[x], row[x_r], row_dn[x]);
+    }
+    // A chunk starting at x covers columns [x, x+15]; the rightmost lane
+    // also needs its +1 neighbour, so the last byte read is at x+16.
+    for (; x + 16 < width; x += 16) {
+      const uint8x16_t up = vld1q_u8(&row_up[x]);
+      const uint8x16_t dn = vld1q_u8(&row_dn[x]);
+      const uint8x16_t l = vld1q_u8(&row[x - 1]);
+      const uint8x16_t c = vld1q_u8(&row[x]);
+      const uint8x16_t r = vld1q_u8(&row[x + 1]);
+      vst1q_s16(&out[x], laplacian4_half8(vmovl_u8(vget_low_u8(up)),
+                                          vmovl_u8(vget_low_u8(l)),
+                                          vmovl_u8(vget_low_u8(c)),
+                                          vmovl_u8(vget_low_u8(r)),
+                                          vmovl_u8(vget_low_u8(dn))));
+      vst1q_s16(&out[x + 8], laplacian4_half8(vmovl_u8(vget_high_u8(up)),
+                                              vmovl_u8(vget_high_u8(l)),
+                                              vmovl_u8(vget_high_u8(c)),
+                                              vmovl_u8(vget_high_u8(r)),
+                                              vmovl_u8(vget_high_u8(dn))));
+    }
+#endif
+    for (; x < width; ++x) {
       const uint32_t x_l = x == 0 ? 0 : x - 1;
       const uint32_t x_r = x + 1 >= width ? width - 1 : x + 1;
       out[x] = laplacian4(row_up[x], row[x_l], row[x], row[x_r], row_dn[x]);
@@ -730,7 +792,27 @@ void log_edges(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
         log_response + (size_t)(y + 1 >= height ? y : y + 1) * width;
     uint8_t *out_row = out_y + (size_t)y * stride;
 
-    for (uint32_t x = 0; x < width; ++x) {
+    uint32_t x = 0;
+#if defined(GS_NEON_AARCH64)
+    const int16x8_t thr = vdupq_n_s16((int16_t)threshold);
+    // Stops 16 short of the end so the rightmost lane's +1 neighbour is
+    // always in bounds; the tail below handles the final column, where
+    // there is no right neighbour to compare against.
+    for (; x + 16 < width; x += 16) {
+      uint8x8_t part[2];
+      for (int half = 0; half < 2; ++half) {
+        const uint32_t xo = x + (uint32_t)half * 8;
+        const int16x8_t here = vld1q_s16(&resp[xo]);
+        const uint16x8_t cr = crosses_zero8(here, vld1q_s16(&resp[xo + 1]), thr);
+        const uint16x8_t cd = crosses_zero8(here, vld1q_s16(&resp_dn[xo]), thr);
+        // Either direction marks the pixel, matching the scalar's
+        // short-circuit || (which only skips work, never changes result).
+        part[half] = vmovn_u16(vorrq_u16(cr, cd));
+      }
+      vst1q_u8(&out_row[x], vcombine_u8(part[0], part[1]));
+    }
+#endif
+    for (; x < width; ++x) {
       const int16_t here = resp[x];
       bool edge = false;
       if (x + 1 < width)
@@ -787,6 +869,54 @@ typedef enum {
   CANNY_DIR_VERTICAL = 2,   // -> compare N/S
   CANNY_DIR_DIAG_NWSE = 3,  // -> compare NW/SE
 } CannyDir;
+
+#if defined(GS_NEON_AARCH64)
+// 8-lane gradient: magnitude (L1, clamped to 255) and quantized direction
+// in one pass over a pre-widened 16-bit half.
+//
+// gx and gy each span +-1020 and their L1 sum +-2040, both well inside
+// int16, so nothing saturates before the deliberate clamp -- which is
+// what keeps this bit-exact with the scalar version.
+//
+// The direction test is the same integer comparison the scalar uses
+// (|gy|*10 against |gx|*4 and |gx|*24, the integer form of tan(22.5) and
+// tan(67.5)). |gy|*24 reaches 24480, still inside int16.
+static inline void canny_gradient8(uint16x8_t a_l, uint16x8_t a_c,
+                                   uint16x8_t a_r, uint16x8_t r_l,
+                                   uint16x8_t r_r, uint16x8_t b_l,
+                                   uint16x8_t b_c, uint16x8_t b_r,
+                                   int16x8_t *mag_out, uint16x8_t *dir_out) {
+  uint16x8_t right = vaddq_u16(vmlaq_n_u16(vaddq_u16(a_r, b_r), r_r, 2),
+                               vdupq_n_u16(0));
+  uint16x8_t left = vmlaq_n_u16(vaddq_u16(a_l, b_l), r_l, 2);
+  int16x8_t gx = vsubq_s16(vreinterpretq_s16_u16(right),
+                           vreinterpretq_s16_u16(left));
+
+  uint16x8_t down = vmlaq_n_u16(vaddq_u16(b_l, b_r), b_c, 2);
+  uint16x8_t up = vmlaq_n_u16(vaddq_u16(a_l, a_r), a_c, 2);
+  int16x8_t gy = vsubq_s16(vreinterpretq_s16_u16(down),
+                           vreinterpretq_s16_u16(up));
+
+  int16x8_t ax = vabsq_s16(gx), ay = vabsq_s16(gy);
+  int16x8_t l1 = vaddq_s16(ax, ay);
+  *mag_out = vminq_s16(l1, vdupq_n_s16(255));
+
+  // Sector selection, branchless. Horizontal (0) when |gy|*10 < |gx|*4,
+  // vertical (2) when |gy|*10 > |gx|*24, else a diagonal chosen by
+  // whether gx and gy agree in sign: 1 when they do, 3 when they differ.
+  int16x8_t ay10 = vmulq_n_s16(ay, 10);
+  uint16x8_t is_h = vcltq_s16(ay10, vmulq_n_s16(ax, 4));
+  uint16x8_t is_v = vcgtq_s16(ay10, vmulq_n_s16(ax, 24));
+  const int16x8_t zero = vdupq_n_s16(0);
+  // Scalar uses (gx > 0) == (gy > 0); replicate that exactly, including
+  // how zero compares.
+  uint16x8_t agree = vceqq_u16(vcgtq_s16(gx, zero), vcgtq_s16(gy, zero));
+  uint16x8_t diag = vbslq_u16(agree, vdupq_n_u16(1), vdupq_n_u16(3));
+  uint16x8_t dir = vbslq_u16(is_h, vdupq_n_u16(0),
+                             vbslq_u16(is_v, vdupq_n_u16(2), diag));
+  *dir_out = dir;
+}
+#endif // GS_NEON_AARCH64
 
 static inline uint8_t quantize_direction(int32_t gx, int32_t gy) {
   int32_t ax = gx < 0 ? -gx : gx;
@@ -874,7 +1004,35 @@ void canny_edges(const uint8_t *const src_planes[3],
     const uint8_t *above = canny_blurred + (size_t)(y - 1) * width;
     const uint8_t *row = canny_blurred + (size_t)y * width;
     const uint8_t *below = canny_blurred + (size_t)(y + 1) * width;
-    for (uint32_t x = 1; x + 1 < width; ++x) {
+    uint32_t x = 1;
+#if defined(GS_NEON_AARCH64)
+    // A chunk starting at x covers [x, x+15] and its rightmost lane needs
+    // the +1 neighbour, so the last byte read is x+16.
+    for (; x + 16 < width; x += 16) {
+      const uint8x16_t al = vld1q_u8(&above[x - 1]), ac = vld1q_u8(&above[x]),
+                       ar = vld1q_u8(&above[x + 1]);
+      const uint8x16_t rl = vld1q_u8(&row[x - 1]), rr = vld1q_u8(&row[x + 1]);
+      const uint8x16_t bl = vld1q_u8(&below[x - 1]), bc = vld1q_u8(&below[x]),
+                       br = vld1q_u8(&below[x + 1]);
+      int16x8_t m0, m1;
+      uint16x8_t d0, d1;
+      canny_gradient8(vmovl_u8(vget_low_u8(al)), vmovl_u8(vget_low_u8(ac)),
+                      vmovl_u8(vget_low_u8(ar)), vmovl_u8(vget_low_u8(rl)),
+                      vmovl_u8(vget_low_u8(rr)), vmovl_u8(vget_low_u8(bl)),
+                      vmovl_u8(vget_low_u8(bc)), vmovl_u8(vget_low_u8(br)),
+                      &m0, &d0);
+      canny_gradient8(vmovl_u8(vget_high_u8(al)), vmovl_u8(vget_high_u8(ac)),
+                      vmovl_u8(vget_high_u8(ar)), vmovl_u8(vget_high_u8(rl)),
+                      vmovl_u8(vget_high_u8(rr)), vmovl_u8(vget_high_u8(bl)),
+                      vmovl_u8(vget_high_u8(bc)), vmovl_u8(vget_high_u8(br)),
+                      &m1, &d1);
+      vst1q_u8(&canny_mag[(size_t)y * width + x],
+               vcombine_u8(vqmovun_s16(m0), vqmovun_s16(m1)));
+      vst1q_u8(&canny_dir[(size_t)y * width + x],
+               vcombine_u8(vmovn_u16(d0), vmovn_u16(d1)));
+    }
+#endif
+    for (; x + 1 < width; ++x) {
       // Same Sobel kernels as sobel_magnitude, and the same L1 norm.
       int32_t gx = (above[x + 1] + 2 * row[x + 1] + below[x + 1]) -
                    (above[x - 1] + 2 * row[x - 1] + below[x - 1]);
