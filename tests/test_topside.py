@@ -6,6 +6,7 @@ The staleness logic is what stands between a pilot and flying on a frozen
 picture, so it is tested directly rather than by eyeballing the overlay.
 Standard library only, like the scripts it tests.
 """
+import http.server
 import json
 import os
 import socket
@@ -185,8 +186,7 @@ class TestAgentHealthRelay(unittest.TestCase):
                 ("::1", 0), config_agent.make_handler(self.config_path)
             )
         else:
-            import http.server
-            self.server = http.server.ThreadingHTTPServer(
+                        self.server = http.server.ThreadingHTTPServer(
                 ("127.0.0.1", 0), config_agent.make_handler(self.config_path)
             )
         self.port = self.server.server_address[1]
@@ -330,6 +330,101 @@ class TestRecorder(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("missing", detail)
         self.assertFalse(r.status()["available"])
+
+
+class TestPageEncodingAndLayout(unittest.TestCase):
+    """The control page itself.
+
+    The bug these exist for: the page was served as "text/html" with no
+    charset and carried no <meta charset>, so browsers fell back to a
+    single-byte encoding and every non-ASCII character rendered as
+    mojibake -- the Record button read "a- Record". It is invisible from
+    the server side (the bytes were always correct UTF-8) and only shows
+    up by looking at the page, so it is worth pinning.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+        class DummySource:
+            """Serving "/" never touches the frame source; it only needs
+            to exist so make_handler can close over it."""
+            def health(self):
+                return {"connected": False, "age_s": None, "frames": 0,
+                        "have_frame": False}
+            def latest_frame(self):
+                return None
+
+        recorder = web_ui.Recorder(None, 8080, self.dir)
+        handler = web_ui.make_handler(DummySource(), "127.0.0.1", 9001,
+                                      recorder, self.dir)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get_index(self):
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/", timeout=5) as r:
+            return r.headers.get("Content-Type", ""), r.read()
+
+    def test_content_type_declares_utf8(self):
+        content_type, _ = self.get_index()
+        self.assertIn("charset=utf-8", content_type.lower())
+
+    def test_page_declares_charset_in_html_too(self):
+        # Covers a page saved to disk, where the header is gone.
+        _, body = self.get_index()
+        self.assertIn(b'<meta charset="utf-8">', body)
+
+    def test_non_ascii_characters_survive_the_round_trip(self):
+        """The bytes must be UTF-8 and carry the intended characters.
+
+        Note this alone would NOT have caught the reported bug: the server
+        always sent correct UTF-8: it simply never said so, and the
+        browser guessed wrong. The two tests above are the ones that pin
+        the declaration. This one guards the other half -- a future change
+        that encodes the page as something else entirely.
+        """
+        _, body = self.get_index()
+        text = body.decode("utf-8")  # raises if the bytes are not UTF-8
+        self.assertIn("\u2014", text)  # em dash, used throughout the copy
+        self.assertIn("\u00b5s", text)  # the exposure label's micro sign
+        # And the mojibake that the old encoding produced must not appear.
+        self.assertNotIn("\u00e2\u20ac\u201d", text)  # em dash read as cp1252
+
+    def test_capture_buttons_carry_no_font_dependent_glyphs(self):
+        """Record/Snapshot draw their icons in CSS.
+
+        A glyph like U+25CF renders as a tofu box wherever no installed
+        font covers it -- seen while previewing this layout -- so the
+        buttons must not depend on one.
+        """
+        _, body = self.get_index()
+        text = body.decode("utf-8")
+        for glyph in ("\u25cf", "\u25c9", "\u25a0", "\u2715"):
+            self.assertNotIn(glyph, text,
+                             f"U+{ord(glyph):04X} is font-dependent")
+        # The classes are composed at runtime by setButtonLabel, so what
+        # the static page carries is the CSS that draws them.
+        self.assertIn(".ico.dot", text)
+        self.assertIn(".ico.ring", text)
+        self.assertIn("setButtonLabel", text)
+
+    def test_two_column_layout_is_present(self):
+        """The video and the panel must be siblings inside the layout
+        wrapper -- that is what keeps the picture on screen while the
+        controls scroll."""
+        _, body = self.get_index()
+        text = body.decode("utf-8")
+        self.assertIn('<div id="layout">', text)
+        self.assertLess(text.index('id="videowrap"'), text.index('id="panel"'),
+                        "video should come before the panel (left column)")
+        # The panel scrolls on its own; the body must not.
+        self.assertIn("overflow-y: auto", text)
 
 
 class TestAgentBaseUrl(unittest.TestCase):

@@ -334,21 +334,66 @@ EFFECT_FIELDS = {
 INDEX_HTML_TEMPLATE = """<!doctype html>
 <html>
 <head>
+<meta charset="utf-8">
 <title>Electric Eye - Control</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #111; color: #eee; }
-  #video { width: 100%; max-height: 60vh; object-fit: contain; background: #000; display: block; }
-  #panel { padding: 12px 16px 32px; max-width: 640px; margin: 0 auto; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #111;
+         color: #eee; overflow: hidden; }
+
+  /* Two columns: picture left, controls right, each scrolling
+     independently. Reaching a slider must never push the camera
+     off-screen -- adjusting an exposure or a threshold is precisely when
+     you need to see what it did. */
+  #layout { display: flex; height: 100%; align-items: stretch; }
+  #videowrap {
+    position: relative; /* the banner below is positioned against this */
+    flex: 1 1 auto;
+    /* Without min-width:0 a flex item will not shrink below its content's
+       intrinsic size, so a 1280-wide frame shoves the panel off the right
+       edge instead of letterboxing. */
+    min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #000; overflow: hidden;
+  }
+  #video { max-width: 100%; max-height: 100%; width: auto; height: auto;
+           object-fit: contain; background: #000; display: block; }
+  #panel {
+    /* Wide enough for a stage row, capped so the picture keeps most of a
+       large screen. */
+    flex: 0 0 clamp(340px, 28vw, 460px);
+    height: 100%; overflow-y: auto; overscroll-behavior: contain;
+    padding: 12px 16px 32px; box-sizing: border-box;
+    background: #161616; border-left: 1px solid #2b2b2b;
+  }
+  #panel h2:first-child { margin-top: 4px; }
+
+  /* Too narrow for two columns (phone, tablet portrait): stack them, but
+     pin the video to the top so it stays visible while the controls
+     scroll under it -- same goal, reached differently. */
+  @media (max-width: 860px) {
+    body { overflow: auto; }
+    #layout { flex-direction: column; height: auto; }
+    #videowrap { flex: none; position: sticky; top: 0; z-index: 3; }
+    #video { max-height: 45vh; }
+    #panel { flex: none; height: auto; overflow: visible;
+             border-left: none; border-top: 1px solid #2b2b2b; }
+  }
   h2 { font-size: 15px; margin: 20px 0 8px; color: #9cf; }
   .stage { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
            background: #1c1c1c; border-radius: 6px; padding: 8px; margin-bottom: 6px; }
   .stage select { font-size: 14px; }
-  .stage label { font-size: 12px; color: #aaa; margin-left: 6px; }
-  .stage input[type=range] { width: 90px; vertical-align: middle; margin: 0 4px; }
+  .stage .fields { display: flex; flex-wrap: wrap; align-items: center;
+                   gap: 4px 12px; }
+  .stage label { display: inline-flex; align-items: center; gap: 5px;
+                 white-space: nowrap; font-size: 12px; color: #aaa; }
+  .stage input[type=range] { width: 90px; vertical-align: middle; margin: 0; }
   .stage .val { display: inline-block; min-width: 26px; text-align: right;
                 font-variant-numeric: tabular-nums; color: #ddd; }
   .stage .spacer { flex: 1; }
+  .stage .rowbtns { display: inline-flex; gap: 4px; flex: none; }
+  .stage .rowbtns button { min-width: 28px; }
   .rgb-row { display: inline-flex; align-items: center; gap: 2px; }
   .rgb-row span.chan { color: #aaa; font-size: 12px; }
   .rgb-row input[type=range] { width: 70px; }
@@ -366,7 +411,6 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
   /* Link/recording state, drawn over the video rather than beside it.
      A pilot watches the picture, not the sidebar -- a warning they have
      to look away to notice is a warning they will miss. */
-  #videowrap { position: relative; display: block; }
   #banner {
     position: absolute; top: 0; left: 0; right: 0;
     padding: 10px 14px; font-weight: bold; font-size: 15px;
@@ -403,6 +447,12 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
      across a deck without reading the label. */
   #btn-record.on { animation: recpulse 1.4s ease-in-out infinite; }
   @keyframes recpulse { 50% { background: #7a1616; } }
+  .ico { display: inline-block; vertical-align: middle; margin-right: 8px;
+         flex: none; }
+  .ico.dot { width: 11px; height: 11px; border-radius: 50%; background: #e6444c; }
+  .ico.ring { width: 11px; height: 11px; border-radius: 50%;
+              border: 2px solid #ccd3da; box-sizing: border-box; }
+  .ico.square { width: 10px; height: 10px; border-radius: 2px; background: #fff; }
   #capturemsg { font-size: 13px; min-height: 18px; margin-bottom: 4px; }
   #capturemsg.err { color: #f88; }
   #capturemsg.ok { color: #6f6; }
@@ -420,6 +470,7 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 </style>
 </head>
 <body>
+  <div id="layout">
   <div id="videowrap">
     <img id="video" src="/stream">
     <div id="banner"></div>
@@ -431,8 +482,8 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 
     <h2>Capture</h2>
     <div id="capture">
-      <button id="btn-record" type="button">● Record</button>
-      <button id="btn-snap" type="button">◉ Snapshot</button>
+      <button id="btn-record" type="button"></button>
+      <button id="btn-snap" type="button"></button>
     </div>
     <div id="capturemsg"></div>
     <label class="field">
@@ -516,6 +567,7 @@ INDEX_HTML_TEMPLATE = """<!doctype html>
 
     <button id="apply" type="button">Apply</button>
     <div id="status"></div>
+  </div>
   </div>
 
 <script>
@@ -634,13 +686,18 @@ function addStage(stage) {
                          if (next) stagesEl.insertBefore(next, row); };
 
   const remove = document.createElement("button");
-  remove.type = "button"; remove.textContent = "\\u2715";
+  remove.type = "button"; remove.textContent = "\\u00d7";
+  remove.title = "Remove this stage";
   remove.onclick = () => row.remove();
 
   const spacer = document.createElement("span");
   spacer.className = "spacer";
 
-  row.append(select, fields, spacer, up, down, remove);
+  const rowbtns = document.createElement("span");
+  rowbtns.className = "rowbtns";
+  rowbtns.append(up, down, remove);
+
+  row.append(select, fields, spacer, rowbtns);
   stagesEl.appendChild(row);
 }
 
@@ -868,9 +925,19 @@ for (const name of CAM_TOGGLES) {
 }
 
 // --- Capture controls ------------------------------------------------
+function setButtonLabel(btn, iconClass, text) {
+  btn.textContent = "";
+  const icon = document.createElement("i");
+  icon.className = "ico " + iconClass;
+  btn.appendChild(icon);
+  btn.appendChild(document.createTextNode(text));
+}
+
 const btnRecord = document.getElementById("btn-record");
 const btnSnap = document.getElementById("btn-snap");
 const captureMsg = document.getElementById("capturemsg");
+setButtonLabel(document.getElementById("btn-record"), "dot", "Record");
+setButtonLabel(document.getElementById("btn-snap"), "ring", "Snapshot");
 const recQuality = document.getElementById("rec_quality");
 // Tracked so the poll can restyle the button without fighting a click
 // that is still in flight -- the server is the authority on whether a
@@ -946,11 +1013,11 @@ function renderRecorder(rec) {
     const mins = Math.floor((rec.elapsed_s || 0) / 60);
     const secs = Math.floor((rec.elapsed_s || 0) % 60);
     const clock = `${mins}:${String(secs).padStart(2, "0")}`;
-    let label = `■ Stop  ${clock}`;
+    let label = `Stop  ${clock}`;
     if (rec.bytes) label += `  ${(rec.bytes / 1e6).toFixed(0)} MB`;
-    btnRecord.textContent = label;
+    setButtonLabel(btnRecord, "square", label);
   } else {
-    btnRecord.textContent = "● Record";
+    setButtonLabel(btnRecord, "dot", "Record");
     // A recorder that died on its own has to say so -- otherwise the
     // button just quietly un-latches and the dive goes unrecorded.
     if (rec.error && !recordBusy) setCaptureMsg(rec.error, "err");
@@ -1123,6 +1190,10 @@ def make_handler(source, agent_host, agent_port, recorder, snapshot_dir):
 
         def _respond(self, status, content_type, body, extra_headers=None):
             self.send_response(status)
+            # JSON is UTF-8 by definition (RFC 8259) and needs no
+            # parameter; text/* has no such default and must say so.
+            if content_type.startswith("text/") and "charset" not in content_type:
+                content_type += "; charset=utf-8"
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             for key, value in (extra_headers or {}).items():
