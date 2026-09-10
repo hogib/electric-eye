@@ -26,6 +26,8 @@ typedef struct {
   // is unused by the rpicam backend, which has no device path -- it talks
   // to a child process.
   CaptureSource capture_source;
+  // Which V4L2 pixel format to demand; ignored by the rpicam backend.
+  CaptureFormat capture_format;
   atomic_bool *is_running;
   // Camera controls are hot-reloadable, so the producer needs the live
   // config too -- it is the only thread that holds the camera device.

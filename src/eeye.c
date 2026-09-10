@@ -222,13 +222,15 @@ int main(int argc, char **argv) {
   // nothing to negotiate.
   if (capture_source == CAPTURE_V4L2) {
     v4l2_in_negotiate_size(prod_args.filename, &capture_width, &capture_height,
-                           startup_config.downscale);
+                           startup_config.downscale,
+                           startup_config.capture_format);
   }
 
   uint32_t out_width = capture_width / startup_config.downscale;
   uint32_t out_height = capture_height / startup_config.downscale;
 
   prod_args.capture_source = capture_source;
+  prod_args.capture_format = startup_config.capture_format;
   prod_args.capture_width = capture_width;
   prod_args.capture_height = capture_height;
   prod_args.downscale = startup_config.downscale;

@@ -364,6 +364,30 @@ static void test_geometry_divisibility_rule(void) {
   }
 }
 
+// capture_format decides whether every frame pays for a JPEG decode, so a
+// typo silently costing that is worth refusing outright.
+static void test_capture_format_values(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_AUTO); // default preserves old behaviour
+  CHECK(parse("{\"capture_format\":\"auto\"}", &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_AUTO);
+  CHECK(parse("{\"capture_format\":\"mjpeg\"}", &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_MJPEG);
+  CHECK(parse("{\"capture_format\":\"yuyv\"}", &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_YUYV);
+  CHECK(!parse("{\"capture_format\":\"YUYV\"}", &c)); // case-sensitive
+  CHECK(!parse("{\"capture_format\":\"mjpg\"}", &c)); // the v4l2 fourcc, not our name
+  CHECK(!parse("{\"capture_format\":\"h264\"}", &c));
+  CHECK(!parse("{\"capture_format\":1}", &c));          // not a string
+  // Coexists with the other startup-only keys.
+  CHECK(parse("{\"capture_source\":\"v4l2\",\"capture_format\":\"yuyv\","
+              "\"capture_width\":640,\"capture_height\":480,\"downscale\":2}",
+              &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_YUYV);
+  CHECK_EQ_INT(c.capture_source, CAPTURE_V4L2);
+}
+
 static void test_capture_source_values(void) {
   Config c;
   CHECK(parse("{\"capture_source\":\"auto\"}", &c));
@@ -469,6 +493,7 @@ int main(void) {
   RUN_TEST(test_downscale_restricted_to_powers);
   RUN_TEST(test_geometry_divisibility_rule);
   RUN_TEST(test_capture_source_values);
+  RUN_TEST(test_capture_format_values);
   RUN_TEST(test_record_path_round_trips);
   RUN_TEST(test_oversized_inputs_rejected);
   RUN_TEST(test_max_chain_length_accepted);

@@ -458,7 +458,8 @@ static void enumerate_sizes(int fd, uint32_t fourcc, SizeChoice *best,
 }
 
 bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
-                            uint32_t *height, uint32_t downscale) {
+                            uint32_t *height, uint32_t downscale,
+                            CaptureFormat want_format) {
   if (downscale == 0)
     downscale = 1;
 
@@ -472,8 +473,13 @@ bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
   }
 
   SizeChoice best = {0};
-  enumerate_sizes(fd, V4L2_PIX_FMT_MJPEG, &best, *width, *height, downscale);
-  enumerate_sizes(fd, V4L2_PIX_FMT_YUYV, &best, *width, *height, downscale);
+  // Only enumerate formats this run is willing to open. Considering a
+  // format that v4l2_in_open will then refuse could substitute a size
+  // only that format offers, and every open would fail on it.
+  if (want_format != FORMAT_YUYV)
+    enumerate_sizes(fd, V4L2_PIX_FMT_MJPEG, &best, *width, *height, downscale);
+  if (want_format != FORMAT_MJPEG)
+    enumerate_sizes(fd, V4L2_PIX_FMT_YUYV, &best, *width, *height, downscale);
   close(fd);
 
   if (!best.found) {
@@ -501,7 +507,8 @@ bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
 }
 
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
-                     uint32_t framerate_hint, uint32_t downscale) {
+                     uint32_t framerate_hint, uint32_t downscale,
+                     CaptureFormat want_format) {
   int fd = open(path, O_RDWR | O_NONBLOCK);
   if (fd < 0) {
     switch (errno) {
@@ -546,31 +553,59 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
 
-  // MJPEG first: at USB2's ~24.6 MB/s isochronous ceiling, most webcams
-  // only offer higher resolutions/framerates through it, reserving raw
-  // YUYV for lower modes (see the framerate/bandwidth discussion this
-  // capture path was designed around). YUYV needs no decode at all, so
-  // it's still preferred over MJPEG at whatever resolution both are
-  // actually available -- try_set_format's exact-match requirement means
-  // this only ever falls through to YUYV when MJPEG genuinely isn't
-  // offered at this resolution, not as a blanket preference.
+  // FORMAT_AUTO tries MJPEG first: at USB2's ~24.6 MB/s isochronous
+  // ceiling, most webcams only offer higher resolutions/framerates
+  // through it, reserving raw YUYV for lower modes. That is the right
+  // default for the cameras most people have.
+  //
+  // It is NOT the right choice on a camera bought for YUYV, which needs
+  // no decode at all -- and since try_set_format demands an exact match,
+  // AUTO would silently take MJPEG whenever both are offered at the
+  // requested size, quietly discarding the reason for buying that camera.
+  // Hence the explicit settings, which are strict: asking for a format
+  // and being given the other one defeats the point of asking.
   struct v4l2_format fmt;
   uint32_t capture_format;
 
-  if (try_set_format(fd, V4L2_PIX_FMT_MJPEG, width, height, &fmt)) {
+  const bool try_mjpeg = (want_format != FORMAT_YUYV);
+  const bool try_yuyv = (want_format != FORMAT_MJPEG);
+
+  if (try_mjpeg && try_set_format(fd, V4L2_PIX_FMT_MJPEG, width, height,
+                                  &fmt)) {
     capture_format = V4L2_PIX_FMT_MJPEG;
-  } else if (try_set_format(fd, V4L2_PIX_FMT_YUYV, width, height, &fmt)) {
+  } else if (try_yuyv && try_set_format(fd, V4L2_PIX_FMT_YUYV, width, height,
+                                        &fmt)) {
     capture_format = V4L2_PIX_FMT_YUYV;
-    printf("%s: MJPEG not available at exactly %ux%u; falling back to "
-           "YUYV\n",
-           path, width, height);
+    if (want_format == FORMAT_AUTO) {
+      printf("%s: MJPEG not available at exactly %ux%u; falling back to "
+             "YUYV\n",
+             path, width, height);
+    }
   } else {
     // try_set_format() already logged why each attempt failed.
-    printf("%s: neither MJPEG nor YUYV is available at exactly %ux%u\n",
-           path, width, height);
+    const char *wanted = want_format == FORMAT_MJPEG   ? "MJPEG"
+                         : want_format == FORMAT_YUYV  ? "YUYV"
+                                                       : "MJPEG or YUYV";
+    printf("%s: %s is not available at exactly %ux%u%s\n", path, wanted,
+           width, height,
+           want_format == FORMAT_AUTO
+               ? ""
+               : " -- \"capture_format\" pins this; set it to \"auto\" to "
+                 "allow the other format");
     close(fd);
     return NULL;
   }
+
+  // Say which format was actually negotiated. Without this an operator
+  // cannot tell whether they are paying for a per-frame JPEG decode or
+  // getting the zero-decode YUYV path -- which is exactly the thing
+  // "capture_format" exists to control, and it is invisible otherwise.
+  printf("%s: capturing %.4s at %ux%u%s\n", path,
+         (const char *)&capture_format, fmt.fmt.pix.width,
+         fmt.fmt.pix.height,
+         capture_format == V4L2_PIX_FMT_YUYV
+             ? " (no decode -- deinterleave only)"
+             : " (decoded per frame)");
 
   // Best-effort: V4L2 does not require a driver to honor an exact
   // framerate, so a failure here is not treated as fatal.

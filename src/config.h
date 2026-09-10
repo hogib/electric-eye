@@ -27,6 +27,25 @@ typedef enum {
   CAPTURE_RPICAM,   // a Pi CSI camera module, via rpicam_in.c
 } CaptureSource;
 
+// Which pixel format to ask a V4L2 camera for. Only meaningful on the
+// V4L2 backend; the Pi camera path always delivers MJPEG (see rpicam_in.h).
+//
+// This exists because the two formats have very different costs. YUYV is
+// packed 4:2:2 -- the same layout VideoFrame uses, just interleaved -- so
+// capture is a deinterleave into the planes with NO decode at all. MJPEG
+// must be decoded every frame. On a camera that offers both, which one
+// you get should be a decision, not a side effect of probe order.
+//
+// The tradeoff is bandwidth: YUYV is uncompressed, so 1280x720 at 30fps
+// needs ~55 MB/s and will not fit USB 2.0's isochronous ceiling. That is
+// why FORMAT_AUTO still tries MJPEG first -- it is the right default for
+// the cameras most people have.
+typedef enum {
+  FORMAT_AUTO = 0, // MJPEG if offered at this size, else YUYV
+  FORMAT_MJPEG,    // MJPEG only; fail at startup if unavailable
+  FORMAT_YUYV,     // YUYV only; fail at startup if unavailable
+} CaptureFormat;
+
 // One entry in an effect chain. Every stage carries its own parameters
 // (rather than one shared set for the whole Config) so e.g. two EFFECT_TINT
 // stages in the same chain, or a threshold before a tint, each get their
@@ -184,6 +203,11 @@ typedef struct {
   // a ribbon-cable camera and a USB webcam attached and the choice would
   // otherwise depend on probe order.
   CaptureSource capture_source;
+
+  // Which pixel format to demand from a V4L2 camera. Startup-only, like
+  // capture_source -- the format is fixed for the lifetime of the open
+  // device. Ignored by the rpicam backend.
+  CaptureFormat capture_format;
 } Config;
 
 /*
@@ -207,7 +231,8 @@ typedef struct {
  *     "capture_width": 1280,
  *     "capture_height": 720,
  *     "downscale": 2,
- *     "capture_source": "auto"
+ *     "capture_source": "auto",
+ *     "capture_format": "auto"
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -246,7 +271,10 @@ typedef struct {
  * changes them warns and keeps running at the original size.
  * "capture_source" (default "auto"; one of "auto", "v4l2", "rpicam")
  * chooses the capture backend and is likewise startup-only -- see
- * CaptureSource above and rpicam_in.h.
+ * CaptureSource above and rpicam_in.h. "capture_format" (default "auto";
+ * one of "auto", "mjpeg", "yuyv") picks the V4L2 pixel format and is also
+ * startup-only; "yuyv" is the zero-decode path and is worth pinning
+ * explicitly on a camera chosen for it, since "auto" prefers MJPEG.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

@@ -219,13 +219,14 @@ Every key is optional. Defaults shown:
   "capture_height": 720,
   "downscale": 1,
   "capture_source": "auto",
+  "capture_format": "auto",
   "stream_raw": false,
   "camera": {}
 }
 ```
 
 > **Startup-only:** `capture_width`, `capture_height`, `downscale`,
-> `capture_source`. Everything else is hot-reloadable. Changing these in a running
+> `capture_source`, `capture_format`. Everything else is hot-reloadable. Changing these in a running
 > config is logged and ignored — applying them live would mean reallocating the
 > frame pool while three threads hold frames from it.
 
@@ -389,6 +390,38 @@ failure. To see what yours offers: `v4l2-ctl -d /dev/video0 --list-ctrls`.
 
 Pin it explicitly if the vehicle carries **both** a CSI camera and a USB webcam —
 otherwise which one you get depends on probe order.
+
+`"capture_format"` picks the V4L2 pixel format (USB cameras only — the Pi camera
+path always delivers MJPEG):
+
+| value | behavior |
+|---|---|
+| `"auto"` (default) | MJPEG if offered at this size, else YUYV |
+| `"mjpeg"` | MJPEG only; fails at startup if unavailable |
+| `"yuyv"` | YUYV only; fails at startup if unavailable |
+
+**Pin `"yuyv"` on a camera you chose for it.** YUYV is packed 4:2:2 — the same
+layout the pipeline uses internally — so capture is a deinterleave with **no
+decode at all**, where MJPEG costs a decode every frame. But `"auto"` prefers
+MJPEG, so a YUYV-capable camera would silently give you the decode anyway.
+
+The catch is bandwidth: YUYV is uncompressed, so 1280×720 at 30fps needs
+~55 MB/s and will not fit USB 2.0. Plan on USB 3.0 for YUYV above 480p, and
+check what yours actually offers:
+
+```sh
+v4l2-ctl --list-formats-ext -d /dev/video0
+```
+
+`eeye` logs which format it settled on at startup:
+
+```
+/dev/video0: capturing YUYV at 640x480 (no decode -- deinterleave only)
+```
+
+Resolution negotiation respects this — pinning `"yuyv"` only considers modes
+that format actually offers, so it will step down to a smaller YUYV size rather
+than pick an MJPEG-only resolution it then cannot open.
 
 Pi camera modules don't go through V4L2: on Pi 5 the `rp1-cfe` driver exposes the
 sensor as raw Bayer only, and converting that to an image is the ISP's job via

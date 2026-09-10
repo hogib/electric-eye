@@ -1,4 +1,5 @@
 #pragma once
+#include "config.h"
 #include "video_frame.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,7 +53,8 @@ typedef struct V4l2In V4l2In;
  * Returns NULL on failure, having already reported the reason.
  */
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
-                     uint32_t framerate_hint, uint32_t downscale);
+                     uint32_t framerate_hint, uint32_t downscale,
+                     CaptureFormat want_format);
 
 /*
  * Best-effort "what can this camera actually do?" pass, run once at
@@ -83,7 +85,8 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
  * still demands whatever size it is eventually given, exactly.
  */
 bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
-                            uint32_t *height, uint32_t downscale);
+                            uint32_t *height, uint32_t downscale,
+                            CaptureFormat want_format);
 
 /*
  * Blocks until the driver has a filled buffer (bounded by an internal

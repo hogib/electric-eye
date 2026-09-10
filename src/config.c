@@ -50,6 +50,7 @@ static const Config config_defaults = {
     .capture_height = 720,
     .downscale = 1, // full resolution: what this ran at before the field existed
     .capture_source = CAPTURE_AUTO,
+    .capture_format = FORMAT_AUTO,
     // Every camera control unset -- "leave the camera alone". Spelled out
     // here rather than fixed up at each use of config_defaults, since a
     // zero-initialized CameraControls would mean "force every control to
@@ -777,6 +778,24 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
       } else if (strcmp(key, "capture_height") == 0) {
         if (!parse_u16(&c, &parsed.capture_height)) {
           printf("Config: invalid value for \"capture_height\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "capture_format") == 0) {
+        char fmt[16];
+        if (!parse_string(&c, fmt, sizeof fmt)) {
+          printf("Config: invalid value for \"capture_format\"\n");
+          return false;
+        }
+        if (strcmp(fmt, "auto") == 0) {
+          parsed.capture_format = FORMAT_AUTO;
+        } else if (strcmp(fmt, "mjpeg") == 0) {
+          parsed.capture_format = FORMAT_MJPEG;
+        } else if (strcmp(fmt, "yuyv") == 0) {
+          parsed.capture_format = FORMAT_YUYV;
+        } else {
+          printf("Config: unknown \"capture_format\": \"%s\" (expected "
+                 "\"auto\", \"mjpeg\", or \"yuyv\")\n",
+                 fmt);
           return false;
         }
       } else if (strcmp(key, "capture_source") == 0) {
