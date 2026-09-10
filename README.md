@@ -23,6 +23,11 @@ sudo ./install.sh          # deps, build, v4l2loopback on boot, systemd service
 Idempotent — re-run it after `git pull` as the update path. If you weren't already
 in the `video` group, log out and back in before running `eeye` by hand.
 
+It also configures the wired interface so the tether works with no DHCP server (see
+[Field checklist](#field-checklist), and [docs/topside.md](docs/topside.md) for why it
+is needed). `--no-network` skips that. It will not restart an interface that is already
+connected, so it is safe to run over SSH.
+
 ```sh
 ffplay /dev/video10        # watch the output
 journalctl -u eeye -f      # watch the logs

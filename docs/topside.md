@@ -153,10 +153,12 @@ Both drone-side ports listen dual-stack specifically so this works.
 
 ### The trap that will bite you
 
-**NetworkManager's default wired profile is DHCP-only.** On a direct cable there is no
-DHCP server, so it sits in "getting IP configuration", times out, tears the connection
-down — *removing the address* — and retries. That produces outages of 75+ seconds while
-the physical link never drops.
+**NetworkManager needs at least one address family to succeed**, or it tears the
+connection down — *removing the address* — and retries. On a direct cable both of its
+defaults fail: `ipv4.method auto` has no DHCP server to answer it, and `ipv6.method
+auto` waits for a router advertisement that never arrives. So it sits in "getting IP
+configuration", times out, drops the connection, and starts over. That produces outages
+of 75+ seconds while the physical link never drops.
 
 Diagnosing it, the giveaway is that `carrier_changes` in
 `/sys/class/net/<iface>/carrier_changes` **does not increment**. The cable is fine; the
@@ -165,16 +167,31 @@ interface simply has no address.
 `ip link` says `UP` the whole time, because that is layer 2. **Check for an address, not
 for "up".**
 
-Fix on **both** ends:
+**One setting fixes it**, on both ends. A link-local address needs no server, so that
+family always succeeds and the connection stays activated:
+
+```sh
+sudo nmcli connection modify "Wired connection 1" ipv6.method link-local
+```
+
+IPv4 is deliberately left on DHCP, so the same profile still works normally on a bench
+LAN — it is simply allowed to fail on a bare cable (`ipv4.may-fail` defaults to yes).
+
+If there is no wired profile yet:
 
 ```sh
 sudo nmcli connection add type ethernet con-name eeye-tether ifname '*' \
-    ipv4.method link-local ipv6.method link-local \
+    ipv4.method auto ipv6.method link-local \
     connection.autoconnect yes connection.autoconnect-priority 50
 ```
 
 `ifname '*'` matters — a profile pinned to one interface name silently stops applying
 the day you use a USB adapter instead.
+
+**On the drone, `sudo ./install.sh` does this automatically.** It fixes every wired
+profile, creates one if none exists, and deliberately does *not* reactivate an
+already-connected interface — the installer is often run over SSH, quite possibly over
+the very interface being changed. `--no-network` skips the step.
 
 A VPN killswitch is worth ruling out early too: if it drops ICMP, discovery finds
 nothing. The tell is that pinging *your own* link-local address fails, which can only be

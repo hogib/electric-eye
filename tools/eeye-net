@@ -257,11 +257,22 @@ def cmd_fix(args):
     print("DRONE SIDE -- make the Pi reachable over a bare cable")
     print("=" * 68)
     print("""
-A direct cable has no DHCP server, so the drone must not be waiting for one.
-Give its wired port link-local addressing, which needs no server at all:
+A direct cable has no DHCP server. NetworkManager needs at least one address
+family to succeed or it tears the connection down and removes the address --
+and on such a cable BOTH defaults fail: DHCP has nothing to answer it, and
+IPv6 "auto" waits for a router advertisement that never arrives.
+
+One setting fixes it, because a link-local address needs no server:
+
+  sudo nmcli connection modify "Wired connection 1" ipv6.method link-local
+
+IPv4 stays on DHCP, so the same profile still works on a bench LAN. On the
+drone, `sudo ./install.sh` does all of this for you.
+
+If there is no wired profile at all yet, create one:
 
   sudo nmcli connection add type ethernet con-name eeye-tether ifname '*' \\
-      ipv4.method link-local ipv6.method link-local \\
+      ipv4.method auto ipv6.method link-local \\
       connection.autoconnect yes connection.autoconnect-priority 50
 
 Note ifname '*': binding a profile to one interface name is why a tether
@@ -277,10 +288,14 @@ Make the drone findable by name as well as by address:
     print("TOPSIDE SIDE -- this machine")
     print("=" * 68)
     print("""
-Same idea for this end of the cable:
+Same idea for this end of the cable -- fix the existing profile:
+
+  sudo nmcli connection modify "Wired connection 1" ipv6.method link-local
+
+or create one if there is none:
 
   sudo nmcli connection add type ethernet con-name eeye-tether ifname '*' \\
-      ipv4.method link-local ipv6.method link-local \\
+      ipv4.method auto ipv6.method link-local \\
       connection.autoconnect yes connection.autoconnect-priority 50
 
 You do NOT need this to use `discover` -- IPv6 link-local works on any live

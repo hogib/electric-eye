@@ -11,8 +11,11 @@
 # checkout is the install -- there is no separate copy-to-/opt step, so
 # `git pull && sudo ./install.sh` is also the update path), configures
 # v4l2loopback to load automatically on every boot with the right options,
-# adds the invoking user to the 'video' group, and installs + enables the
-# systemd service.
+# adds the invoking user to the 'video' group, configures the wired
+# interface so a direct tether works, and installs + enables the systemd
+# service.
+#
+# Pass --no-network to skip the networking step.
 #
 # Safe to re-run: every step here is idempotent (apt install of an
 # installed package, usermod -aG on an existing membership, systemctl
@@ -25,6 +28,15 @@ warn() { printf 'WARNING: %s\n' "$1" >&2; }
 die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 
 trap 'die "Install failed at line $LINENO. Nothing after that point ran; it is safe to fix the issue and re-run this script."' ERR
+
+SETUP_NETWORK=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-network) SETUP_NETWORK=0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) die "Unknown option: $arg (try --help)" ;;
+  esac
+done
 
 if [ "$(id -u)" -ne 0 ]; then
   die "This needs root, for package installs, /etc/modules-load.d, /etc/modprobe.d, and the systemd unit. Run: sudo $0"
@@ -103,6 +115,120 @@ else
 run via sudo?). Do it manually: sudo usermod -aG video <your-user>"
 fi
 
+# --- Wired networking for the tether ---------------------------------
+#
+# The drone and the topside machine are joined by a direct Ethernet cable:
+# no router, no DHCP server, no DNS. NetworkManager's default wired profile
+# is ipv4=auto/ipv6=auto, and on such a cable BOTH fail -- DHCP has nothing
+# to answer it, and IPv6 "auto" waits for a router advertisement that never
+# arrives. NetworkManager needs at least one address family to succeed, so
+# it tears the connection down, removing the address, and retries. The
+# result is the interface flapping in and out of "connected" with outages
+# of a minute or more, while the physical link never drops at all.
+#
+# The fix is one setting: ipv6.method=link-local. A link-local address
+# needs no server, so that family always succeeds, the connection stays
+# activated, and the address persists. IPv4 is deliberately left on DHCP --
+# it keeps working normally on a bench LAN, and is simply allowed to fail
+# on a bare cable (ipv4.may-fail defaults to yes).
+#
+# That link-local address is exactly what tools/eeye-net discovers over.
+setup_network() {
+  if ! command -v nmcli >/dev/null 2>&1; then
+    warn "NetworkManager not found, so the wired interface was left alone. \
+On Raspberry Pi OS Bullseye and older this machine probably uses dhcpcd \
+instead. The tether needs the wired interface to keep an IPv6 link-local \
+address when no DHCP server answers; configure that by hand, or re-run \
+with --no-network to silence this."
+    return 0
+  fi
+  if ! nmcli -t general status >/dev/null 2>&1; then
+    warn "NetworkManager is installed but not responding, so the wired \
+interface was left alone. Start it (systemctl enable --now NetworkManager) \
+and re-run this script."
+    return 0
+  fi
+
+  # Work on connection PROFILES, not devices. A device reports only the
+  # connection currently active on it, so keying off that would create a
+  # duplicate profile every time this ran with the cable unplugged -- and
+  # NetworkManager happily allows duplicate names.
+  local profiles
+  profiles=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
+             | awk -F: '$2 == "802-3-ethernet" { print $1 }')
+
+  if [ -z "$profiles" ]; then
+    # No wired profile at all (a Pi that has never had a cable plugged in).
+    # Deliberately not pinned to an interface name: a profile bound to one
+    # silently stops applying the day a USB adapter is used instead.
+    log "No wired profile exists; creating 'eeye-tether'"
+    if nmcli connection add type ethernet con-name eeye-tether \
+         ipv4.method auto ipv6.method link-local \
+         connection.autoconnect yes connection.autoconnect-priority 50 \
+         >/dev/null 2>&1; then
+      profiles="eeye-tether"
+    else
+      warn "Could not create a wired profile. Set one up by hand: \
+nmcli connection add type ethernet con-name eeye-tether ifname '*' \
+ipv4.method auto ipv6.method link-local"
+      return 0
+    fi
+  fi
+
+  # Fix every wired profile, so whichever one activates on the tether
+  # behaves. Modifying is idempotent, which keeps re-running this script
+  # safe.
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if nmcli connection modify "$name" ipv6.method link-local >/dev/null 2>&1; then
+      log "Wired profile '$name': ipv6.method set to link-local"
+    else
+      warn "Could not modify wired profile '$name'. Set it by hand: \
+nmcli connection modify '$name' ipv6.method link-local"
+    fi
+  done <<< "$profiles"
+
+  # Activate only where nothing is already up. Reactivating a live
+  # connection drops it, and this script is very often run over SSH --
+  # quite possibly over the very interface being changed.
+  local dev state
+  while IFS= read -r dev; do
+    [ -n "$dev" ] || continue
+    state=$(nmcli -t -f GENERAL.STATE device show "$dev" 2>/dev/null | cut -d: -f2-)
+    # Matched on NetworkManager's numeric state, not its words: the string
+    # "disconnected" contains "connected", so a glob for the latter also
+    # catches the former and would skip exactly the devices worth bringing
+    # up. 100 = connected, 30 = disconnected, 20 = unavailable (no cable).
+    case "$state" in
+      100*)
+        warn "$dev is already connected, so it was not restarted. The change \
+applies on the next reboot or cable replug. Reactivating it now would drop \
+that connection, which is a bad idea if you are currently on it."
+        ;;
+      20*)
+        log "$dev has no cable; the profile will apply when one is plugged in"
+        ;;
+      *)
+        if nmcli device connect "$dev" >/dev/null 2>&1; then
+          log "$dev activated"
+        else
+          warn "$dev is configured but would not activate. It should come up \
+on its own once a cable is connected."
+        fi
+        ;;
+    esac
+  done <<< "$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null \
+              | awk -F: '$2 == "ethernet" && $3 != "unmanaged" { print $1 }')"
+}
+
+if [ "$SETUP_NETWORK" -eq 1 ]; then
+  log "Configuring wired networking for the tether"
+  setup_network
+else
+  log "Skipping tether networking (--no-network)"
+fi
+
 log "Installing the systemd service"
 sed \
   -e "s#/opt/electric-eye/builddir/eeye#$EXE_PATH#" \
@@ -123,6 +249,10 @@ Electric Eye is installed and running as a systemd service.
   Logs:    journalctl -u eeye -f
   Config:  edit $SCRIPT_DIR/eeye_config.json -- changes apply live, no restart needed
   Camera:  point another app at /dev/video10 to view the effects feed
+  Tether:  the wired interface now keeps an IPv6 link-local address even
+           with no DHCP server, which is what topside discovery uses.
+           Run the same setup on the TOPSIDE machine -- 'tools/eeye-net fix'
+           prints the command for it.
 
 If you weren't already in the 'video' group before this install, log out
 and back in (or reboot) before running 'eeye' by hand from a terminal --
