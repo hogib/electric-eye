@@ -10,6 +10,11 @@ Worked example: the `canny` operator, which is the most recent and touched every
 **1. Implement the kernel** — `src/conv.c` (neighborhood) or `src/point_opps.c` (point
 op), declared in the matching header.
 
+If it overwrites chroma without reading it (as the edge maps do) or passes chroma
+through untouched, add it to `kills_chroma` / `passes_chroma` in `effect_chain.c`, so a
+blur in front of it can skip work nobody will see. Leaving it out of both is always
+safe: it is then assumed to read chroma.
+
 Follow the existing signature shape so the chain can dispatch uniformly:
 
 ```c
@@ -21,7 +26,7 @@ void my_effect(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
 `src` and `dst` must not alias for neighborhood ops. If you write a luma-only edge map,
 `memset` both chroma planes to 128 — see [effects.md](effects.md).
 
-If you need scratch, follow the `realloc`-grown file-static pattern (`blur_scratch`,
+If you need scratch, follow the `realloc`-grown file-static pattern (`blur_rows`,
 `canny_mag`). Return without writing `dst` on allocation failure rather than crashing.
 If you allocate tightly packed at `width * height`, **check `stride[0] == width`** and
 bail otherwise, as `log_edges` and `canny_edges` do.
@@ -107,17 +112,22 @@ The largest CPU item on that path: `rpicam-vid` software-encodes MJPEG and `eeye
 immediately decodes it — 1.74 ms/frame decode alone on x86, likely 5–9 ms on a Pi, plus
 the encode.
 
-**Option A — `rpicam-vid --codec yuv420`.** Take the ISP's output directly, no JPEG
-either way. What has to be handled:
+**Option A — `rpicam-vid --codec yuv420`. Implemented, opt-in:** `"capture_format":
+"yuv420"` with `"capture_source": "rpicam"`. Takes the ISP's output directly, no JPEG
+either way. How each hazard is handled in `rpicam_in.c`:
 
-- **Stride padding**: Y rows padded to a multiple of 64 bytes, U/V to 32. The stream
-  carries no framing and no geometry, so frame size must be computed from the padding
-  rule. Getting this wrong is the documented cause of upstream "corrupt yuv420 output"
-  reports.
-- **4:2:0 → I422**: needs chroma line-doubling. **That code already exists** —
-  `decode_420_to_i422` in `jpeg_decode.c`, already tested.
-- **Frame boundaries** become "read exactly N bytes", simpler than the JPEG marker walk
-  but no longer self-synchronising. A desync stays desynced, so sanity-check frame size.
+- **Stride padding**: Y rows padded to a multiple of 64 bytes, U/V to 32. Applied
+  explicitly when unpacking, so any width works; at 640, 1280 and 1920 it pads nothing.
+- **4:2:0 → I422**: chroma line-doubling at downscale 1, an `n × n/2` box average
+  otherwise. `rpicam-vid` is still asked for the full size, so the sensor mode (and the
+  field of view) does not change with `downscale`.
+- **Frame boundaries** are "read exactly N bytes". Not self-synchronising, so any read
+  failure reopens the stream rather than guessing.
+
+**Why opt-in:** it has not run against a real camera. `rpicam-vid`'s null encoder writes
+each libcamera buffer whole, so if those buffers carry padding beyond the row strides
+(e.g. extra rows at some heights), every frame after the first would be misaligned.
+Check on a Pi with the default chain, then consider making it the default for rpicam.
 
 **Option B — link libcamera directly.** Removes the subprocess entirely; drags a C++
 dependency into a C project. Only worth it if A proves insufficient.
@@ -129,19 +139,15 @@ after that switch, not less.
 
 ## Vectorize a kernel
 
-The remaining candidate is Canny's non-maximum suppression — 33% of Canny, still scalar.
+Every operator in `conv.c` now has a NEON path, Canny's NMS included. None of them has
+been timed on hardware yet (see Known gaps), so the next step there is measurement, not
+more kernels.
 
-It selects 2 of 8 neighbours **by direction**, which is data-dependent addressing.
-Branchless approach: load all four candidate neighbour pairs, compute all four
-comparisons, select with `vbslq_u8` against masks from the direction plane. That is 8
-loads instead of 2 to avoid a branch that is already well-predicted on real images,
-where direction runs long along an edge.
+Pattern to follow (`sobel_row16`, `laplacian4_half8`, `canny_gradient8`, the NMS loop):
 
-**Measure before keeping it.** It may lose. The fused gradient+NMS idea did.
-
-Pattern to follow (`sobel_row16`, `laplacian4_half8`, `canny_gradient8`):
-
-- Guard with `#if defined(GS_NEON_AARCH64)`, leaving the scalar loop as the tail
+- Guard with `#if defined(GS_NEON)`, which covers AArch64 and ARMv7, leaving the scalar
+  loop as the tail. Use only intrinsics both have; the AArch64-only ones (e.g.
+  `vminvq_u8`) need their own branch, as in `point_opps.c`
 - Handle the left edge scalar-first, vectorize the interior, scalar tail for the
   remainder **and** the right edge
 - Keep intermediate widths generous enough that nothing saturates before the deliberate
@@ -171,6 +177,10 @@ Worth knowing before you propose them, along with why:
 | Fuse Canny's gradient + NMS | Measured **slower**: 0.94 ms vs 0.68 ms, recomputing each gradient 3× |
 | Parallel (bounded-sweep) hysteresis | 2× slower on realistic content, and only approximates connectivity |
 | NEON for `apply_lut_plane` | A cache-friendly table lookup beats a NEON gather |
+| `TJFLAG_FASTDCT` on JPEG decode | Measured on x86 with libjpeg-turbo's SIMD: between 1% slower and 13% faster across runs, and it changes decoded pixels (~60 dB PSNR against the accurate IDCT). libjpeg-turbo itself says the accurate IDCT is about as fast once SIMD is in play. The stream *encoder* does use it, since the preview is throwaway |
+| Skip health-file writes when nothing changed | `config_agent.py` uses the file's age as eeye's heartbeat, and `frames` changes every second anyway |
+| `GOMP_SPINCOUNT` instead of `OMP_WAIT_POLICY=passive` | Measured worse on x86 at 10,000: 55% CPU and 2.0–2.3ms effects time per frame, against 27% and 1.3ms. Spinning workers take cores the capture and output threads need. Either variable set in the environment is respected, so it is easy to re-test on a Pi |
+| Build flags (`-O3`, `-mcpu`, LTO) | Unmeasured. `-mcpu=native` would also tie a build directory to one board. Worth timing on a Pi with the stats log's effects line |
 | MMAP for `v4l2_out` | v4l2loopback shares one buffer with `write()`; saves no copy |
 | Build v4l2loopback from source at install | Loses DKMS auto-rebuild on kernel upgrade and signing; does not address the MOK failure mode at all |
 | Prebuilt release binaries | The kernel module makes a toolchain mandatory anyway |
@@ -179,8 +189,14 @@ Worth knowing before you propose them, along with why:
 
 ## Known gaps
 
-- **Non-maximum suppression is scalar** — the one real SIMD candidate left.
-- **NEON speedup is unmeasured on hardware.** Correctness verified; benefit is not.
+- **NEON speedup is unmeasured on hardware.** Correctness verified (bit-exact on both
+  AArch64 and ARMv7 under qemu); benefit is not. On x86 the fused blur and chroma skip
+  took the default chain from 39% to 27% CPU (both with `OMP_WAIT_POLICY=passive`);
+  that still needs repeating on a Pi.
+- **rpicam `yuv420` capture is unverified on real CSI hardware** (see above).
+- **`OMP_NUM_THREADS`** is left at the default (one per core). On a 4-core Pi the team
+  competes with the producer's JPEG decode and the stream thread's encode; 3 may be
+  faster. Measure it with the stats log's effects line.
 - **The rpicam camera-control mapping is unverified on real CSI hardware.** Only its
   argument construction is tested.
 - **Recordings carry no metadata** — an `.mp4` has no record of the chain, geometry, or

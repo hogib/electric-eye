@@ -49,7 +49,7 @@ fastest route — it lists every file a given kind of change touches.
 │    │                             │          │    │      ▲               │
 │    ├──JPEG──► stream_server :9000├──────────┼────┘      │               │
 │    │                             │  tether  │           │               │
-│    └──raw───► record_path        │          │  eeye-record ──► .mp4     │
+│    └──raw/mjpeg─► record_path    │          │  eeye-record ──► .mp4     │
 │                                  │          │                           │
 │  config_agent.py :9001 ◄─────────┼──────────┼──── config writes         │
 │    │ writes eeye_config.json     │          │                           │
@@ -63,7 +63,7 @@ deliberate — see [topside.md](topside.md).
 
 ## Source layout
 
-`src/` is a flat set of translation units, no subdirectories. At 16 files and ~7,800
+`src/` is a flat set of translation units, no subdirectories. At 17 files and ~8,500
 lines that is easier to navigate than a hierarchy would be. Most modules use a prefix
 matching their filename (`v4l2_in_*`, `camera_ctrl_*`, `stream_server_*`), which is the
 namespacing C gives you.
@@ -76,7 +76,7 @@ namespacing C gives you.
 | `frame_ring_buffer.c` | The lock-free-ish ring between stages |
 | `config.c` | JSON parser, validation, inotify hot-reload |
 | `v4l2_in.c` | USB/UVC capture: MMAP streaming, format negotiation |
-| `rpicam_in.c` | Pi camera capture: forks `rpicam-vid`, reads MJPEG |
+| `rpicam_in.c` | Pi camera capture: forks `rpicam-vid`, reads MJPEG (or raw yuv420) |
 | `jpeg_decode.c` | Shared MJPEG→I422 decode used by both backends |
 | `camera_ctrl.c` | Portable camera controls across both backends |
 | `conv.c` | Neighborhood operators: sobel, blur, LoG, Canny |
@@ -84,7 +84,8 @@ namespacing C gives you.
 | `effect_chain.c` | Chain runner, LUT fusion, buffer ping-pong |
 | `v4l2_out.c` | Writes frames to the loopback device |
 | `virtual_cam.c` | Loads/unloads the v4l2loopback module |
-| `stream_server.c` | JPEG preview tap over TCP |
+| `stream_server.c` | JPEG preview tap over TCP, on its own thread |
+| `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |
 
 Python lives outside the meson build: `pi/` (drone side), `topside/`, `tools/`.

@@ -1,6 +1,6 @@
 # Testing
 
-12 suites, ~167 tests, run with `meson test -C builddir`.
+14 suites, ~190 tests, run with `meson test -C builddir`.
 
 ## The suites
 
@@ -8,12 +8,14 @@
 |---|---|
 | `config` | Parsing, validation, every key, the defaults |
 | `ring_buffer` | FIFO order, capacity, wraparound, concurrent pushers |
-| `jpeg_framing` | `find_jpeg_end` — frame boundaries in a pipe stream |
+| `jpeg_framing` | `find_jpeg_end` — frame boundaries in a pipe stream, resumed scans, rpicam yuv420 unpacking |
 | `jpeg_decode` | 4:2:2 and 4:2:0 decode, line-doubling, downscale |
-| `negotiation` | Resolution ranking and the divisibility filter |
+| `negotiation` | Resolution ranking, the divisibility filter, YUYV downscale |
 | `log_edges` | LoG behavior |
 | `canny` | Canny behavior |
-| `effect_chain` | LUT fusion against an independent reference |
+| `effect_chain` | LUT fusion against an independent reference; chroma skipping, role swaps |
+| `recorder` | Recording thread: file contents, ordering, a stalled disk (FIFO) never blocking |
+| `stream_server` | Preview thread: complete JPEGs, a viewer that never reads gets dropped, offers never block |
 | `camera_ctrl` | Range scaling, unit conversion, rpicam argv |
 | `health` | Health file contents and escaping |
 | `topside` | Python: link staleness, health relay, recorder |
@@ -75,6 +77,16 @@ aarch64-linux-gnu-gcc -O2 -I src -o neon_verify neon_verify.c \
     conv_neon.o conv_scalar.o src/video_frame.c -lm
 qemu-aarch64-static -L /usr/aarch64-linux-gnu ./neon_verify
 ```
+
+Without a cross toolchain installed, `zig cc` works as one and bundles its own libc:
+`zig cc -target aarch64-linux-musl -mcpu=cortex_a76` (AArch64) or
+`zig cc -target arm-linux-musleabihf -mcpu=cortex_a53` (ARMv7 with NEON), run with plain
+`qemu-aarch64` / `qemu-arm`. The kernels are also guarded for ARMv7 now, so verify both.
+
+**Check the guard actually fires.** Before trusting a zero-mismatch run, plant a bug in
+the NEON path and confirm the harness catches it, or check
+`-dM -E src/conv.c | grep GS_NEON`. A guard that silently compiles the NEON path out
+makes the comparison scalar against scalar, which passes every time.
 
 The renaming trick is what makes this cheap: no separate reference implementation to
 write and keep in sync, so the twin cannot drift from the thing it validates.
