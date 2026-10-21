@@ -64,6 +64,7 @@ static void test_reports_recording_off(void) {
 static void test_reports_recording_active(void) {
   HealthSnapshot s = {.recording_state = RECORDING_ACTIVE,
                       .recording_bytes = 12345678,
+                      .recording_dropped = 42,
                       .disk_free_bytes = 999888777,
                       .camera_connected = true,
                       .frame_width = 1280,
@@ -75,6 +76,8 @@ static void test_reports_recording_active(void) {
   CHECK(strstr(out, "\"state\":\"active\"") != NULL);
   CHECK(strstr(out, "\"path\":\"/data/dive.raw\"") != NULL);
   CHECK(strstr(out, "\"bytes\":12345678") != NULL);
+  // A disk falling behind shows up as dropped frames, not a frozen feed.
+  CHECK(strstr(out, "\"dropped_frames\":42") != NULL);
   CHECK(strstr(out, "\"disk_free_bytes\":999888777") != NULL);
   free(out);
 }

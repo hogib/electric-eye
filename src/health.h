@@ -10,7 +10,7 @@
  *
  * This exists because the drone knows things topside cannot infer. Chief
  * among them: whether recording is actually still running. When a disk
- * fills mid-dive, consumer_loop stops recording and clears its path -- but
+ * fills mid-dive, the recorder (recorder.c) stops recording -- but
  * the operator's UI still shows the path they typed, so they carry on
  * believing they are recording and only discover the gap after surfacing.
  * At 640x480 that is ~18 MB/s, so a disk fills fast enough for this to be
@@ -35,6 +35,7 @@ typedef struct {
   // isn't it recording" is a sentence, not an errno.
   char recording_error[128];
   uint64_t recording_bytes;   // written this session
+  uint64_t recording_dropped; // frames skipped because the disk fell behind
   uint64_t disk_free_bytes;   // on the recording path's filesystem, 0 if unknown
 
   bool camera_connected;

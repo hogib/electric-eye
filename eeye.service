@@ -46,12 +46,13 @@ ExecStart=/opt/electric-eye/builddir/eeye /opt/electric-eye/eeye_config.json
 # busy-spins waiting for the next #pragma omp parallel for region instead of
 # sleeping between them. That trade only pays off when parallel regions run
 # back-to-back with negligible gaps -- here they run once per video frame
-# (~33ms apart) and finish in under a millisecond, so every worker spends
-# essentially the whole frame interval spinning. Measured impact on a 12-core
-# host: ~178% CPU idling down to ~15-19% from this one setting, no code
-# change. On the Pi 5's 4 cores this trades a smaller CPU number for a much
-# larger fraction of a fixed thermal/power budget, so it matters more there,
-# not less.
+# (~33ms apart), so every worker spends most of the frame interval spinning.
+# Measured impact on a 12-core host: ~178% CPU idling down to ~15-19% from
+# this one setting. A bounded GOMP_SPINCOUNT=10000 was also measured and
+# lost on both CPU and effects time (see eeye.c main()). On the Pi's 4
+# cores this matters more, not less: it is a larger fraction of a fixed
+# thermal/power budget. eeye re-execs itself with this if neither variable
+# is set, so this line documents the setting rather than being required.
 Environment=OMP_WAIT_POLICY=passive
 
 # Restart on anything other than an intentional `systemctl stop` (which

@@ -88,11 +88,12 @@ void health_publish(const char *config_path, const HealthSnapshot *snap) {
 
   fprintf(f,
           "{\"recording\":{\"state\":\"%s\",\"path\":\"%s\",\"error\":\"%s\","
-          "\"bytes\":%llu,\"disk_free_bytes\":%llu},"
+          "\"bytes\":%llu,\"dropped_frames\":%llu,\"disk_free_bytes\":%llu},"
           "\"camera\":{\"connected\":%s,\"frames\":%llu},"
           "\"geometry\":{\"width\":%u,\"height\":%u}}\n",
           state_name(snap->recording_state), esc_path, esc_err,
           (unsigned long long)snap->recording_bytes,
+          (unsigned long long)snap->recording_dropped,
           (unsigned long long)snap->disk_free_bytes,
           snap->camera_connected ? "true" : "false",
           (unsigned long long)snap->frames_captured, snap->frame_width,

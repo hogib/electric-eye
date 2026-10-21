@@ -83,6 +83,7 @@ src = [
     'src/jpeg_decode.c',
     'src/video_frame.c',
     'src/point_opps.c',
+    'src/recorder.c',
     'src/rpicam_in.c',
     'src/stream_server.c',
     'src/v4l2_in.c',
@@ -127,6 +128,12 @@ test_extra_sources = {
     'canny': ['src/conv.c', 'src/video_frame.c'],
     'health': [],
     'camera_ctrl': [],
+    'recorder': [
+        'src/frame_ring_buffer.c',
+        'src/health.c',
+        'src/video_frame.c',
+    ],
+    'stream_server': ['src/video_frame.c'],
     'effect_chain': [
         'src/camera_ctrl.c',
         'src/conv.c',

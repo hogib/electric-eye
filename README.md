@@ -218,6 +218,7 @@ Every key is optional. Defaults shown:
 {
   "chain": [{"effect": "sobel"}],
   "record_path": "",
+  "record_format": "raw",
   "stream_frame_interval": 0,
   "stream_quality": 60,
   "capture_width": 1280,
@@ -396,14 +397,14 @@ failure. To see what yours offers: `v4l2-ctl -d /dev/video0 --list-ctrls`.
 Pin it explicitly if the vehicle carries **both** a CSI camera and a USB webcam —
 otherwise which one you get depends on probe order.
 
-`"capture_format"` picks the V4L2 pixel format (USB cameras only — the Pi camera
-path always delivers MJPEG):
+`"capture_format"` picks the pixel format:
 
 | value | behavior |
 |---|---|
-| `"auto"` (default) | MJPEG if offered at this size, else YUYV |
+| `"auto"` (default) | MJPEG if offered at this size, else YUYV (Pi camera: MJPEG) |
 | `"mjpeg"` | MJPEG only; fails at startup if unavailable |
-| `"yuyv"` | YUYV only; fails at startup if unavailable |
+| `"yuyv"` | YUYV only; fails at startup if unavailable (USB cameras) |
+| `"yuv420"` | Pi camera only: raw ISP output, no JPEG encode or decode. **Opt-in and not yet verified on a real camera** — see [docs/capture.md](docs/capture.md) |
 
 **Pin `"yuyv"` on a camera you chose for it.** YUYV is packed 4:2:2 — the same
 layout the pipeline uses internally — so capture is a deinterleave with **no
@@ -463,11 +464,20 @@ through `web_ui.py` rather than to the drone directly, because the drone serves
 one viewer at a time — connecting straight to it would kick the pilot off
 their video.
 
-**Onboard, uncompressed (`"record_path"`)** — writes the camera frame **before
-the effect chain** as raw I422, no container. Empty means off. This is the
+**Onboard (`"record_path"`)** — writes the camera frame **before the effect
+chain**. Empty means off. By default it is raw I422, no container: the
 full-rate, full-quality, effect-free source, and it is enormous: ~53 MB/s,
 ~190 GB/hour at 1280×720. Use it for short clips where the compression or the
 dropped frames of the topside path would matter.
+
+`"record_format": "mjpeg"` writes the JPEG frames the camera itself sent
+instead: no re-encode, roughly an order of magnitude smaller, playable with
+`ffplay -f mjpeg -framerate 30 -i FILE`. It needs an MJPEG camera stream; with
+a YUYV camera it falls back to raw and says so in the log.
+
+Recording runs on its own thread, so a disk that can't keep up drops recorded
+frames (counted as `dropped_frames` in the health file) rather than freezing
+the live feed.
 
 `downscale` applies (it happens during capture decode, upstream of this tap),
 so recordings shrink proportionally — ~48 GB/hour at `downscale: 2`. Play back
@@ -479,9 +489,9 @@ ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE   # downscale 2
 
 | | topside (`eeye-record`) | onboard (`record_path`) |
 |---|---|---|
-| size | ~1.2 GB/hour | ~190 GB/hour |
+| size | ~1.2 GB/hour | ~190 GB/hour raw, far less as `mjpeg` |
 | framerate | `30 ÷ stream_frame_interval` | full capture rate |
-| quality | JPEG then H.264 | untouched |
+| quality | JPEG then H.264 | untouched (raw) or the camera's JPEG (`mjpeg`) |
 | effects | follows `stream_raw` | always excluded |
 | costs the drone | nothing extra | disk write per frame |
 

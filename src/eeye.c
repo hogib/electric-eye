@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 #include <unistd.h>
 
@@ -42,6 +43,18 @@ constexpr char virtual_cam_device_path[] = "/dev/video10";
 // stream_frame_interval starts at 0); this is only the port it listens on
 // once a config turns it on.
 constexpr uint16_t stream_server_port = 9000;
+
+// Frames in circulation. Not the ring capacity (31): every frame in the
+// pool can be queued in front of the virtual camera at once, so this is
+// also the worst-case backlog between the camera and what the pilot sees --
+// 8 frames is ~270ms at 30fps, where 31 was a full second. When the
+// pipeline falls behind, the producer blocks on an empty pool and the
+// camera driver drops its oldest frames instead, which is the right trade
+// for a live view. Also the memory bill: each frame is three full I422
+// buffers, ~5.5MB at 720p.
+constexpr unsigned int frame_pool_size = 8;
+static_assert(frame_pool_size <= ring_buffer_size - 1,
+              "every pooled frame must fit in the free ring at once");
 
 FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
@@ -92,8 +105,11 @@ ProducerArgs prod_args = {.filename = "/dev/video0",
 
 // .config is filled in by main() once config_watch_start() has run --
 // building the watcher needs is_running, which isn't available until then.
+static EffectsTiming effects_timing;
+
 WorkerArgs work_args = {
     .is_running = &is_running,
+    .timing = &effects_timing,
     .ring_buffer_in = &ring_buffer_in,
     .ring_buffer_out = &ring_buffer_out,
 };
@@ -108,21 +124,31 @@ ConsumerArgs cons_args = {
 
 StatsArgs stats_args = {
     .is_running = &is_running,
+    .effects_timing = &effects_timing,
     .ring_buffer_in = &ring_buffer_in,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
 };
 
 int main(int argc, char **argv) {
-  // libgomp's default OMP_WAIT_POLICY is "active": each worker thread in a
-  // #pragma omp parallel for team (conv.c, point_opps.c) busy-spins between
-  // regions instead of sleeping, on the assumption regions run back-to-back.
-  // Here they run once per video frame (~33ms apart) and finish in under a
-  // millisecond, so every worker spends nearly the whole frame interval
-  // spinning -- measured at ~178% CPU idling down to ~15-19% once this
-  // variable is actually present, no other code change.
+  // libgomp's default OMP_WAIT_POLICY has each worker thread in a #pragma
+  // omp parallel team (conv.c, point_opps.c) busy-spin for a few ms after
+  // every region, on the assumption regions run back-to-back. Here frames
+  // are ~33ms apart, so every worker spent most of each frame interval
+  // spinning -- measured at ~178% CPU idling down to ~15-19% once
+  // OMP_WAIT_POLICY=passive is set, no other code change.
   //
-  // It cannot be fixed from inside this process after it has started:
+  // A bounded spin (GOMP_SPINCOUNT) looked like it should do better still,
+  // by keeping workers awake across one frame's back-to-back regions. It
+  // measured worse on every count: with the default blur -> sobel chain on
+  // a 12-core host, GOMP_SPINCOUNT=10000 cost 55% CPU and 2.0-2.3ms per
+  // frame of effects time, against 27% and 1.3ms for passive. Spinning
+  // workers compete for cores with the capture and output threads, and the
+  // more the host has going on the worse that gets. So: passive. An
+  // operator's own OMP_WAIT_POLICY or GOMP_SPINCOUNT is left alone, which
+  // makes either easy to try on real hardware.
+  //
+  // It cannot be set from inside this process after it has started:
   // verified empirically that neither setenv() here nor an early
   // __attribute__((constructor(101))) -- about as soon as user code is
   // allowed to run -- changes libgomp's behavior. Whatever decides this is
@@ -133,14 +159,11 @@ int main(int argc, char **argv) {
   // constructor (including libgomp's) against the now-updated environment.
   // /proc/self/exe -- the kernel's own resolved path to this running binary
   // -- sidesteps the usual argv[0]-may-be-relative-or-bare problem that
-  // execve() (unlike execvp()) can't otherwise handle. Guarded by
-  // getenv() so this only ever happens once: an operator's own
-  // OMP_WAIT_POLICY (e.g. eeye.service's Environment= line, kept as
-  // documentation/belt-and-suspenders even though this makes it redundant)
-  // is left alone, and the re-exec's own child inherits the variable it
-  // just set, so it takes this branch's "already set" path and runs
-  // normally.
-  if (!getenv("OMP_WAIT_POLICY")) {
+  // execve() (unlike execvp()) can't otherwise handle. Skipped when the
+  // operator set either variable themselves (e.g. eeye.service's
+  // Environment= line), and the re-exec'd image inherits the variable it
+  // just set, so this only ever happens once.
+  if (!getenv("GOMP_SPINCOUNT") && !getenv("OMP_WAIT_POLICY")) {
     setenv("OMP_WAIT_POLICY", "passive", 1);
     printf("Re-executing with OMP_WAIT_POLICY=passive (see eeye.c main() "
            "for why this can't be done in-process)...\n");
@@ -205,6 +228,15 @@ int main(int argc, char **argv) {
            capture_source == CAPTURE_RPICAM
                ? "Pi camera module (rpicam-vid)"
                : "V4L2 device");
+  }
+  // config.c already refuses an explicit v4l2 source with yuv420; this
+  // catches "auto" resolving to V4L2.
+  if (capture_source == CAPTURE_V4L2 &&
+      startup_config.capture_format == FORMAT_YUV420) {
+    printf("Error: \"capture_format\": \"yuv420\" is only for the Pi camera "
+           "(rpicam) backend, but no Pi camera was found. Use \"auto\", "
+           "\"mjpeg\" or \"yuyv\" for a V4L2 camera.\n");
+    return 1;
   }
 
   // Ask the camera what it can actually do before anything is sized from
@@ -276,7 +308,7 @@ int main(int argc, char **argv) {
   ring_init(&ring_buffer_out);
   ring_init(&ring_buffer_free);
 
-  const unsigned int pool_size = ring_buffer_size - 1;
+  const unsigned int pool_size = frame_pool_size;
   VideoFrame **pool = vf_pool_create(pool_size, out_width, out_height);
   if (!pool) {
     printf("Error: Failed to allocate frame pool.\n");
@@ -289,8 +321,8 @@ int main(int argc, char **argv) {
   // these frames invisible to producer_loop -- the ring held them, but
   // nothing was ever posted to say so. NULL is safe here (never give up
   // rather than abandon a frame) since is_running is already true and
-  // there is always exactly enough room: pool_size == ring_buffer_size - 1,
-  // matching empty's initial capacity exactly.
+  // there is always enough room: the static_assert on frame_pool_size
+  // keeps it within empty's initial capacity.
   for (unsigned int i = 0; i < pool_size; ++i) {
     ring_push_wait(&ring_buffer_free, pool[i], NULL);
   }

@@ -26,7 +26,8 @@ typedef struct {
   // is unused by the rpicam backend, which has no device path -- it talks
   // to a child process.
   CaptureSource capture_source;
-  // Which V4L2 pixel format to demand; ignored by the rpicam backend.
+  // Which pixel format to demand; the rpicam backend only distinguishes
+  // yuv420 from everything else (MJPEG).
   CaptureFormat capture_format;
   atomic_bool *is_running;
   // Camera controls are hot-reloadable, so the producer needs the live
@@ -41,11 +42,22 @@ typedef struct {
   uint32_t downscale;
 } ProducerArgs;
 
+// How long apply_effect_chain() takes per frame, accumulated by
+// effects_loop and logged (then reset) by stats_loop. The number to watch
+// when tuning OpenMP or the chain on real hardware. Diagnostic only, so
+// every access is relaxed.
+typedef struct {
+  atomic_uint_fast64_t frames;
+  atomic_uint_fast64_t total_ns;
+  atomic_uint_fast64_t max_ns;
+} EffectsTiming;
+
 typedef struct {
   atomic_bool *is_running;
   FrameRingBuffer *ring_buffer_in;
   FrameRingBuffer *ring_buffer_out;
   const ConfigWatcher *config;
+  EffectsTiming *timing;
   uint32_t frame_width;
   uint32_t frame_height;
 } WorkerArgs;
@@ -69,6 +81,7 @@ typedef struct {
 // ring_get_stats() on them, never pushes/pops.
 typedef struct {
   atomic_bool *is_running;
+  EffectsTiming *effects_timing;
   const FrameRingBuffer *ring_buffer_in;
   const FrameRingBuffer *ring_buffer_out;
   const FrameRingBuffer *ring_buffer_free;

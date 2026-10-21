@@ -74,16 +74,28 @@ client. If two things connect (say, the web UI and a diagnostic script), they wi
 each other off in a reconnect loop that looks exactly like a flaky link. This is a real
 trap — it caused an hour of misdiagnosis once.
 
-**It costs nothing when nobody is watching.** `stream_server_send_frame()` checks for a
-connected client before doing any JPEG work at all, so an unwatched stream is one idle
-listening socket, not a background encode loop. That is why `stream_frame_interval: 0`
-is a safe default.
+**It runs on its own thread.** `consumer_loop`, which feeds the virtual camera, only
+calls `stream_server_offer_frame()`: that copies the frame into a one-slot mailbox and
+returns. The stream thread encodes and sends. If it is still busy with the previous
+frame, the newer one replaces whatever is waiting, since a live preview wants the
+latest frame, not every frame. So a viewer on a bad tether can only make the preview
+stale; it cannot stall the pilot's local feed. The encode moved off the consumer thread
+with it.
 
-**A slow viewer gets dropped after 200ms** (`send_timeout_ms`). This is called from the
-same thread that feeds the local virtual camera, so a stuck network peer must never be
-able to stall that for long.
+**It costs nothing when nobody is watching.** `stream_server_offer_frame()` checks an
+atomic "viewer connected" flag before copying anything, so an unwatched stream is one
+idle listening socket and a sleeping thread. That is why `stream_frame_interval: 0` is
+a safe default.
 
-That timeout interacts with frame size in a way worth doing the arithmetic on. At
+**A slow viewer gets dropped when one frame takes more than 200ms** (`send_timeout_ms`)
+to send. The deadline covers the whole frame: the client socket is non-blocking and
+every `sendmsg()` waits only for whatever is left of it. The earlier `SO_SNDTIMEO`
+bounded each `send()` call instead, and restarted on every partial send, so a viewer
+draining slowly could hold the consumer thread far past 200ms. In the test suite a
+viewer that never reads is dropped after ~270ms, while each offer returns in under a
+millisecond.
+
+That deadline interacts with frame size in a way worth doing the arithmetic on. At
 100 Mbit/s:
 
 | `stream_quality` | Frame size | Push time | Margin vs 200ms |
@@ -100,8 +112,8 @@ serves both families. This is not cosmetic: on a direct tether the only zero-con
 addressing is IPv6 link-local, and an IPv4-only listener is simply unreachable that
 way. `SO_REUSEADDR` is set so a restart does not fail to rebind during `TIME_WAIT`.
 
-Nagle is disabled — each frame goes out as two `send()` calls (length prefix, then
-body) and Nagle would hold the tiny first packet waiting to coalesce.
+Each frame goes out as one `sendmsg()` of the length prefix and the JPEG together.
+Nagle is disabled as well, so the tail of a frame is not held back waiting for an ACK.
 
 ### The raw bypass
 
@@ -111,25 +123,58 @@ processed one, leaving the virtual camera and recording tap on the full chain.
 It answers a question you cannot otherwise answer from topside — "is that thing in the
 water real, or is it my filter?" — without dismantling the chain and putting it back.
 
-Implemented by pointer, not by copying: `raw_data` shares the frame's layout exactly, so
-a shallow `VideoFrame` view with the raw planes is all `stream_server` needs, and it
-costs nothing per frame.
+Implemented by pointer: `raw_data` shares the frame's layout exactly, so a shallow
+`VideoFrame` view with the raw planes is what gets offered, and the mailbox copies from
+those planes instead of the processed ones.
 
 ## Recording tap
 
-`record_path` writes the **untouched** camera frame — `raw_data`, independent of the
-effect chain — as raw I422 with no container, frames back to back.
+`record_path` writes the **untouched** camera frame, independent of the effect chain:
+by default `raw_data` as raw I422 with no container, frames back to back.
+
+### It runs on its own thread
+
+The recorder (`recorder.c`) owns the file. `consumer_loop` writes the virtual camera
+first, then offers the frame with `recorder_submit()`. If the writer thread takes it,
+the frame goes back to the pool once it is written. `fopen()`, `fwrite()` and
+`fclose()` (which flushes, and is often the slow one) all happen on the writer thread.
+
+The writer holds at most `recorder_max_queued` (3) frames. When the disk falls behind
+and it is full, `recorder_submit()` refuses, the consumer returns the frame to the pool
+itself, and the recording counts a **dropped frame**. That count is in the health file
+as `dropped_frames`. A slow disk costs footage you can see is missing, instead of
+freezing the live view. Before this, raw recording at 55MB/s to an SD card that could
+not keep up blocked `fwrite()`, backed up the out ring, and the pilot's picture fell up
+to a second behind.
+
+### `record_format`
+
+`"raw"` (the default) is described above. `"mjpeg"` writes the JPEG bytes the camera
+sent instead: roughly an order of magnitude smaller, no encode cost, and one decode
+closer to the sensor than the raw file. The bytes are kept per frame by
+`jpeg_decode_frame()` (after the DHT patch, so a DHT-less camera still records a
+playable stream). Play it back with:
+
+```sh
+ffplay -f mjpeg -framerate 30 -i FILE
+```
+
+Only an MJPEG source has those bytes. With YUYV or rpicam `yuv420` capture, the first
+frame decides: the recording falls back to raw for the whole file and logs that it did.
+The format is read when a recording starts; changing it mid-recording restarts the
+recording.
 
 ### Size, and why this matters more than it looks
 
-~53 MB/s, ~190 GB/hour at 1280×720. On a real dive this filled a Pi's disk in about
-eight minutes and took the whole machine down. `downscale` applies (it happens during
+Raw is ~53 MB/s, ~190 GB/hour at 1280×720. On a real dive this filled a Pi's disk in
+about eight minutes and took the whole machine down. `"record_format": "mjpeg"` is the
+way out of that when the camera sends MJPEG. `downscale` applies (it happens during
 capture decode, upstream of this tap), so `downscale: 2` quarters that.
 
 `eeye` reports free space and estimated recording time when a recording starts:
 
 ```
-Recording: 41000 MB free at /data/dive.raw (~780 seconds at this geometry)
+Recording: 41000 MB free at /data/dive.raw (~780 seconds of raw video at this geometry)
 ```
 
 Play back with the *output* dimensions, i.e. `capture / downscale`:
@@ -146,8 +191,8 @@ For anything longer than a short clip, `tools/eeye-record` topside writes H.264 
 
 ### Failure handling
 
-A write failure (almost always a full disk) stops the recording, clears the path so it
-is not retried on every frame, and — importantly — sets the health state to
+A write failure (almost always a full disk) stops the recording, which is not retried
+until `record_path` changes, and — importantly — sets the health state to
 `RECORDING_FAILED` with the reason. Without that last part the operator has no way to
 know: the UI still shows the path they typed.
 
@@ -159,7 +204,8 @@ knows.
 ```json
 {
   "recording": {"state": "active", "path": "/data/dive.raw", "error": "",
-                "bytes": 24166195200, "disk_free_bytes": 27641176064},
+                "bytes": 24166195200, "dropped_frames": 0,
+                "disk_free_bytes": 27641176064},
   "camera": {"connected": true, "frames": 13110},
   "geometry": {"width": 1280, "height": 720}
 }
@@ -167,8 +213,10 @@ knows.
 
 `state` is one of `off`, `active`, `failed`.
 
-**Why this exists:** when a disk fills mid-dive, `consumer_loop` stops recording and
-clears its path — but the operator's UI still shows the path they typed, so they carry
+`dropped_frames` counts frames the recorder skipped because the disk could not keep up
+(see [Recording tap](#recording-tap)).
+
+**Why this exists:** when a disk fills mid-dive, the recorder stops recording — but the operator's UI still shows the path they typed, so they carry
 on believing they are recording and only discover the gap after surfacing.
 
 Same writer contract as the config status file: **write a temp file in the same

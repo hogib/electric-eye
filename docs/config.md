@@ -7,7 +7,7 @@ One JSON file, hand-written or written over the network, hot-reloaded via inotif
 This is the distinction to internalize before changing anything:
 
 **Hot-reloadable** — picked up within ~200ms, no restart. `chain`, `record_path`,
-`stream_frame_interval`, `stream_quality`, `stream_raw`, and everything under `camera`.
+`record_format` (read when a recording starts), `stream_frame_interval`, `stream_quality`, `stream_raw`, and everything under `camera`.
 
 **Startup-only** — read once by `config_load_once()` before any thread exists.
 `capture_width`, `capture_height`, `downscale`, `capture_source`, `capture_format`.
@@ -40,6 +40,7 @@ has to understand them anyway or every reload of a geometry-carrying file would 
 {
   "chain": [{"effect": "sobel"}],
   "record_path": "",
+  "record_format": "raw",
   "stream_frame_interval": 0,
   "stream_quality": 60,
   "stream_raw": false,
@@ -104,6 +105,15 @@ source has half-height chroma that gets line-doubled into full-height planes, wh
 only lands exactly on an even output height. One rule covers both layouts rather than
 making the valid geometries depend on which camera is attached.
 
+### Capture source and format
+
+`capture_source` is `"auto"`, `"v4l2"` or `"rpicam"`. `capture_format` is `"auto"`,
+`"mjpeg"` or `"yuyv"` for a V4L2 camera (see [capture.md](capture.md#format-selection)),
+or `"yuv420"` for the Pi camera only: raw ISP output with no JPEG encode or decode,
+opt-in until verified on hardware (see [capture.md](capture.md)). `"yuv420"` with
+`"capture_source": "v4l2"` is refused at parse time; with `"auto"` it is refused at
+startup if the probe picks V4L2.
+
 ### Streaming and recording
 
 `stream_frame_interval` — send every Nth post-effects frame. **0 disables the tap
@@ -115,6 +125,12 @@ range-check).
 
 `record_path` — empty means off. See [output.md](output.md) for the size warning and
 the `~` trap.
+
+`record_format` — `"raw"` (default: decoded I422, ~55MB/s at 720p) or `"mjpeg"` (the
+camera's own JPEG bytes, roughly an order of magnitude smaller). `"mjpeg"` needs an
+MJPEG source; with YUYV or rpicam `yuv420` capture the recording falls back to raw and
+logs it. Changing it while recording restarts the recording. See
+[output.md](output.md#record_format).
 
 ### `camera`
 

@@ -4,19 +4,27 @@ Threads, frames, and how a frame gets from the sensor to the loopback device.
 
 ## Threads
 
-Five, all created in `main()` except the config watcher, which
-`config_watch_start()` creates for itself.
+Seven. Four are created in `main()`; the config watcher, recorder and stream threads
+are started by the modules that own them.
 
 | Thread | Entry point | Job |
 |---|---|---|
 | producer | `producer_loop` | Owns the camera. Captures into a frame, pushes it downstream. |
 | effects | `effects_loop` | Runs the effect chain on each frame. |
-| consumer | `consumer_loop` | Writes to the virtual camera; runs the recording and preview taps. |
-| stats | `stats_loop` | Logs ring occupancy every 5s. Purely diagnostic. |
+| consumer | `consumer_loop` | Writes to the virtual camera, then hands the frame to the recording and preview taps. |
+| recorder | `writer_loop` in `recorder.c` | Owns the recording file. Writes frames the consumer hands it, returns them to the pool. |
+| stream | `stream_loop` in `stream_server.c` | JPEG-encodes and sends the preview to the connected viewer. |
+| stats | `stats_loop` | Logs ring occupancy and effects time every 5s. Purely diagnostic. |
 | config watcher | inside `config.c` | Watches the config file with inotify, republishes on change. |
 
-The stats thread is optional: if `pthread_create` fails for it, `main()` logs and
-carries on. The other three are fatal to start.
+The stats, recorder and stream threads are optional: if one fails to start, that
+feature is disabled with a log line and the pipeline carries on. The producer, effects
+and consumer threads are fatal to start.
+
+**Nothing slow runs on the consumer thread.** It feeds the virtual camera, which is
+what the pilot is looking at, so the two taps only take a copy (preview) or ownership
+(recording) of the frame and return. A full disk or a bad tether can cost recorded or
+previewed frames, never the live feed. See [output.md](output.md).
 
 Only the producer thread ever touches the camera device, and only the consumer thread
 ever touches the loopback device. That is what makes the reconnect logic tractable —
@@ -48,11 +56,17 @@ A frame's round trip:
 1. Producer pops an empty frame from **free**.
 2. Producer captures into it (writing `raw_planes`), stamps `pts`, pushes to **in**.
 3. Effects pops from **in**, runs the chain (writing `planes`), pushes to **out**.
-4. Consumer pops from **out**, writes to the loopback device, taps recording and
-   preview, pushes the frame back to **free**.
+4. Consumer pops from **out**, writes to the loopback device, offers the preview a
+   copy, then either hands the frame to the recorder (which pushes it back to **free**
+   once written) or pushes it back to **free** itself.
 
-The pool is allocated once, up front, and never grows. `ring_buffer_size - 1` frames,
-i.e. 31 — see [Ring buffers](#ring-buffers) for why one slot is missing.
+The pool is allocated once, up front, and never grows: `frame_pool_size` frames, 8.
+That is deliberately far below the rings' 31-slot capacity. Every pooled frame can end
+up queued in front of the virtual camera, so the pool size is also the worst-case lag
+between camera and output: 8 frames is ~270ms at 30fps, where the old 31 was a full
+second. When the pipeline falls behind, the producer blocks on an empty pool and the
+camera driver drops its oldest frames, which is the right trade for a live view. Each
+frame is three full I422 buffers, ~5.5MB at 720p, so it is also 44MB instead of 171MB.
 
 **A frame must never be abandoned.** If a frame is dropped instead of returned to
 **free**, it leaks out of the pool permanently and the pipeline runs one frame poorer
@@ -80,6 +94,13 @@ identical layout:
 | `spare_data` / `spare_planes` | scratch for chained neighborhood ops | effects |
 
 All three share one set of `plane_sizes[3]` and `stride[3]`.
+
+**The roles can move between allocations.** `owned[3]` holds the three blocks; the
+role pointers above say which block plays which part right now. A chain that finishes
+in spare swaps the work and spare roles instead of copying, and an empty chain points
+work at raw itself. `vf_restore_roles()` at the start of the next chain separates them
+again, and `vf_free()` frees `owned[]`, never the roles. Raw always stays on its own
+block.
 
 **Pixel format is I422 throughout** (planar YUV 4:2:2): a full-resolution Y plane, and
 U and V planes at half width, full height. So `stride[0] == width` and
@@ -137,12 +158,16 @@ five blocked pushes.
 
 `main()` in `eeye.c`. The order matters and is commented in place:
 
-1. **Re-exec with `OMP_WAIT_POLICY=passive`** if it is not already set. libgomp's
-   default makes every OpenMP worker busy-spin between parallel regions, which here run
-   once per frame with long gaps. Measured at ~178% CPU idle versus ~15–19% with the
-   variable set. It cannot be fixed in-process — neither `setenv` nor an early
-   constructor works — so the process replaces its own image via `execve("/proc/self/exe")`.
-   Guarded by `getenv` so it happens once.
+1. **Re-exec with `OMP_WAIT_POLICY=passive`** if neither it nor `GOMP_SPINCOUNT` is
+   set. libgomp's default makes every OpenMP worker busy-spin between parallel
+   regions, which here run once per frame with long gaps. Measured at ~178% CPU idle
+   versus ~15–19% with the variable set. A bounded spin (`GOMP_SPINCOUNT=10000`) was
+   also tried, to avoid waking the team at each region within a frame, and measured
+   worse: 55% CPU and 2.0–2.3ms of effects time per frame against 27% and 1.3ms
+   for passive, since spinning workers compete for cores with the other pipeline
+   threads. It cannot be fixed in-process — neither `setenv` nor an early
+   constructor works — so the process replaces its own image via
+   `execve("/proc/self/exe")`. Guarded by `getenv` so it happens once.
 2. **Signal handlers** for SIGINT/SIGTERM (flip `is_running`), SIGPIPE ignored.
 3. **`config_load_once()`** — reads geometry and startup-only keys. A malformed config
    aborts here, before anything else is allocated.
@@ -167,7 +192,9 @@ context.
 
 Every loop polls `is_running` on a bounded interval, so all three drain and join. The
 effects and consumer loops additionally keep running while their input ring is
-non-empty, so in-flight frames are finished rather than dropped. Then: join, final
+non-empty, so in-flight frames are finished rather than dropped. On its way out the
+consumer stops the recorder, which writes whatever it still has queued, closes the file
+and returns its frames to the pool, then stops the stream thread. Then: join, final
 stats snapshot, free the pool, and `atexit` unloads v4l2loopback if this process loaded
 it.
 
@@ -223,7 +250,9 @@ All in `video_threads.c` unless noted:
 | `STATS_LOG_INTERVAL_MS` | 5000 | |
 | `HEALTH_PUBLISH_INTERVAL_MS` | 1000 | |
 | `ring_buffer_size` | 32 | `frame_ring_buffer.h`; power of two enforced |
-| `send_timeout_ms` | 200 | `stream_server.c`; viewer dropped past this |
+| `send_timeout_ms` | 200 | `stream_server.c`; a viewer that can't take a whole frame in this long is dropped |
+| `frame_pool_size` | 8 | `eeye.c`; frames in circulation, and the worst-case output lag |
+| `recorder_max_queued` | 3 | `recorder.h`; frames the recording thread may hold before it drops |
 | `virtual_cam_video_nr` | 10 | `eeye.c` → `/dev/video10` |
 | `stream_server_port` | 9000 | `eeye.c` |
 

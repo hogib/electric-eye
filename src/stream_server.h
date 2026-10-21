@@ -17,9 +17,17 @@
  * consumer_loop in video_threads.c), so what goes out over this socket can
  * be lossy and throttled without losing anything that matters.
  *
- * Costs nothing when nobody is watching: stream_server_send_frame() checks
- * for a connected client before doing any JPEG work at all, so an unwatched
- * stream is just one idle listening socket, not a background encode loop.
+ * Costs nothing when nobody is watching: stream_server_offer_frame()
+ * checks for a connected client before copying anything, so an unwatched
+ * stream is just one idle listening socket and a sleeping thread.
+ *
+ * Encoding and sending happen on the server's own thread, never on the
+ * caller's: the caller is consumer_loop, which also feeds the local
+ * virtual camera, and a viewer on a marginal tether must not be able to
+ * stall that. The caller only copies the frame into a one-slot mailbox;
+ * if the stream thread is still busy with an earlier frame, the newer one
+ * replaces whatever is waiting -- a live preview wants the latest frame,
+ * not every frame.
  *
  * Wire format, repeated for each frame: a 4-byte big-endian frame length,
  * then that many bytes of one complete JPEG file (SOI...EOI).
@@ -27,28 +35,24 @@
 
 typedef struct StreamServer StreamServer;
 
-// Opens a listening TCP socket on `port` (all interfaces). Never blocks.
-// Returns NULL on failure (already logged); the caller should treat this as
-// non-fatal -- the local pipeline (virtual cam, recording) doesn't depend
-// on it.
+// Opens a listening TCP socket on `port` (all interfaces) and starts the
+// stream thread. Never blocks. Returns NULL on failure (already logged);
+// the caller should treat this as non-fatal -- the local pipeline (virtual
+// cam, recording) doesn't depend on it.
 StreamServer *stream_server_open(uint16_t port);
 
 /*
- * Opportunistically accepts a pending connection (replacing any existing
- * client -- this is a single-viewer server, last connection wins), then, if
- * a client is connected, JPEG-encodes `frame` at `quality` (1-100; see
- * turbojpeg.h's tjCompress2 for what this scale means) and writes it to
- * that client.
+ * Hands `frame` to the stream thread to JPEG-encode at `quality` (1-100;
+ * see turbojpeg.h's tjCompress2 for what this scale means) and send to the
+ * connected viewer. Copies the frame's work planes, so the caller may
+ * recycle the frame as soon as this returns.
  *
- * Returns false, without touching any client connection, if there is no
- * client connected -- so a caller can tell "no one is watching" apart from
- * "the encode/send itself failed" if it cares to. Also returns false, and
- * drops the connection, if the send fails or stalls past a bounded timeout
- * (see send_timeout_ms in stream_server.c): this is called from the same
- * thread that also feeds the local virtual camera, so a stuck or slow
- * network peer must never be able to stall that for long.
+ * Returns false, doing nothing, if no viewer is connected. Never blocks on
+ * the network: a viewer that cannot take a whole frame within
+ * send_timeout_ms (see stream_server.c) is dropped by the stream thread.
  */
-bool stream_server_send_frame(StreamServer *s, const VideoFrame *frame,
-                              int quality);
+bool stream_server_offer_frame(StreamServer *s, const VideoFrame *frame,
+                               int quality);
 
+// Stops the stream thread and closes every socket.
 void stream_server_close(StreamServer *s);
