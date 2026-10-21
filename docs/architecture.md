@@ -166,8 +166,11 @@ five blocked pushes.
    worse: 55% CPU and 2.0–2.3ms of effects time per frame against 27% and 1.3ms
    for passive, since spinning workers compete for cores with the other pipeline
    threads. It cannot be fixed in-process — neither `setenv` nor an early
-   constructor works — so the process replaces its own image via
-   `execve("/proc/self/exe")`. Guarded by `getenv` so it happens once.
+   constructor works — so the process replaces its own image, exec'ing the path
+   `/proc/self/exe` resolves to. Not `/proc/self/exe` itself: the kernel names a
+   process after the path it was exec'd from, so it would run as `exe` and
+   `pgrep eeye` / `pkill eeye` would not find it. Guarded by `getenv` so it happens
+   once.
 2. **Signal handlers** for SIGINT/SIGTERM (flip `is_running`), SIGPIPE ignored.
 3. **`config_load_once()`** — reads geometry and startup-only keys. A malformed config
    aborts here, before anything else is allocated.

@@ -130,6 +130,24 @@ StatsArgs stats_args = {
     .ring_buffer_free = &ring_buffer_free,
 };
 
+// The path main() re-executes. /proc/self/exe works as an execve() target
+// too, but the kernel names the new process after the last component of the
+// path it was exec'd from, so the daemon would run as "exe": invisible to
+// `pgrep eeye` / `pkill eeye` and mislabelled in ps and top. Its readlink()
+// target is the binary's real path, which keeps the name ("eeye", or
+// "eeye-d" for a debug build). Falls back to /proc/self/exe itself if the
+// link can't be read, or if the binary was replaced on disk while running
+// (it then reads back as "<path> (deleted)", which names nothing).
+static const char *self_exe_path(char *buf, size_t cap) {
+  ssize_t n = readlink("/proc/self/exe", buf, cap - 1);
+  if (n <= 0 || (size_t)n >= cap - 1)
+    return "/proc/self/exe";
+  buf[n] = '\0';
+  if (strstr(buf, " (deleted)"))
+    return "/proc/self/exe";
+  return buf;
+}
+
 int main(int argc, char **argv) {
   // libgomp's default OMP_WAIT_POLICY has each worker thread in a #pragma
   // omp parallel team (conv.c, point_opps.c) busy-spin for a few ms after
@@ -157,9 +175,11 @@ int main(int argc, char **argv) {
   // So: re-exec once, with the variable set, before doing anything else.
   // execve() replaces the process image outright, which re-runs every
   // constructor (including libgomp's) against the now-updated environment.
-  // /proc/self/exe -- the kernel's own resolved path to this running binary
-  // -- sidesteps the usual argv[0]-may-be-relative-or-bare problem that
-  // execve() (unlike execvp()) can't otherwise handle. Skipped when the
+  // The target is this binary's real path, from /proc/self/exe -- the
+  // kernel's own resolved path, which sidesteps the usual argv[0]-may-be-
+  // relative-or-bare problem that execve() (unlike execvp()) can't otherwise
+  // handle. See self_exe_path() for why not /proc/self/exe itself. Skipped
+  // when the
   // operator set either variable themselves (e.g. eeye.service's
   // Environment= line), and the re-exec'd image inherits the variable it
   // just set, so this only ever happens once.
@@ -172,7 +192,8 @@ int main(int argc, char **argv) {
     // the message above is silently lost every single time, on a redirected
     // file exactly as much as under journald's own pipe-backed capture.
     fflush(stdout);
-    execve("/proc/self/exe", argv, environ);
+    char exe_buf[4096];
+    execve(self_exe_path(exe_buf, sizeof exe_buf), argv, environ);
     // Only reached if execve() itself failed to start (e.g. /proc not
     // mounted) -- exec never returns on success. Degrade rather than abort:
     // the pipeline is still correct, it will just idle at a higher CPU cost
