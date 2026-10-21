@@ -1,3 +1,6 @@
+// _GNU_SOURCE before any header include: sem_clockwait() is a GNU extension
+// (glibc 2.30+), hidden in the strict ISO mode -std=c23 selects otherwise.
+#define _GNU_SOURCE
 #include "frame_ring_buffer.h"
 #include <assert.h>
 #include <errno.h>
@@ -12,8 +15,12 @@
 // ring arrives within a frame interval, tens of milliseconds at most.
 static constexpr long ring_wait_timeout_ns = 200000000;
 
+// Deadlines are on CLOCK_MONOTONIC (waited on with sem_clockwait rather
+// than sem_timedwait, which only takes CLOCK_REALTIME): a Pi has no RTC, so
+// its wall clock can be stepped by timesyncd at any point, and a backwards
+// step would stretch a wait that is supposed to notice shutdown in 200ms.
 static void add_timeout(struct timespec *ts) {
-  clock_gettime(CLOCK_REALTIME, ts);
+  clock_gettime(CLOCK_MONOTONIC, ts);
   ts->tv_nsec += ring_wait_timeout_ns;
   if (ts->tv_nsec >= 1000000000) {
     ts->tv_sec += 1;
@@ -88,7 +95,7 @@ bool ring_push_wait(FrameRingBuffer *rb, void *frame_ptr,
     struct timespec deadline;
     add_timeout(&deadline);
 
-    int r = sem_timedwait(&rb->empty, &deadline);
+    int r = sem_clockwait(&rb->empty, CLOCK_MONOTONIC, &deadline);
     if (r == 0)
       break; // a free slot is reserved for us -- push below cannot fail
     if (errno == EINTR)
@@ -120,7 +127,7 @@ bool ring_pop_wait(FrameRingBuffer *rb, void **frame_ptr,
     struct timespec deadline;
     add_timeout(&deadline);
 
-    int r = sem_timedwait(&rb->filled, &deadline);
+    int r = sem_clockwait(&rb->filled, CLOCK_MONOTONIC, &deadline);
     if (r == 0)
       break; // an item is reserved for us -- pop below cannot fail
     if (errno == EINTR)
