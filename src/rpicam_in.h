@@ -1,5 +1,6 @@
 #pragma once
 #include "camera_ctrl.h"
+#include "config.h"
 #include "video_frame.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,6 +32,15 @@
  * loudly. It costs a decode this project was already paying on the UVC
  * MJPEG path anyway.
  *
+ * "capture_format": "yuv420" opts into the raw path anyway, because the
+ * round trip is the largest CPU cost on this backend: rpicam-vid
+ * software-encodes every frame and eeye decodes it straight back. The
+ * padding rule is applied explicitly (see rpicam_in.c), and at the common
+ * widths -- 640, 1280, 1920 -- it pads nothing. It stays opt-in until it
+ * has been checked against a real camera: if libcamera's buffers carry
+ * padding beyond the row strides (e.g. extra rows), every frame after the
+ * first would be misaligned.
+ *
  * Note that rpicam-vid's MJPEG is 4:2:0 subsampled, not the 4:2:2 that
  * most UVC webcams produce -- jpeg_decode.c handles both.
  */
@@ -49,14 +59,19 @@ typedef struct RpicamIn RpicamIn;
  * restarting the child, which producer_loop handles.
  *
  * `downscale` follows the same contract as v4l2_in_open(): frames handed
- * back are width/downscale x height/downscale. It is applied during JPEG
- * decompression (see jpeg_decode.h), not as a separate pass.
+ * back are width/downscale x height/downscale. For MJPEG it is applied
+ * during JPEG decompression (see jpeg_decode.h); for yuv420 by a box
+ * average, keeping rpicam-vid at the full size so the sensor mode (and so
+ * the field of view) does not change with it.
+ *
+ * `format`: FORMAT_YUV420 for the raw path above, anything else for MJPEG.
  *
  * Returns NULL on failure, having already reported the reason.
  */
 RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
                          uint32_t framerate_hint, uint32_t downscale,
-                         const CameraControls *controls);
+                         const CameraControls *controls,
+                         CaptureFormat format);
 
 /*
  * Reads and decodes the next complete JPEG into frame->raw_planes.

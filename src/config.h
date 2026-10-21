@@ -44,7 +44,17 @@ typedef enum {
   FORMAT_AUTO = 0, // MJPEG if offered at this size, else YUYV
   FORMAT_MJPEG,    // MJPEG only; fail at startup if unavailable
   FORMAT_YUYV,     // YUYV only; fail at startup if unavailable
+  // rpicam backend only: take the ISP's raw 4:2:0 output instead of having
+  // rpicam-vid software-encode MJPEG that eeye then decodes. Opt-in until
+  // verified on real hardware -- see rpicam_in.c.
+  FORMAT_YUV420,
 } CaptureFormat;
+
+// What the recording tap writes -- see Config.record_format.
+typedef enum {
+  RECORD_RAW = 0, // decoded I422 planes, frames back to back (~55MB/s at 720p)
+  RECORD_MJPEG,   // the camera's own JPEG bytes, as received
+} RecordFormat;
 
 // One entry in an effect chain. Every stage carries its own parameters
 // (rather than one shared set for the whole Config) so e.g. two EFFECT_TINT
@@ -128,8 +138,15 @@ typedef struct {
   // non-empty, independent of whatever the effect chain above does to the
   // frame that's actually sent to the virtual camera -- see consumer_loop.
   // Empty string means recording is off. Written as raw I422 with no
-  // container; see video_threads.c's own note on how to play it back.
+  // container by default; see recorder.c for how to play it back.
   char record_path[max_record_path_len];
+
+  // "raw" (default) or "mjpeg". "mjpeg" writes the JPEG bytes the camera
+  // sent instead of the decoded frame: roughly an order of magnitude
+  // smaller, no encode cost, and one decode closer to the sensor. Only an
+  // MJPEG source has those bytes; with YUYV or yuv420 capture the recording
+  // falls back to raw and says so. Read when a recording starts.
+  RecordFormat record_format;
 
   // Camera controls -- exposure, gain, white balance and friends. Unlike
   // the geometry fields these ARE hot-reloadable: light changes as the
@@ -204,9 +221,10 @@ typedef struct {
   // otherwise depend on probe order.
   CaptureSource capture_source;
 
-  // Which pixel format to demand from a V4L2 camera. Startup-only, like
+  // Which pixel format to demand from the camera. Startup-only, like
   // capture_source -- the format is fixed for the lifetime of the open
-  // device. Ignored by the rpicam backend.
+  // device. "auto", "mjpeg" and "yuyv" are V4L2 choices (rpicam treats
+  // them all as MJPEG); "yuv420" is rpicam-only.
   CaptureFormat capture_format;
 } Config;
 

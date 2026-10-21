@@ -153,7 +153,7 @@ There is a second, short-lived fork: `rpicam_in_available()` runs
 cameras available" rather than the presence of a header, because the positive wording
 has changed across releases.
 
-### Why MJPEG and not `--codec yuv420`
+### MJPEG by default, `yuv420` opt-in
 
 The raw YUV output is **stride-padded** — Y rows to a multiple of 64 bytes, U/V to 32 —
 with no framing and no geometry in the stream, so a consumer must know the padding rule
@@ -161,15 +161,30 @@ to unpack it. That is the cause of a long tail of "corrupt raw output" reports
 upstream. MJPEG is self-delimiting and carries its own dimensions, so a frame either
 decodes correctly or fails loudly.
 
-The cost is real and worth knowing: `rpicam-vid` **software-encodes** the JPEG (its
-`mjpeg_encoder.cpp` uses libjpeg), and `eeye` immediately decodes it. That is two JPEG
-operations per frame on the Pi's CPU, where a USB webcam's own chip does the encode for
-free. Removing it is a live optimization option — see
-[extending.md](extending.md#remove-the-jpeg-round-trip-pi-camera).
+The cost is real: `rpicam-vid` **software-encodes** the JPEG (its `mjpeg_encoder.cpp`
+uses libjpeg), and `eeye` immediately decodes it. That is two JPEG operations per frame
+on the Pi's CPU, where a USB webcam's own chip does the encode for free.
+
+`"capture_format": "yuv420"` removes both. `rpicam_in.c` applies the padding rule
+explicitly (at 640, 1280 and 1920 wide it pads nothing), reads exactly one frame's bytes
+per capture, line-doubles 4:2:0 chroma into I422 (or box-averages, with `downscale`),
+and raises the pipe buffer to 1MB with `F_SETPIPE_SZ`, since 720p30 is ~41MB/s through
+it. `rpicam-vid` is asked for the full capture size either way, so the sensor mode and
+the field of view do not change with `downscale`.
+
+**It is opt-in because it is unverified on a real camera.** `rpicam-vid`'s null encoder
+writes each libcamera buffer whole. If those buffers carry padding beyond the row
+strides at some geometry, every frame after the first is misaligned, and with no
+markers in the stream nothing detects it. Turn it on, check a few minutes of video, then
+consider making it the default. The startup log states the frame size it expects:
+
+```
+rpicam_in: capturing raw yuv420 at 1280x720 (1382400 bytes per frame; no JPEG encode or decode)
+```
 
 `rpicam_jpeg_quality` is a compile-time constant (93) in `rpicam_in.c`. It is the
-*capture* quality feeding the whole pipeline — distinct from `stream_quality`, which
-only affects the preview.
+*capture* quality feeding the whole pipeline in MJPEG mode — distinct from
+`stream_quality`, which only affects the preview.
 
 ### Frame framing
 
@@ -185,6 +200,11 @@ end.
 Return values are three-way: a length, `0` for "need more bytes", or `SIZE_MAX` for
 "this is not a JPEG stream" — which the caller treats as a stream-level failure rather
 than waiting forever for a frame that will never come.
+
+The scan **resumes** across reads (`find_jpeg_end_resumable`): a frame arriving over
+several pipe reads is no longer rescanned from byte 0 after each one, and inside
+entropy-coded data `memchr` jumps from one `FF` to the next instead of testing every
+byte.
 
 Whatever follows a decoded frame stays in the buffer for the next call; a single
 `read()` routinely straddles a frame boundary.

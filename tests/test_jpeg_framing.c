@@ -197,6 +197,139 @@ static void test_incremental_feed_is_stable(void) {
   CHECK_EQ_INT(answer, j.len);
 }
 
+// The reader resumes the scan where the last read left off instead of
+// rescanning from byte 0. Fed in every chunk size -- so that chunk
+// boundaries land on every byte, including between an FF and its marker
+// byte -- it must agree with the one-shot scan exactly.
+static void test_resumed_scan_matches_one_shot(void) {
+  Jpeg j;
+  jpeg_start(&j);
+  jpeg_segment(&j, 0xDB, 64, 0x10);
+  // Entropy data dense with the tricky cases: stuffed FF 00, restart
+  // markers, fill bytes, and an FF right before EOI.
+  uint8_t entropy[300];
+  for (size_t i = 0; i < sizeof entropy; i += 6) {
+    entropy[i] = 0x11;
+    entropy[i + 1] = 0xFF;
+    entropy[i + 2] = 0x00;
+    entropy[i + 3] = 0xFF;
+    entropy[i + 4] = (uint8_t)(0xD0 + i % 8);
+    entropy[i + 5] = 0xFF;
+  }
+  entropy[sizeof entropy - 1] = 0x00; // ends on a stuffed FF 00 pair
+  jpeg_sos_and_data(&j, entropy, sizeof entropy);
+  jpeg_end(&j);
+  const size_t whole = find_jpeg_end(j.buf, j.len);
+  CHECK_EQ_INT(whole, j.len);
+
+  for (size_t chunk = 1; chunk <= 40; chunk++) {
+    size_t resume = 0, have = 0, answer = 0;
+    while (answer == 0 && have < j.len) {
+      have = have + chunk > j.len ? j.len : have + chunk;
+      answer = find_jpeg_end_resumable(j.buf, have, &resume);
+      if (have < j.len)
+        CHECK_EQ_INT(answer, 0);
+    }
+    CHECK_EQ_INT(answer, whole);
+  }
+}
+
+// --- yuv420 capture -----------------------------------------------------
+
+// Writes one stride-padded yuv420 frame the way rpicam-vid lays it out:
+// Y rows padded to 64 bytes, U and V rows to 32, padding filled with a
+// value that must never reach the output.
+static size_t make_yuv420(uint8_t *out, uint32_t w, uint32_t h, uint8_t seed) {
+  size_t ys = (w + 63) & ~63u, cs = (w / 2 + 31) & ~31u;
+  memset(out, 0xEE, ys * h + 2 * cs * (h / 2));
+  for (uint32_t y = 0; y < h; y++)
+    for (uint32_t x = 0; x < w; x++)
+      out[y * ys + x] = (uint8_t)(x * 3 + y * 5 + seed);
+  uint8_t *u = out + ys * h, *v = u + cs * (h / 2);
+  for (uint32_t y = 0; y < h / 2; y++)
+    for (uint32_t x = 0; x < w / 2; x++) {
+      u[y * cs + x] = (uint8_t)(x * 7 + y + seed);
+      v[y * cs + x] = (uint8_t)(255 - x - y * 9 - seed);
+    }
+  return ys * h + 2 * cs * (h / 2);
+}
+
+// Reads frames from a real pipe through capture_yuv420 and checks them
+// against an independent unpack: padding stripped, chroma line-doubled at
+// downscale 1, n x n/2 box-averaged otherwise.
+static void check_yuv420_capture(uint32_t w, uint32_t h, uint32_t n) {
+  int fds[2];
+  CHECK(pipe(fds) == 0);
+  RpicamIn in = {.fd = fds[0], .width = w, .height = h, .downscale = n,
+                 .format = FORMAT_YUV420};
+  in.y_stride = (w + 63) & ~63u;
+  in.c_stride = (w / 2 + 31) & ~31u;
+  in.yuv_frame_bytes = in.y_stride * h + 2 * in.c_stride * (h / 2);
+  in.buf = malloc(in.yuv_frame_bytes);
+  in.buf_cap = in.yuv_frame_bytes;
+
+  uint8_t *src = malloc(in.yuv_frame_bytes * 2);
+  make_yuv420(src, w, h, 1);
+  make_yuv420(src + in.yuv_frame_bytes, w, h, 2);
+  // Small frames only: both must fit in the pipe without a reader.
+  CHECK(write(fds[1], src, in.yuv_frame_bytes * 2) ==
+        (ssize_t)(in.yuv_frame_bytes * 2));
+
+  VideoFrame *f = vf_create(w / n, h / n, 0);
+  for (int k = 0; k < 2; k++) {
+    const uint8_t *ys = src + k * in.yuv_frame_bytes;
+    const uint8_t *us = ys + in.y_stride * h;
+    const uint8_t *vs = us + in.c_stride * (h / 2);
+    CHECK(capture_yuv420(&in, f));
+    int bad = 0;
+    for (uint32_t oy = 0; oy < h / n && !bad; oy++) {
+      for (uint32_t ox = 0; ox < w / n; ox++) {
+        uint32_t sum = 0;
+        for (uint32_t dy = 0; dy < n; dy++)
+          for (uint32_t dx = 0; dx < n; dx++)
+            sum += ys[(oy * n + dy) * in.y_stride + ox * n + dx];
+        uint8_t want = (uint8_t)((sum + n * n / 2) / (n * n));
+        if (f->raw_planes[0][oy * f->stride[0] + ox] != want)
+          bad = 1;
+      }
+      for (uint32_t cx = 0; cx < w / n / 2; cx++) {
+        for (int p = 1; p <= 2; p++) {
+          const uint8_t *cp = p == 1 ? us : vs;
+          uint32_t sum = 0, cnt = 0;
+          // Output row oy covers source luma rows [oy*n, oy*n + n), i.e.
+          // chroma rows [oy*n/2, (oy*n + n)/2) -- one row, shared by two
+          // output rows, at n == 1.
+          uint32_t r0 = oy * n / 2, r1 = (oy * n + n + 1) / 2;
+          for (uint32_t r = r0; r < r1; r++)
+            for (uint32_t dx = 0; dx < n; dx++, cnt++)
+              sum += cp[r * in.c_stride + cx * n + dx];
+          uint8_t want = (uint8_t)((sum + cnt / 2) / cnt);
+          if (f->raw_planes[p][oy * f->stride[p] + cx] != want)
+            bad = 1;
+        }
+      }
+    }
+    CHECK(!bad);
+    CHECK_EQ_INT(f->source_jpeg_len, 0);
+  }
+  vf_free(f);
+  free(src);
+  free(in.buf);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void test_yuv420_capture_strips_padding_and_doubles_chroma(void) {
+  check_yuv420_capture(64, 16, 1); // no padding at all
+  check_yuv420_capture(80, 12, 1); // Y and chroma rows both padded
+}
+
+static void test_yuv420_capture_downscales(void) {
+  check_yuv420_capture(64, 16, 2);
+  check_yuv420_capture(96, 16, 4);
+  check_yuv420_capture(128, 16, 8);
+}
+
 int main(void) {
   printf("test_jpeg_framing:\n");
   RUN_TEST(test_finds_end_of_simple_frame);
@@ -208,5 +341,8 @@ int main(void) {
   RUN_TEST(test_tiny_inputs);
   RUN_TEST(test_fill_bytes_before_marker);
   RUN_TEST(test_incremental_feed_is_stable);
+  RUN_TEST(test_resumed_scan_matches_one_shot);
+  RUN_TEST(test_yuv420_capture_strips_padding_and_doubles_chroma);
+  RUN_TEST(test_yuv420_capture_downscales);
   TEST_MAIN_END();
 }

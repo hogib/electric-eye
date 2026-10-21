@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "v4l2_in.c"
 #include "test_harness.h"
+#include <stdlib.h>
 
 // Runs a camera's whole mode list through the ranker, as enumerate_sizes
 // would, and returns the winner.
@@ -141,6 +142,51 @@ static void test_result_is_order_independent(void) {
   CHECK_EQ_INT(a.height, b.height);
 }
 
+// downscale_yuyv_frame divides its box sums by a shift instead of n * n.
+// Checked against plain division for every n config.c allows, on content
+// that makes the rounding term matter.
+static void test_yuyv_downscale_matches_box_average(void) {
+  const uint32_t ns[] = {2, 4, 8};
+  for (size_t k = 0; k < 3; k++) {
+    uint32_t n = ns[k], cw = 64, ch = 16;
+    uint8_t *yuyv = malloc((size_t)cw * ch * 2);
+    for (size_t i = 0; i < (size_t)cw * ch * 2; i++)
+      yuyv[i] = (uint8_t)(i * 37 + (i >> 3) * 11);
+    VideoFrame *f = vf_create(cw / n, ch / n, 0);
+    downscale_yuyv_frame(yuyv, f, cw, n);
+    int bad = 0;
+    for (uint32_t oy = 0; oy < ch / n; oy++) {
+      for (uint32_t ox = 0; ox < cw / n; ox++) {
+        uint32_t sum = 0;
+        for (uint32_t dy = 0; dy < n; dy++)
+          for (uint32_t dx = 0; dx < n; dx++)
+            sum += yuyv[((oy * n + dy) * cw + ox * n + dx) * 2];
+        if (f->raw_planes[0][oy * f->stride[0] + ox] !=
+            (uint8_t)((sum + n * n / 2) / (n * n)))
+          bad = 1;
+      }
+      for (uint32_t cx = 0; cx < cw / n / 2; cx++) {
+        uint32_t us = 0, vs = 0;
+        for (uint32_t dy = 0; dy < n; dy++)
+          for (uint32_t g = 0; g < n; g++) {
+            const uint8_t *grp = yuyv + ((oy * n + dy) * cw * 2) +
+                                 (size_t)(cx * n + g) * 4;
+            us += grp[1];
+            vs += grp[3];
+          }
+        if (f->raw_planes[1][oy * f->stride[1] + cx] !=
+                (uint8_t)((us + n * n / 2) / (n * n)) ||
+            f->raw_planes[2][oy * f->stride[2] + cx] !=
+                (uint8_t)((vs + n * n / 2) / (n * n)))
+          bad = 1;
+      }
+    }
+    CHECK(!bad);
+    vf_free(f);
+    free(yuyv);
+  }
+}
+
 int main(void) {
   printf("test_negotiation:\n");
   RUN_TEST(test_exact_match_wins_outright);
@@ -153,5 +199,6 @@ int main(void) {
   RUN_TEST(test_zero_and_degenerate_sizes_ignored);
   RUN_TEST(test_empty_mode_list_finds_nothing);
   RUN_TEST(test_result_is_order_independent);
+  RUN_TEST(test_yuyv_downscale_matches_box_average);
   TEST_MAIN_END();
 }

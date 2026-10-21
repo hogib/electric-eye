@@ -48,7 +48,7 @@ static bool capture_open(const ProducerArgs *args, CaptureHandle *h) {
     const Config *cfg = config_current(args->config);
     h->rpicam = rpicam_in_open(args->capture_width, args->capture_height,
                                CAMERA_FRAMERATE, args->downscale,
-                               &cfg->camera);
+                               &cfg->camera, args->capture_format);
     return h->rpicam != NULL;
   }
   h->v4l2 = v4l2_in_open(args->filename, args->capture_width,

@@ -44,7 +44,17 @@ struct RpicamIn {
   uint32_t height;
   uint32_t downscale;
 
-  JpegDecoder *decoder;
+  // FORMAT_YUV420 reads the ISP's raw output instead of MJPEG (see
+  // capture_yuv420); every other value means MJPEG here.
+  CaptureFormat format;
+  // yuv420 layout, from rpicam-vid's stride padding rule: Y rows padded to
+  // a multiple of 64 bytes, U and V rows to 32. No framing in the stream,
+  // so a frame is exactly yuv_frame_bytes.
+  size_t y_stride;
+  size_t c_stride;
+  size_t yuv_frame_bytes;
+
+  JpegDecoder *decoder; // MJPEG only
 
   // Accumulates bytes from the pipe until a complete JPEG is present.
   // Whatever follows a decoded frame stays here and is carried into the
@@ -55,6 +65,10 @@ struct RpicamIn {
   size_t buf_len;
 
   bool eof; // the child closed its stdout / exited
+
+  // Where find_jpeg_end should resume scanning the frame at the head of
+  // buf, so each read only scans the bytes it added. 0 = from the start.
+  size_t scan_pos;
 };
 
 // Runs `rpicam-vid --list-cameras` and reports whether it named at least
@@ -107,6 +121,9 @@ bool rpicam_in_available(void) {
   return strstr(out, "No cameras available") == NULL;
 }
 
+static size_t scan_entropy(const uint8_t *data, size_t size, size_t pos,
+                           size_t *resume);
+
 // Finds the end of the first complete JPEG in `data`, returning its total
 // length, or 0 if it isn't all here yet.
 //
@@ -120,7 +137,16 @@ bool rpicam_in_available(void) {
 //
 // Returns SIZE_MAX if the data is not a JPEG at all (no SOI), which the
 // caller treats as a stream-level failure rather than "need more bytes".
-static size_t find_jpeg_end(const uint8_t *data, size_t size) {
+//
+// *resume carries scan progress across calls on the same, growing buffer:
+// 0 to start fresh, and on a "need more bytes" return it is set to where
+// the next call can pick up -- past the header walk and past every byte of
+// entropy-coded data already ruled out. Without it, a frame arriving over
+// several pipe reads was rescanned from byte 0 after every one of them.
+static size_t find_jpeg_end_resumable(const uint8_t *data, size_t size,
+                                      size_t *resume) {
+  if (*resume > 0 && *resume < size)
+    return scan_entropy(data, size, *resume, resume);
   if (size < 2)
     return 0;
   if (data[0] != 0xFF || data[1] != 0xD8)
@@ -154,12 +180,29 @@ static size_t find_jpeg_end(const uint8_t *data, size_t size) {
   if (pos >= size)
     return 0; // SOS header not fully buffered yet
 
-  // Entropy-coded data: the only unstuffed FF sequences are markers.
+  return scan_entropy(data, size, pos, resume);
+}
+
+// The one-shot form, for callers (and tests) with a complete buffer.
+[[maybe_unused]] static size_t find_jpeg_end(const uint8_t *data,
+                                             size_t size) {
+  size_t resume = 0;
+  return find_jpeg_end_resumable(data, size, &resume);
+}
+
+// The entropy-coded part of find_jpeg_end, from `pos` on. The only
+// unstuffed FF sequences in it are markers, so memchr can skip straight
+// from one FF to the next instead of testing every byte.
+static size_t scan_entropy(const uint8_t *data, size_t size, size_t pos,
+                           size_t *resume) {
   while (pos + 1 < size) {
-    if (data[pos] != 0xFF) {
-      ++pos;
-      continue;
+    // Up to size - 2: an FF found there still has its marker byte in range.
+    const uint8_t *ff = memchr(data + pos, 0xFF, size - pos - 1);
+    if (!ff) {
+      pos = size - 1; // the last byte may be an FF whose marker is unread
+      break;
     }
+    pos = (size_t)(ff - data);
     uint8_t marker = data[pos + 1];
     if (marker == 0x00 || marker == 0xFF) {
       pos += 2; // stuffed literal FF, or a fill byte
@@ -176,13 +219,18 @@ static size_t find_jpeg_end(const uint8_t *data, size_t size) {
     // keep going. rpicam-vid emits baseline JPEG so this is defensive.
     pos += 2;
   }
+  *resume = pos;
   return 0; // need more bytes
 }
 
 // Pulls more bytes from the pipe into in->buf. Returns false only on a
 // hard failure (the child died, the pipe broke, the frame cap was hit);
 // a timeout with no data is reported by the caller's own retry budget.
-static bool fill_buffer(RpicamIn *in) {
+//
+// Never reads past `limit` bytes buffered: the yuv420 path reads exactly one
+// frame at a time (it has no framing to find a boundary with afterwards);
+// MJPEG passes SIZE_MAX.
+static bool fill_buffer(RpicamIn *in, size_t limit) {
   if (in->eof)
     return false;
 
@@ -218,7 +266,10 @@ static bool fill_buffer(RpicamIn *in) {
     in->buf_cap = want;
   }
 
-  ssize_t n = read(in->fd, in->buf + in->buf_len, in->buf_cap - in->buf_len);
+  size_t room = in->buf_cap - in->buf_len;
+  if (limit - in->buf_len < room)
+    room = limit - in->buf_len;
+  ssize_t n = read(in->fd, in->buf + in->buf_len, room);
   if (n < 0) {
     if (errno == EINTR || errno == EAGAIN)
       return true;
@@ -234,18 +285,97 @@ static bool fill_buffer(RpicamIn *in) {
   return true;
 }
 
+// Box-averages (or, at downscale 1, copies) one stride-padded yuv420 frame
+// from in->buf into the frame's I422 planes. 4:2:0 chroma is half height,
+// so at downscale 1 each chroma row is written twice -- the same line
+// doubling decode_420_to_i422 does for 4:2:0 JPEGs. At downscale n, output
+// chroma sample (cx, oy) covers source chroma columns [cx*n, cx*n + n) and
+// rows [oy*n/2, oy*n/2 + n/2): n * n/2 samples, a power of two.
+static void unpack_yuv420(const RpicamIn *in, VideoFrame *frame) {
+  const uint32_t n = in->downscale;
+  const uint8_t *y_src = in->buf;
+  const uint8_t *u_src = y_src + in->y_stride * in->height;
+  const uint8_t *v_src = u_src + in->c_stride * (in->height / 2);
+  const uint32_t out_w = frame->width, out_h = frame->height;
+  const uint32_t chroma_w = out_w / 2;
+
+  if (n == 1) {
+    for (uint32_t y = 0; y < out_h; ++y)
+      memcpy(frame->raw_planes[0] + (size_t)y * frame->stride[0],
+             y_src + (size_t)y * in->y_stride, out_w);
+    for (uint32_t sy = 0; sy < out_h / 2; ++sy) {
+      for (int p = 1; p <= 2; ++p) {
+        const uint8_t *row = (p == 1 ? u_src : v_src) + (size_t)sy * in->c_stride;
+        uint8_t *dst = frame->raw_planes[p];
+        memcpy(dst + (size_t)(2 * sy) * frame->stride[p], row, chroma_w);
+        memcpy(dst + (size_t)(2 * sy + 1) * frame->stride[p], row, chroma_w);
+      }
+    }
+    return;
+  }
+
+  const uint32_t y_shift = 2u * (uint32_t)__builtin_ctz(n);
+  const uint32_t c_rows = n / 2;
+  const uint32_t c_shift = y_shift - 1; // n * n/2 samples
+#pragma omp parallel for
+  for (uint32_t oy = 0; oy < out_h; ++oy) {
+    uint8_t *y_row = frame->raw_planes[0] + (size_t)oy * frame->stride[0];
+    for (uint32_t ox = 0; ox < out_w; ++ox) {
+      uint32_t sum = 0;
+      for (uint32_t dy = 0; dy < n; ++dy) {
+        const uint8_t *r = y_src + (size_t)(oy * n + dy) * in->y_stride;
+        for (uint32_t dx = 0; dx < n; ++dx)
+          sum += r[ox * n + dx];
+      }
+      y_row[ox] = (uint8_t)((sum + (1u << (y_shift - 1))) >> y_shift);
+    }
+    for (int p = 1; p <= 2; ++p) {
+      const uint8_t *plane = p == 1 ? u_src : v_src;
+      uint8_t *c_row = frame->raw_planes[p] + (size_t)oy * frame->stride[p];
+      for (uint32_t cx = 0; cx < chroma_w; ++cx) {
+        uint32_t sum = 0;
+        for (uint32_t dy = 0; dy < c_rows; ++dy) {
+          const uint8_t *r =
+              plane + (size_t)(oy * c_rows + dy) * in->c_stride;
+          for (uint32_t dx = 0; dx < n; ++dx)
+            sum += r[cx * n + dx];
+        }
+        c_row[cx] = (uint8_t)((sum + (1u << (c_shift - 1))) >> c_shift);
+      }
+    }
+  }
+}
+
+// One yuv420 frame: exactly yuv_frame_bytes off the pipe, no framing to
+// find. Any read failure is a stream failure -- with no markers there is no
+// way to resynchronize on a partial frame, so the caller reopens.
+static bool capture_yuv420(RpicamIn *in, VideoFrame *frame) {
+  while (in->buf_len < in->yuv_frame_bytes) {
+    if (!fill_buffer(in, in->yuv_frame_bytes))
+      return false;
+  }
+  unpack_yuv420(in, frame);
+  frame->source_jpeg_len = 0; // never was a JPEG
+  in->buf_len = 0;
+  return true;
+}
+
 bool rpicam_in_capture(RpicamIn *in, VideoFrame *frame) {
+  if (in->format == FORMAT_YUV420)
+    return capture_yuv420(in, frame);
+
   // Same retry budget and rationale as v4l2_in_capture(): an isolated
   // corrupt frame is absorbed, a format mismatch returns immediately.
   for (int attempt = 0; attempt < 5; attempt++) {
-    size_t frame_len = find_jpeg_end(in->buf, in->buf_len);
+    size_t frame_len =
+        find_jpeg_end_resumable(in->buf, in->buf_len, &in->scan_pos);
 
     if (frame_len == SIZE_MAX) {
       printf("rpicam_in: rpicam-vid's output is not a JPEG stream\n");
       return false;
     }
     if (frame_len == 0) {
-      if (!fill_buffer(in))
+      if (!fill_buffer(in, SIZE_MAX))
         return false;
       // Not a failed attempt -- no frame was available to try yet.
       --attempt;
@@ -260,6 +390,7 @@ bool rpicam_in_capture(RpicamIn *in, VideoFrame *frame) {
     // the same bad bytes forever.
     memmove(in->buf, in->buf + frame_len, in->buf_len - frame_len);
     in->buf_len -= frame_len;
+    in->scan_pos = 0;
 
     if (result == JPEG_DECODE_OK)
       return true;
@@ -275,7 +406,9 @@ bool rpicam_in_capture(RpicamIn *in, VideoFrame *frame) {
 
 RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
                          uint32_t framerate_hint, uint32_t downscale,
-                         const CameraControls *controls) {
+                         const CameraControls *controls,
+                         CaptureFormat format) {
+  const bool yuv420 = format == FORMAT_YUV420;
   if (downscale == 0)
     downscale = 1;
 
@@ -299,15 +432,17 @@ RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
   size_t argc = 0;
   argv[argc++] = "rpicam-vid";
   argv[argc++] = "--codec";
-  argv[argc++] = "mjpeg";
+  argv[argc++] = yuv420 ? "yuv420" : "mjpeg";
   argv[argc++] = "--width";
   argv[argc++] = width_arg;
   argv[argc++] = "--height";
   argv[argc++] = height_arg;
   argv[argc++] = "--framerate";
   argv[argc++] = fps_arg;
-  argv[argc++] = "--quality";
-  argv[argc++] = quality_arg;
+  if (!yuv420) {
+    argv[argc++] = "--quality";
+    argv[argc++] = quality_arg;
+  }
   argv[argc++] = "-t";
   argv[argc++] = "0";
   argv[argc++] = "-n";
@@ -375,11 +510,36 @@ RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
   in->width = width;
   in->height = height;
   in->downscale = downscale;
+  in->format = yuv420 ? FORMAT_YUV420 : FORMAT_MJPEG;
 
-  in->decoder = jpeg_decoder_create(width, height);
-  if (!in->decoder) {
-    rpicam_in_close(in);
-    return NULL;
+#if defined(F_SETPIPE_SZ)
+  // yuv420 moves ~41MB/s at 720p30 through this pipe; a 1MB pipe buffer
+  // (up from 64KB) takes that in a few reads per frame instead of ~20.
+  // Best-effort: past /proc/sys/fs/pipe-max-size this simply fails.
+  if (yuv420)
+    fcntl(in->fd, F_SETPIPE_SZ, 1 << 20);
+#endif
+
+  if (yuv420) {
+    in->y_stride = ((size_t)width + 63) & ~(size_t)63;
+    in->c_stride = ((size_t)width / 2 + 31) & ~(size_t)31;
+    in->yuv_frame_bytes =
+        in->y_stride * height + 2 * in->c_stride * (height / 2);
+    in->buf = malloc(in->yuv_frame_bytes);
+    if (!in->buf) {
+      rpicam_in_close(in);
+      return NULL;
+    }
+    in->buf_cap = in->yuv_frame_bytes;
+    printf("rpicam_in: capturing raw yuv420 at %ux%u (%zu bytes per frame; "
+           "no JPEG encode or decode)\n",
+           width, height, in->yuv_frame_bytes);
+  } else {
+    in->decoder = jpeg_decoder_create(width, height);
+    if (!in->decoder) {
+      rpicam_in_close(in);
+      return NULL;
+    }
   }
 
   // Probe one real frame before declaring success, for the same reason

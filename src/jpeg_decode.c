@@ -266,13 +266,28 @@ static JpegDecodeResult decode_420_to_i422(JpegDecoder *dec,
   return JPEG_DECODE_OK;
 }
 
+static JpegDecodeResult decode_frame(JpegDecoder *dec, const uint8_t *data,
+                                     size_t size, VideoFrame *frame);
+
 JpegDecodeResult jpeg_decode_frame(JpegDecoder *dec, const uint8_t *data,
                                    size_t size, VideoFrame *frame) {
+  frame->source_jpeg_len = 0;
   if (!ensure_dht(dec, data, size, &data, &size)) {
     printf("jpeg_decode: out of memory augmenting a DHT-less frame\n");
     return JPEG_DECODE_TRANSIENT_FAIL;
   }
+  JpegDecodeResult result = decode_frame(dec, data, size, frame);
+  // Keep the bytes this frame came from for record_format "mjpeg" -- after
+  // ensure_dht(), so a recording of a DHT-less camera is still a stream
+  // any player can decode. A failed copy only costs that frame's place in
+  // an MJPEG recording (recorder.c counts it as dropped), not the frame.
+  if (result == JPEG_DECODE_OK)
+    vf_set_source_jpeg(frame, data, size);
+  return result;
+}
 
+static JpegDecodeResult decode_frame(JpegDecoder *dec, const uint8_t *data,
+                                     size_t size, VideoFrame *frame) {
   int jw, jh, jsubsamp, jcolorspace;
   if (tjDecompressHeader3(dec->handle, data, size, &jw, &jh, &jsubsamp,
                           &jcolorspace) < 0) {

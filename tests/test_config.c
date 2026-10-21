@@ -470,6 +470,32 @@ static void test_whitespace_and_key_order(void) {
   CHECK_EQ_INT(c.capture_width, 640);
 }
 
+// record_format defaults to raw, so existing recordings and their playback
+// commands are unchanged unless an operator opts in.
+static void test_record_format_values(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK_EQ_INT(c.record_format, RECORD_RAW);
+  CHECK(parse("{\"record_format\":\"mjpeg\"}", &c));
+  CHECK_EQ_INT(c.record_format, RECORD_MJPEG);
+  CHECK(parse("{\"record_format\":\"raw\"}", &c));
+  CHECK_EQ_INT(c.record_format, RECORD_RAW);
+  CHECK(!parse("{\"record_format\":\"mp4\"}", &c));
+  CHECK(!parse("{\"record_format\":0}", &c));
+}
+
+// yuv420 is the Pi camera's raw output; asking a V4L2 webcam for it is a
+// mistake worth refusing up front. "auto" is settled at startup instead.
+static void test_yuv420_is_rpicam_only(void) {
+  Config c;
+  CHECK(parse("{\"capture_source\":\"rpicam\",\"capture_format\":\"yuv420\"}",
+              &c));
+  CHECK_EQ_INT(c.capture_format, FORMAT_YUV420);
+  CHECK(parse("{\"capture_format\":\"yuv420\"}", &c)); // source "auto"
+  CHECK(!parse("{\"capture_source\":\"v4l2\",\"capture_format\":\"yuv420\"}",
+               &c));
+}
+
 int main(void) {
   printf("test_config:\n");
   RUN_TEST(test_defaults_match_documentation);
@@ -499,5 +525,7 @@ int main(void) {
   RUN_TEST(test_max_chain_length_accepted);
   RUN_TEST(test_output_geometry_division);
   RUN_TEST(test_whitespace_and_key_order);
+  RUN_TEST(test_record_format_values);
+  RUN_TEST(test_yuv420_is_rpicam_only);
   TEST_MAIN_END();
 }

@@ -43,6 +43,7 @@ static const Config config_defaults = {
     .stages = {{.effect = EFFECT_SOBEL}},
     .stage_count = 1,
     .record_path = "",
+    .record_format = RECORD_RAW,
     .stream_frame_interval = 0, // off by default -- no JPEG work, no socket traffic
     .stream_quality = 60,
     .stream_raw = false,
@@ -792,9 +793,27 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           parsed.capture_format = FORMAT_MJPEG;
         } else if (strcmp(fmt, "yuyv") == 0) {
           parsed.capture_format = FORMAT_YUYV;
+        } else if (strcmp(fmt, "yuv420") == 0) {
+          parsed.capture_format = FORMAT_YUV420;
         } else {
           printf("Config: unknown \"capture_format\": \"%s\" (expected "
-                 "\"auto\", \"mjpeg\", or \"yuyv\")\n",
+                 "\"auto\", \"mjpeg\", \"yuyv\", or \"yuv420\")\n",
+                 fmt);
+          return false;
+        }
+      } else if (strcmp(key, "record_format") == 0) {
+        char fmt[16];
+        if (!parse_string(&c, fmt, sizeof fmt)) {
+          printf("Config: invalid value for \"record_format\"\n");
+          return false;
+        }
+        if (strcmp(fmt, "raw") == 0) {
+          parsed.record_format = RECORD_RAW;
+        } else if (strcmp(fmt, "mjpeg") == 0) {
+          parsed.record_format = RECORD_MJPEG;
+        } else {
+          printf("Config: unknown \"record_format\": \"%s\" (expected "
+                 "\"raw\" or \"mjpeg\")\n",
                  fmt);
           return false;
         }
@@ -880,6 +899,17 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
   // capture height to be a multiple of 2*downscale covers both layouts
   // with one rule rather than making the valid geometries depend on which
   // camera happens to be attached.
+  // yuv420 is raw output from rpicam-vid; there is no such V4L2 format
+  // here to ask a webcam for. "auto" is settled at startup, and eeye.c
+  // refuses the combination there if the probe picks V4L2.
+  if (parsed.capture_format == FORMAT_YUV420 &&
+      parsed.capture_source == CAPTURE_V4L2) {
+    printf("Config: \"capture_format\": \"yuv420\" needs \"capture_source\": "
+           "\"rpicam\" -- it is the Pi camera's raw output, not a V4L2 "
+           "format\n");
+    return false;
+  }
+
   uint32_t wstep = (uint32_t)parsed.downscale * 2u;
   if (parsed.capture_width % wstep != 0 ||
       parsed.capture_height % wstep != 0) {

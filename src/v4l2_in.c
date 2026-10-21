@@ -78,6 +78,9 @@ static void downscale_yuyv_frame(const uint8_t *yuyv, VideoFrame *frame,
                                  uint32_t cap_width, uint32_t n) {
   const size_t src_stride = (size_t)cap_width * 2;
   const uint32_t half = n * n / 2; // rounding term for the averages below
+  // n is 2, 4 or 8 (config.c allows nothing else), so dividing by n * n is
+  // an exact shift -- one instruction instead of a divide per output pixel.
+  const uint32_t shift = 2u * (uint32_t)__builtin_ctz(n);
 
   uint8_t *y_plane = frame->raw_planes[0];
   uint8_t *u_plane = frame->raw_planes[1];
@@ -99,7 +102,7 @@ static void downscale_yuyv_frame(const uint8_t *yuyv, VideoFrame *frame,
         for (uint32_t dx = 0; dx < n; ++dx)
           sum += r[(size_t)(ox * n + dx) * 2];
       }
-      y_row[ox] = (uint8_t)((sum + half) / (n * n));
+      y_row[ox] = (uint8_t)((sum + half) >> shift);
     }
 
     uint8_t *u_row = u_plane + (size_t)oy * c_stride;
@@ -114,8 +117,8 @@ static void downscale_yuyv_frame(const uint8_t *yuyv, VideoFrame *frame,
           v_sum += grp[3];
         }
       }
-      u_row[cx] = (uint8_t)((u_sum + half) / (n * n));
-      v_row[cx] = (uint8_t)((v_sum + half) / (n * n));
+      u_row[cx] = (uint8_t)((u_sum + half) >> shift);
+      v_row[cx] = (uint8_t)((v_sum + half) >> shift);
     }
   }
 }
@@ -228,6 +231,7 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
     }
 
     const uint8_t *data = (const uint8_t *)in->buffers[buf.index].start;
+    frame->source_jpeg_len = 0; // set again by a successful MJPEG decode
     JpegDecodeResult result =
         (in->capture_format == V4L2_PIX_FMT_MJPEG)
             ? jpeg_decode_frame(in->jpeg_decoder, data, buf.bytesused, frame)
