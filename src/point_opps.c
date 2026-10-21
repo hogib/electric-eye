@@ -133,7 +133,8 @@ void gs_contrast_normalize(const uint8_t *src, uint8_t *dst, uint32_t width,
   float scale = (float)y_plain_max_jpeg / (r_max - r_min);
   uint8_t lut[256];
 
-#pragma omp parallel for
+  // Serial on purpose: 256 iterations are far less work than waking the
+  // OpenMP team to share them.
   for (int i = 0; i <= y_plain_max_jpeg; ++i) {
     float val = (i - r_min) * scale;
     if (val > (float)y_plain_max_jpeg)

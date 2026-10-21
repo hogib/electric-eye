@@ -253,8 +253,8 @@ static void test_point_ops_around_neighborhood_op(void) {
 }
 
 // The chain must always leave its result in frame->planes -- the rest of
-// the pipeline reads nothing else. Two neighborhood ops leave the result
-// in `spare` mid-chain, so the final copy-back is what makes this hold.
+// the pipeline reads nothing else. Neighborhood ops ping-pong through
+// `spare`, so the final hand-over is what makes this hold.
 static void test_result_always_lands_in_work_buffer(void) {
   VideoFrame *frame = make_frame(64, 32, 88);
   Config cfg = {0};
@@ -274,6 +274,141 @@ static void test_result_always_lands_in_work_buffer(void) {
   vf_free(frame);
 }
 
+// Runs `stages` through the production chain and requires the result to
+// equal running gaussian_blur (all three planes, the unoptimized way) and
+// then `finish` by hand. Blur skips chroma whenever a later stage would
+// throw it away; that is only allowed when it changes nothing visible.
+typedef void (*Finish)(VideoFrame *f, const uint8_t *const blurred[3],
+                       uint8_t *const out[3]);
+
+static void finish_sobel(VideoFrame *f, const uint8_t *const in[3],
+                         uint8_t *const out[3]) {
+  sobel_edges(in, out, f->width, f->height, f->stride, 0);
+}
+static void finish_canny(VideoFrame *f, const uint8_t *const in[3],
+                         uint8_t *const out[3]) {
+  canny_edges(in, out, f->width, f->height, f->stride, 1, 20, 60);
+}
+static void finish_grayscale(VideoFrame *f, const uint8_t *const in[3],
+                             uint8_t *const out[3]) {
+  memcpy(out[0], in[0], f->plane_sizes[0]);
+  memset(out[1], 128, f->plane_sizes[1]);
+  memset(out[2], 128, f->plane_sizes[2]);
+}
+static void finish_invert(VideoFrame *f, const uint8_t *const in[3],
+                          uint8_t *const out[3]) {
+  for (size_t i = 0; i < f->plane_sizes[0]; i++)
+    out[0][i] = (uint8_t)(255 - in[0][i]);
+  memcpy(out[1], in[1], f->plane_sizes[1]);
+  memcpy(out[2], in[2], f->plane_sizes[2]);
+}
+
+static void check_blur_then(const EffectStage *stages, size_t count,
+                            Finish finish) {
+  VideoFrame *frame = make_frame(66, 32, 31);
+  VideoFrame *ref = make_frame(66, 32, 31); // same content
+  Config cfg = {0};
+  cfg.stage_count = count;
+  for (size_t i = 0; i < count; i++)
+    cfg.stages[i] = stages[i];
+
+  const uint8_t *raw[3] = {ref->raw_planes[0], ref->raw_planes[1],
+                           ref->raw_planes[2]};
+  uint8_t *blurred[3] = {ref->spare_planes[0], ref->spare_planes[1],
+                         ref->spare_planes[2]};
+  gaussian_blur(raw, blurred, ref->width, ref->height, ref->stride,
+                stages[0].blur_strength);
+  finish(ref, (const uint8_t *const *)blurred, ref->planes);
+
+  apply_effect_chain(frame, &cfg);
+  for (int p = 0; p < 3; p++)
+    CHECK_MEM_EQ(frame->planes[p], ref->planes[p], frame->plane_sizes[p]);
+  vf_free(frame);
+  vf_free(ref);
+}
+
+static void test_blur_skipping_dead_chroma_changes_nothing(void) {
+  check_blur_then(STAGES({.effect = EFFECT_BLUR}, {.effect = EFFECT_SOBEL}),
+                  2, finish_sobel);
+  check_blur_then(STAGES({.effect = EFFECT_BLUR, .blur_strength = 5},
+                         {.effect = EFFECT_SOBEL}),
+                  2, finish_sobel);
+  check_blur_then(STAGES({.effect = EFFECT_BLUR},
+                         {.effect = EFFECT_CANNY, .canny_strength = 1,
+                          .canny_low = 20, .canny_high = 60}),
+                  2, finish_canny);
+  check_blur_then(STAGES({.effect = EFFECT_BLUR},
+                         {.effect = EFFECT_GRAYSCALE}),
+                  2, finish_grayscale);
+}
+
+// The other side of the same rule: chroma that does reach the output has
+// to be blurred, even when a luma-only stage sits in between.
+static void test_blur_keeps_live_chroma(void) {
+  check_blur_then(STAGES({.effect = EFFECT_BLUR}, {.effect = EFFECT_INVERT}),
+                  2, finish_invert);
+  check_blur_then(STAGES({.effect = EFFECT_BLUR, .blur_strength = 4},
+                         {.effect = EFFECT_INVERT}),
+                  2, finish_invert);
+}
+
+// A chain ending in spare hands its result over by swapping the work and
+// spare roles, not by copying 1.8MB at 720p.
+static void test_result_in_spare_is_swapped_not_copied(void) {
+  VideoFrame *frame = make_frame(64, 32, 21);
+  uint8_t *spare_before = frame->spare_data;
+  Config cfg = {0};
+  cfg.stage_count = 1;
+  cfg.stages[0] = (EffectStage){.effect = EFFECT_SOBEL};
+  apply_effect_chain(frame, &cfg);
+  CHECK(frame->pixel_data == spare_before);
+  CHECK(frame->spare_data != frame->pixel_data);
+  CHECK(frame->spare_data != frame->raw_data);
+  vf_free(frame);
+}
+
+// An empty chain points work at raw. The next trip through the pool must
+// not then write into raw: the frame is recycled, the producer refills
+// raw, and a real chain runs -- raw has to come out untouched and the
+// output right.
+static void test_empty_chain_aliasing_is_undone_next_frame(void) {
+  VideoFrame *frame = make_frame(64, 32, 5);
+  Config empty = {0};
+  Config invert = {0};
+  invert.stage_count = 1;
+  invert.stages[0] = (EffectStage){.effect = EFFECT_INVERT};
+  Config blur = {0};
+  blur.stage_count = 1;
+  blur.stages[0] = (EffectStage){.effect = EFFECT_BLUR};
+
+  size_t n = frame->plane_sizes[0];
+  uint8_t *raw_copy = malloc(n);
+  const Config *sequence[] = {&empty, &invert, &empty, &blur, &empty,
+                              &empty, &invert, &blur, &invert, &empty};
+  for (size_t k = 0; k < sizeof sequence / sizeof sequence[0]; k++) {
+    // What the producer does: new camera content into raw.
+    for (size_t i = 0; i < n; i++)
+      frame->raw_planes[0][i] = (uint8_t)(i * 7 + k * 13);
+    memcpy(raw_copy, frame->raw_planes[0], n);
+
+    apply_effect_chain(frame, sequence[k]);
+
+    CHECK_MEM_EQ(frame->raw_planes[0], raw_copy, n); // raw never written
+    if (sequence[k] == &empty) {
+      CHECK(frame->pixel_data == frame->raw_data);
+    } else {
+      CHECK(frame->pixel_data != frame->raw_data);
+      CHECK(frame->spare_data != frame->raw_data);
+      CHECK(frame->spare_data != frame->pixel_data);
+    }
+    if (sequence[k] == &invert)
+      for (size_t i = 0; i < n; i++)
+        CHECK_EQ_INT(frame->planes[0][i], 255 - raw_copy[i]);
+  }
+  free(raw_copy);
+  vf_free(frame); // must free each allocation exactly once
+}
+
 int main(void) {
   printf("test_effect_chain:\n");
   RUN_TEST(test_single_point_ops);
@@ -285,5 +420,9 @@ int main(void) {
   RUN_TEST(test_empty_chain_passes_frame_through);
   RUN_TEST(test_point_ops_around_neighborhood_op);
   RUN_TEST(test_result_always_lands_in_work_buffer);
+  RUN_TEST(test_blur_skipping_dead_chroma_changes_nothing);
+  RUN_TEST(test_blur_keeps_live_chroma);
+  RUN_TEST(test_result_in_spare_is_swapped_not_copied);
+  RUN_TEST(test_empty_chain_aliasing_is_undone_next_frame);
   TEST_MAIN_END();
 }

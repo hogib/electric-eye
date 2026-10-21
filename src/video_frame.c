@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /*
  *@params:
@@ -86,6 +87,10 @@ VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts) {
   frame->spare_planes[1] = frame->spare_data + y_size;
   frame->spare_planes[2] = frame->spare_data + y_size + u_size;
 
+  frame->owned[0] = frame->pixel_data;
+  frame->owned[1] = frame->raw_data;
+  frame->owned[2] = frame->spare_data;
+
   return frame;
 }
 
@@ -93,19 +98,56 @@ void vf_free(VideoFrame *frame) {
   if (!frame)
     return;
 
-  if (frame->pixel_data) {
-    free(frame->pixel_data);
-  }
-
-  if (frame->raw_data) {
-    free(frame->raw_data);
-  }
-
-  if (frame->spare_data) {
-    free(frame->spare_data);
-  }
+  // owned[], not the role pointers: after an empty chain pixel_data and
+  // raw_data are the same block, and freeing by role would free it twice.
+  for (uint32_t i = 0; i < max_planes; ++i)
+    free(frame->owned[i]);
+  free(frame->source_jpeg);
 
   free(frame);
+}
+
+static void set_planes(uint8_t *planes[max_planes], uint8_t *data,
+                       const size_t plane_sizes[max_planes]) {
+  planes[0] = data;
+  planes[1] = data + plane_sizes[0];
+  planes[2] = data + plane_sizes[0] + plane_sizes[1];
+}
+
+void vf_set_work(VideoFrame *frame, uint8_t *data) {
+  frame->pixel_data = data;
+  set_planes(frame->planes, data, frame->plane_sizes);
+}
+
+void vf_swap_work_spare(VideoFrame *frame) {
+  uint8_t *work = frame->pixel_data;
+  vf_set_work(frame, frame->spare_data);
+  frame->spare_data = work;
+  set_planes(frame->spare_planes, work, frame->plane_sizes);
+}
+
+void vf_restore_roles(VideoFrame *frame) {
+  if (frame->pixel_data != frame->raw_data)
+    return;
+  // spare never moves onto raw, so the one allocation that is neither raw
+  // nor spare is the one work was using before it was pointed at raw.
+  uint8_t *free_block = frame->owned[0] == frame->spare_data ? frame->owned[2]
+                                                             : frame->owned[0];
+  vf_set_work(frame, free_block);
+}
+
+bool vf_set_source_jpeg(VideoFrame *frame, const uint8_t *data, size_t len) {
+  frame->source_jpeg_len = 0;
+  if (frame->source_jpeg_cap < len) {
+    uint8_t *grown = realloc(frame->source_jpeg, len);
+    if (!grown)
+      return false;
+    frame->source_jpeg = grown;
+    frame->source_jpeg_cap = len;
+  }
+  memcpy(frame->source_jpeg, data, len);
+  frame->source_jpeg_len = len;
+  return true;
 }
 
 void vf_pool_free(VideoFrame **pool, unsigned int allocated_size) {

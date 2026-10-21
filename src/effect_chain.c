@@ -39,15 +39,6 @@ static void chain_buf_planes_mut(VideoFrame *frame, ChainBuf which,
   out[2] = src[2];
 }
 
-static uint8_t *chain_buf_data(VideoFrame *frame, ChainBuf which) {
-  switch (which) {
-  case CHAIN_RAW: return frame->raw_data;
-  case CHAIN_WORK: return frame->pixel_data;
-  case CHAIN_SPARE: return frame->spare_data;
-  default: return NULL; // unreachable
-  }
-}
-
 static bool is_point_op(EffectType e) {
   switch (e) {
   case EFFECT_NONE:
@@ -217,8 +208,53 @@ static void fuse_point_op_run(const Config *cfg, size_t *i, uint8_t lut_y[256],
   }
 }
 
+// Does stage `e` overwrite chroma without reading it? Edge maps reset both
+// chroma planes to neutral, and grayscale's composed chroma LUT is a
+// constant (see lut_is_constant), so whatever chroma reached them is never
+// looked at.
+static bool kills_chroma(EffectType e) {
+  return e == EFFECT_SOBEL || e == EFFECT_LOG || e == EFFECT_CANNY ||
+         e == EFFECT_GRAYSCALE;
+}
+
+// Does stage `e` pass chroma through untouched (copied at most)?
+static bool passes_chroma(EffectType e) {
+  return e == EFFECT_NONE || e == EFFECT_INVERT || e == EFFECT_THRESHOLD ||
+         e == EFFECT_CONTRAST;
+}
+
+// chroma_live[i]: whether the chroma stage i produces is ever looked at --
+// by a later stage, or by the output once the chain ends. Computed back to
+// front. A blur whose chroma is dead blurs luma only: in the shipped
+// blur -> sobel chain that is half the blur's work, thrown away by sobel's
+// chroma reset on every frame. Tint and light are treated as reading
+// chroma even at their no-op settings; being conservative there only costs
+// a skipped optimization, never a wrong frame.
+static void compute_chroma_liveness(const Config *cfg,
+                                    bool chroma_live[max_chain_stages]) {
+  bool live = true; // the output itself shows chroma
+  for (size_t i = cfg->stage_count; i-- > 0;) {
+    chroma_live[i] = live;
+    EffectType e = cfg->stages[i].effect;
+    if (kills_chroma(e))
+      live = false;
+    else if (e == EFFECT_BLUR)
+      ; // reads chroma exactly when its own chroma output is live
+    else if (!passes_chroma(e))
+      live = true; // tint, light
+  }
+}
+
 void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   ChainBuf cur = CHAIN_RAW;
+
+  // The previous trip through the pool may have left work pointing at raw
+  // (an empty chain, see the end of this function). Every stage below
+  // needs work and spare to be real buffers of their own.
+  vf_restore_roles(frame);
+
+  bool chroma_live[max_chain_stages];
+  compute_chroma_liveness(cfg, chroma_live);
 
   size_t i = 0;
   while (i < cfg->stage_count) {
@@ -229,8 +265,8 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       // Neighborhood ops ping-pong between work and spare, never
       // targeting whichever buffer 'cur' already is (that's what's being
       // read). The first neighborhood op in a chain has cur == RAW, so it
-      // reads raw and writes work -- exactly the pre-chaining behavior
-      // this replaces.
+      // reads raw and writes spare; a chain that ends there is fixed up by
+      // a pointer swap at the bottom of this function, not a copy.
       ChainBuf dst = (cur == CHAIN_SPARE) ? CHAIN_WORK : CHAIN_SPARE;
 
       const uint8_t *src_planes[3];
@@ -248,9 +284,12 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
       } else if (stage->effect == EFFECT_LOG) {
         log_edges(src_planes, dst_planes, frame->width, frame->height,
                   frame->stride, stage->log_strength, stage->log_threshold);
-      } else {
+      } else if (chroma_live[i]) {
         gaussian_blur(src_planes, dst_planes, frame->width, frame->height,
                      frame->stride, stage->blur_strength);
+      } else {
+        gaussian_blur_luma(src_planes, dst_planes, frame->width,
+                           frame->height, frame->stride, stage->blur_strength);
       }
 
       cur = dst;
@@ -318,13 +357,15 @@ void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   }
 
   // The rest of the pipeline always expects the result in frame->planes.
-  // Falls through here for an empty chain (cur is still CHAIN_RAW -- copy
-  // the untouched frame through unmodified) and for a chain whose last
-  // stage was a neighborhood op that happened to leave the result in
-  // spare rather than work.
-  if (cur != CHAIN_WORK) {
-    size_t total =
-        frame->plane_sizes[0] + frame->plane_sizes[1] + frame->plane_sizes[2];
-    memcpy(frame->pixel_data, chain_buf_data(frame, cur), total);
-  }
+  // Two cases leave it elsewhere, and both are fixed by moving pointers
+  // rather than copying 1.8MB at 720p:
+  //  - a chain whose last stage was a neighborhood op that wrote spare:
+  //    swap the work and spare roles;
+  //  - an empty chain (cur is still CHAIN_RAW): point work at raw itself.
+  //    Nothing downstream writes work, so sharing the block is safe, and
+  //    vf_restore_roles() at the top of the next trip separates them again.
+  if (cur == CHAIN_SPARE)
+    vf_swap_work_spare(frame);
+  else if (cur == CHAIN_RAW)
+    vf_set_work(frame, frame->raw_data);
 }

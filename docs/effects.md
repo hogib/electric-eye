@@ -45,9 +45,8 @@ and beats a NEON gather. That was measured, not assumed.
 
 ## The buffer ping-pong (neighborhood ops)
 
-A neighborhood op must read a buffer that no stage is still writing. With one such op
-that is easy — read `raw`, write `work`. With two chained (blur then sobel) you need a
-third buffer, which is what `spare` is for.
+A neighborhood op must read a buffer that no stage is still writing. With two chained
+(blur then sobel) that takes a third buffer, which is what `spare` is for.
 
 ```c
 ChainBuf dst = (cur == CHAIN_SPARE) ? CHAIN_WORK : CHAIN_SPARE;
@@ -61,10 +60,30 @@ buffer is current and write straight into `work` — no separate copy-then-overw
 step. Only an *untouched* plane needs an explicit copy, and only when `cur` is not
 already `work`.
 
-At the end, if `cur` is not `CHAIN_WORK`, the result is copied into `pixel_data`,
-because the rest of the pipeline always reads `frame->planes`. That also handles the
-empty-chain case, where `cur` is still `CHAIN_RAW` and the untouched frame passes
-through.
+The first neighborhood op reads `raw` and writes `spare`. At the end, the rest of the
+pipeline always reads `frame->planes`, and two cases leave the result elsewhere. Both
+are fixed by moving pointers, not by copying a frame (1.8MB at 720p):
+
+- **`cur` is `CHAIN_SPARE`** (e.g. a lone `blur` or `sobel`): the work and spare roles
+  swap (`vf_swap_work_spare`).
+- **`cur` is `CHAIN_RAW`** (an empty chain): work is pointed at raw itself. Nothing
+  downstream writes work, so sharing the block is safe, and `vf_restore_roles()` at the
+  top of the next chain separates them again before any stage can write.
+
+See [architecture.md](architecture.md#videoframe) for how the roles and allocations
+relate.
+
+### Chroma nobody will see
+
+Before running, the chain works out back to front whether each stage's chroma is ever
+looked at (`compute_chroma_liveness`). `sobel`, `log`, `canny` and `grayscale`
+overwrite chroma without reading it; `invert`, `threshold`, `contrast` and `none` pass
+it through; `tint` and `light` read it. A `blur` whose chroma is dead blurs luma only
+(`gaussian_blur_luma`).
+
+That is the shipped `blur → sobel` chain: the two chroma planes hold as many pixels as
+luma, and sobel resets them to 128 anyway, so it is about half the blur's work. The
+output is byte-identical, which is what the tests check.
 
 ## The operators
 
@@ -76,11 +95,27 @@ shift — integer-exact, no float, no accumulated rounding error.
 
 `blur_strength` repeats the pass. 0 and 1 both mean one pass.
 
+**One sweep per pass, one OpenMP region per call.** Each thread owns a band of rows.
+Horizontal results go into a private 5-row rolling window (a few KB, in L1), and each
+output row is written as soon as its five inputs exist, instead of writing the whole
+horizontal result to memory and reading it back. All planes and passes of one
+`gaussian_blur` run inside a single `#pragma omp parallel`, where the old structure
+opened a region per horizontal pass and per vertical pass for each plane (six for the
+default chain). Repeated passes blur in place: each thread first blurs the two rows on
+either side of its band, a barrier lets everyone start writing, and from then on a
+thread only reads rows inside its own band that it has not yet written. The arithmetic
+is unchanged, so the result is bit-identical.
+
+The horizontal NEON loop loads 16 pixels' 5-tap window with two loads and `vextq_u8`
+instead of five overlapping loads.
+
 **Half-resolution fast path** at `halfres_blur_pass_threshold = 4`: downsample 2×2, run
 the repeated passes at a quarter the pixels, upsample back. Below 4 the fixed
 downsample/upsample cost eats most of the savings, and a low pass count is the "just
 soften this a little" case most likely to be scrutinized. Measured ~3.3× faster at
-strength 255.
+strength 255. For an odd-width plane (the chroma of a frame whose width is 2 mod 4, e.g.
+1366 → 683), the upsample replicates the last column; it used to leave that column
+unwritten, showing stale bytes from the buffer's previous use.
 
 Note the visible effect grows roughly with the square root of the pass count while cost
 is linear, which is why the web UI caps the slider at 20.
@@ -102,8 +137,8 @@ Smooth, then take the second derivative, then mark where it crosses zero. Produc
 closed 1px contours rather than Sobel's thicker gradient ridges.
 
 `log_strength` is Gaussian passes, so it sets sigma (which grows as its square root).
-It reuses `blur_plane_repeated`, so it inherits an already-verified NEON kernel rather
-than introducing a second smoothing path.
+It reuses the blur's full-resolution path (`blur_luma_into`), so it inherits an
+already-verified NEON kernel rather than introducing a second smoothing path.
 
 `log_threshold` is a **slope test**, not a plain sign comparison: comparing signs alone
 marks a crossing wherever the response merely grazes zero, which in a smooth region is
@@ -166,7 +201,10 @@ desaturated". Special-cased in `parse_effect_stage`.
 
 ## Measured costs
 
-On a real 1280×720 camera frame, x86 dev laptop, against a 33.3 ms budget at 30fps:
+On a real 1280×720 camera frame, x86 dev laptop, against a 33.3 ms budget at 30fps.
+These predate the fused blur, the chroma skip and NEON NMS, and none of those has been
+timed on a Pi yet. The stats log now prints average and worst effects time per frame
+every 5s (`effects: N frames, avg X ms, max Y ms`), which is the number to collect there.
 
 | Operator | Cost |
 |---|---|
@@ -180,7 +218,7 @@ Canny per stage:
 |---|---|---|---|
 | gaussian blur | 0.620 | 20.3% | NEON |
 | gradient + direction | 0.951 | 31.1% | NEON |
-| non-max suppression | 1.014 | 33.2% | scalar |
+| non-max suppression | 1.014 | 33.2% | NEON (now; timing predates it) |
 | hysteresis | 0.435 | 14.2% | serial by design |
 | chroma memset | 0.036 | 1.2% | — |
 
@@ -196,16 +234,20 @@ several-fold and will mislead you.
 | `gs_contrast_normalize` (min/max scan) | yes |
 | `log_edges` (Laplacian + zero-crossing) | yes |
 | `canny_edges` (gradient + direction) | yes |
-| `canny_edges` (NMS) | **no** |
+| `canny_edges` (NMS) | yes |
 | `apply_lut_plane` | no, deliberately |
-| YUYV unpack / downscale | yes |
+| YUYV unpack | yes |
+| YUYV / yuv420 downscale | no (integer shifts, rarely used) |
 
-**NMS is the one real remaining candidate.** It selects 2 of 8 neighbours by direction —
-data-dependent addressing, SIMD's worst case. It can be made branchless by computing
-all four candidate pairs and selecting with `vbslq_u8`, but that is 8 loads instead of
-2 to avoid a branch that is already well-predicted on real images, where direction runs
-long along an edge. It is 33% of Canny, so it matters — but it needs a measurement on
-real hardware before the complexity is worth it.
+Every NEON block in `conv.c` builds on **ARMv7 as well as AArch64** (`GS_NEON`): none of
+its intrinsics is AArch64-only, so 32-bit Pi OS images no longer run the edge operators
+and blur scalar. `point_opps.c` keeps its separate ARMv7 branch for the min/max
+reduction, which does need AArch64-only instructions.
+
+**NMS** selects 2 of 8 neighbours by direction, which is data-dependent addressing. It is
+branchless: all four candidate pairs come from the same 3×3 window, which is eight
+overlapping row loads shared by every lane, and `vbslq_u8` picks each lane's pair by its
+direction. It is bit-exact against the scalar loop, which stays as the tail.
 
 **The NEON speedup itself is unmeasured.** Correctness is verified bit-exact; the
 benefit needs a run on the Pi. qemu says nothing about real NEON throughput.

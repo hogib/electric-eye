@@ -70,9 +70,16 @@ void canny_edges(const uint8_t *const src_planes[3],
 
 // strength: how many times to repeat the 5-tap pass. 0 and 1 both mean a
 // single pass (src read once, dst written once); each pass after the
-// first re-blurs dst in place -- safe because blur_plane() fully consumes
-// its source into an internal scratch buffer before writing dst at all
-// (see conv.c), so src and dst may be the same buffer.
+// first re-blurs dst in place (see blur_plane_team in conv.c for why that
+// is safe), so src and dst may be the same buffer.
 void gaussian_blur(const uint8_t *const src_planes[3], uint8_t *const dst_planes[3],
                    uint32_t width, uint32_t height, const size_t stride[3],
                    uint8_t strength);
+
+// gaussian_blur, luma plane only: dst's chroma planes are left untouched.
+// For a chain whose next chroma consumer overwrites chroma without reading
+// it (sobel, log, canny, grayscale) -- see effect_chain.c.
+void gaussian_blur_luma(const uint8_t *const src_planes[3],
+                        uint8_t *const dst_planes[3], uint32_t width,
+                        uint32_t height, const size_t stride[3],
+                        uint8_t strength);
