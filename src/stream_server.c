@@ -186,7 +186,11 @@ static void accept_pending(StreamServer *s) {
   if (fd < 0)
     return; // EAGAIN/EWOULDBLOCK: nothing pending, the common case
 
-  drop_client(s); // single-viewer server: last connection wins
+  // Single-viewer server: last connection wins. The old socket is closed
+  // here rather than through drop_client(), which would clear `viewer` for
+  // the moment between the two connections and skip an offer for nothing.
+  if (s->client_fd >= 0)
+    close(s->client_fd);
 
   // Non-blocking, so send_frame below can hold every send to one deadline
   // per frame.

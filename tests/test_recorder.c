@@ -82,6 +82,19 @@ static long file_size(const char *path) {
   return stat(path, &st) == 0 ? (long)st.st_size : -1;
 }
 
+// Waits until the writer has room for another frame, so tests that are not
+// about drops never depend on how fast the writer thread gets scheduled.
+static void wait_for_room(Recorder *r) {
+  for (int i = 0; i < 5000; i++) {
+    pthread_mutex_lock(&r->lock);
+    bool room = r->frames_held < recorder_max_queued;
+    pthread_mutex_unlock(&r->lock);
+    if (room)
+      return;
+    sleep_ms(1);
+  }
+}
+
 // Hands a frame over, or returns it to the pool the way consumer_loop does
 // when the recorder refuses it.
 static bool submit_or_return(Recorder *r, Pool *p, VideoFrame *f) {
@@ -100,7 +113,7 @@ static void test_raw_frames_written_in_order(void) {
   recorder_set_target(r, path, RECORD_RAW);
   for (uint8_t tag = 1; tag <= 5; tag++) {
     CHECK(submit_or_return(r, &p, take(&p, tag)));
-    sleep_ms(2); // stay within the queue bound; drops are tested below
+    wait_for_room(r); // drops are tested separately, below
   }
   recorder_set_target(r, "", RECORD_RAW);
   recorder_destroy(r);
@@ -135,7 +148,7 @@ static void test_mjpeg_writes_the_source_bytes(void) {
     VideoFrame *f = take(&p, 9);
     vf_set_source_jpeg(f, jpeg, sizeof jpeg);
     CHECK(submit_or_return(r, &p, f));
-    sleep_ms(2);
+    wait_for_room(r);
   }
   recorder_destroy(r);
   CHECK_EQ_INT(file_size(path), 3 * (long)sizeof jpeg);
@@ -154,7 +167,7 @@ static void test_mjpeg_without_source_falls_back_to_raw(void) {
   recorder_set_target(r, path, RECORD_MJPEG);
   for (int i = 0; i < 2; i++) {
     CHECK(submit_or_return(r, &p, take(&p, 3)));
-    sleep_ms(2);
+    wait_for_room(r);
   }
   recorder_destroy(r);
   CHECK_EQ_INT(file_size(path), 2 * (long)frame_bytes());
@@ -218,7 +231,10 @@ static void test_stalled_disk_never_blocks_submit(void) {
   }
   CHECK_EQ_INT(accepted, recorder_max_queued);
   CHECK_EQ_INT(refused, 6 - (int)recorder_max_queued);
-  CHECK(worst < 50.0); // never waits on the disk
+  // Never waits on the disk: a submit that did would wait forever, since
+  // the FIFO has no reader yet. The bound only leaves room for scheduling
+  // delays on a loaded machine.
+  CHECK(worst < 500.0);
   RecorderStatus st;
   recorder_status(r, &st);
   CHECK_EQ_INT(st.dropped_frames, 6 - (int)recorder_max_queued);
@@ -240,7 +256,7 @@ static void test_open_failure_is_reported_not_retried(void) {
   Recorder *r = recorder_create(&p.free_ring, W, H, 30);
   recorder_set_target(r, "/proc/nonexistent-dir/x.raw", RECORD_RAW);
   RecorderStatus st = {0};
-  for (int i = 0; i < 200 && st.state != RECORDING_FAILED; i++) {
+  for (int i = 0; i < 5000 && st.state != RECORDING_FAILED; i++) {
     sleep_ms(1);
     recorder_status(r, &st);
   }

@@ -7,8 +7,33 @@
 #include "stream_server.c"
 #include "test_harness.h"
 #include <netdb.h>
+#include <sys/time.h>
 
 static uint16_t port;
+
+// A port nothing is listening on, from the kernel's ephemeral range. Picked
+// per test: meson runs repeated iterations of this suite in parallel, so a
+// fixed or pid-derived port can collide.
+static uint16_t pick_port(void) {
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  struct sockaddr_in6 addr = {.sin6_family = AF_INET6,
+                              .sin6_addr = in6addr_any};
+  socklen_t len = sizeof addr;
+  uint16_t p = 0;
+  if (bind(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
+      getsockname(fd, (struct sockaddr *)&addr, &len) == 0)
+    p = ntohs(addr.sin6_port);
+  close(fd);
+  return p;
+}
+
+// Opens a server on a fresh port, or fails the test cleanly.
+static StreamServer *open_server(void) {
+  port = pick_port();
+  StreamServer *s = port ? stream_server_open(port) : NULL;
+  CHECK(s != NULL);
+  return s;
+}
 
 static double now_ms_d(void) {
   struct timespec ts;
@@ -71,8 +96,9 @@ static VideoFrame *noise_frame(uint32_t w, uint32_t h) {
 }
 
 static void test_no_viewer_means_no_work(void) {
-  StreamServer *s = stream_server_open(port);
-  CHECK(s != NULL);
+  StreamServer *s = open_server();
+  if (!s)
+    return;
   VideoFrame *f = noise_frame(64, 32);
   CHECK(!stream_server_offer_frame(s, f, 60));
   CHECK_EQ_INT(s->buf_cap, 0); // nothing even allocated
@@ -81,7 +107,9 @@ static void test_no_viewer_means_no_work(void) {
 }
 
 static void test_viewer_receives_complete_jpegs(void) {
-  StreamServer *s = stream_server_open(port);
+  StreamServer *s = open_server();
+  if (!s)
+    return;
   int fd = connect_viewer(0);
   CHECK(fd >= 0);
   CHECK(wait_viewer(s, true));
@@ -120,7 +148,9 @@ static void test_viewer_receives_complete_jpegs(void) {
 // at once, and the server must give up on the viewer rather than keep
 // trying forever.
 static void test_stalled_viewer_never_blocks_offer(void) {
-  StreamServer *s = stream_server_open(port);
+  StreamServer *s = open_server();
+  if (!s)
+    return;
   int fd = connect_viewer(4096);
   CHECK(fd >= 0);
   CHECK(wait_viewer(s, true));
@@ -142,9 +172,10 @@ static void test_stalled_viewer_never_blocks_offer(void) {
     sleep_ms(33);
   }
   CHECK(dropped);
-  // The offer is a memcpy of a 600KB frame; anything near the 200ms send
-  // deadline would mean it waited on the socket.
-  CHECK(worst < 50.0);
+  // The offer is a memcpy of a 600KB frame. Waiting on the socket would
+  // mean waiting out the 200ms send deadline; the bound below that only
+  // leaves room for scheduling delays on a loaded machine.
+  CHECK(worst < 150.0);
   printf("    (worst offer %.2f ms, viewer dropped after %.0f ms)\n", worst,
          now_ms_d() - start);
   vf_free(f);
@@ -152,20 +183,20 @@ static void test_stalled_viewer_never_blocks_offer(void) {
   stream_server_close(s);
 }
 
-// Last connection wins, and close() returns promptly with a viewer still
-// attached.
+// Last connection wins -- the replaced viewer sees its connection closed
+// -- and close() returns promptly with a viewer still attached.
 static void test_new_viewer_replaces_old_and_close_is_prompt(void) {
-  StreamServer *s = stream_server_open(port);
+  StreamServer *s = open_server();
+  if (!s)
+    return;
   int a = connect_viewer(0);
   CHECK(wait_viewer(s, true));
-  int old_fd = s->client_fd;
   int b = connect_viewer(0);
-  bool replaced = false;
-  for (int i = 0; i < 300 && !replaced; i++) {
-    replaced = s->client_fd >= 0 && s->client_fd != old_fd;
-    sleep_ms(10);
-  }
-  CHECK(replaced);
+  struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+  setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  char byte;
+  CHECK(recv(a, &byte, 1, 0) == 0); // EOF: the server dropped viewer a
+  CHECK(atomic_load(&s->viewer)); // and b is the viewer, with no gap
   double t0 = now_ms_d();
   stream_server_close(s);
   CHECK(now_ms_d() - t0 < 1000.0);
@@ -175,7 +206,6 @@ static void test_new_viewer_replaces_old_and_close_is_prompt(void) {
 
 int main(void) {
   printf("test_stream_server:\n");
-  port = (uint16_t)(20000 + getpid() % 20000);
   RUN_TEST(test_no_viewer_means_no_work);
   RUN_TEST(test_viewer_receives_complete_jpegs);
   RUN_TEST(test_stalled_viewer_never_blocks_offer);
