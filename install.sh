@@ -69,7 +69,7 @@ fi
 
 log "Installing build and runtime dependencies"
 apt-get update
-if ! apt-get install -y build-essential meson ninja-build pkg-config \
+if ! apt-get install -y build-essential pkg-config \
     libturbojpeg0-dev v4l2loopback-dkms; then
   die "Package install failed. If it was specifically v4l2loopback-dkms \
 that failed to build, you're most likely missing kernel headers for your \
@@ -80,12 +80,7 @@ then re-run this script."
 fi
 
 log "Building electric_eye in $SCRIPT_DIR"
-if [ -d "$BUILD_DIR" ]; then
-  meson setup --reconfigure "$BUILD_DIR" "$SCRIPT_DIR"
-else
-  meson setup "$BUILD_DIR" "$SCRIPT_DIR"
-fi
-meson compile -C "$BUILD_DIR"
+make -C "$SCRIPT_DIR" BUILDDIR="$BUILD_DIR" -j"$(nproc)"
 
 EXE_PATH="$BUILD_DIR/eeye"
 [ -x "$EXE_PATH" ] || die "Build succeeded but $EXE_PATH is missing -- unexpected, please report this."

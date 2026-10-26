@@ -12,9 +12,9 @@
 // claim to be.
 #include "jpeg_decode.h"
 #include "test_harness.h"
+#include "turbojpeg_compat.h"
 #include "video_frame.h"
 #include <stdlib.h>
-#include <turbojpeg.h>
 
 // Encodes planar YUV as a JPEG at the given subsampling. Returns a malloc'd
 // buffer the caller frees.
@@ -30,7 +30,7 @@ static uint8_t *encode(const uint8_t *y, const uint8_t *u, const uint8_t *v,
   unsigned long size = 0;
   // Quality 100 so decode differences come from the layout conversion
   // under test, not from quantization noise.
-  int rc = tjCompressFromYUVPlanes(enc, planes, (int)w, strides, (int)h,
+  int rc = tjCompressFromYUVPlanes(enc, TJ_SRC(planes), (int)w, strides, (int)h,
                                    subsamp, &buf, &size, 100, 0);
   tjDestroy(enc);
   if (rc < 0) {

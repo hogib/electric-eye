@@ -185,7 +185,7 @@ Worth knowing before you propose them, along with why:
 | Build v4l2loopback from source at install | Loses DKMS auto-rebuild on kernel upgrade and signing; does not address the MOK failure mode at all |
 | Prebuilt release binaries | The kernel module makes a toolchain mandatory anyway |
 | Subdirectories / namespaces in `src/` | 16 files, ~7.8k lines; the prefix convention already does the job |
-| C++ for `constexpr` | Already using C23 `constexpr`; nothing input-independent left to fold |
+| C++ for `constexpr` | The constants are already compile-time (`enum` / `static const`); nothing input-independent left to fold |
 
 ## Known gaps
 

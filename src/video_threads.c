@@ -12,11 +12,9 @@
 #include <errno.h>
 #include <linux/videodev2.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <threads.h>
 #include <time.h>
 
 // Best-effort request passed to v4l2_in_open(); V4L2 does not guarantee a
@@ -120,7 +118,7 @@ void *producer_loop(void *arg) {
   // amount of retrying open() fixes, unlike a USB camera that may
   // genuinely come back. That class of failure is left to exit the process
   // and rely on the systemd unit's Restart= for recovery instead.
-  while (atomic_load(args->is_running)) {
+  while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
     CaptureHandle in;
     if (!capture_open(args, &in)) {
       reconnect_attempt++;
@@ -130,8 +128,9 @@ void *producer_loop(void *arg) {
                reconnect_attempt, CAMERA_RECONNECT_DELAY_MS / 1000);
       }
       for (int waited_ms = 0;
-          waited_ms < CAMERA_RECONNECT_DELAY_MS && atomic_load(args->is_running);
-          waited_ms += 100) {
+           waited_ms < CAMERA_RECONNECT_DELAY_MS &&
+           __atomic_load_n(args->is_running, __ATOMIC_SEQ_CST);
+           waited_ms += 100) {
         sleep_us(100000); // 100ms chunks so shutdown is noticed promptly
       }
       continue;
@@ -157,7 +156,7 @@ void *producer_loop(void *arg) {
     else
       printf("Camera connected: %s\n", args->filename);
 
-    while (atomic_load(args->is_running)) {
+    while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
       VideoFrame *frame = NULL;
 
       if (!ring_pop_wait(args->ring_buffer_free, (void **)&frame,
@@ -225,22 +224,20 @@ static void record_effects_time(EffectsTiming *t, const struct timespec *t0,
     return;
   uint64_t ns = (uint64_t)(t1->tv_sec - t0->tv_sec) * 1000000000u +
                 (uint64_t)(t1->tv_nsec - t0->tv_nsec);
-  atomic_fetch_add_explicit(&t->frames, 1, memory_order_relaxed);
-  atomic_fetch_add_explicit(&t->total_ns, ns, memory_order_relaxed);
-  uint_fast64_t prev = atomic_load_explicit(&t->max_ns, memory_order_relaxed);
-  while (ns > prev && !atomic_compare_exchange_weak_explicit(
-                          &t->max_ns, &prev, ns, memory_order_relaxed,
-                          memory_order_relaxed)) {
+  __atomic_fetch_add(&t->frames, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&t->total_ns, ns, __ATOMIC_RELAXED);
+  uint_fast64_t prev = __atomic_load_n(&t->max_ns, __ATOMIC_RELAXED);
+  while (ns > prev &&
+         !__atomic_compare_exchange_n(&t->max_ns, &prev, ns, true,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
   }
 }
 
 void *effects_loop(void *arg) {
   WorkerArgs *args = (WorkerArgs *)arg;
-  while (
-      atomic_load(args->is_running) ||
-      atomic_load_explicit(&args->ring_buffer_in->head, memory_order_relaxed) !=
-          atomic_load_explicit(&args->ring_buffer_in->tail,
-                               memory_order_relaxed)) {
+  while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST) ||
+         __atomic_load_n(&args->ring_buffer_in->head, __ATOMIC_RELAXED) !=
+             __atomic_load_n(&args->ring_buffer_in->tail, __ATOMIC_RELAXED)) {
 
     VideoFrame *frame = NULL;
 
@@ -275,7 +272,7 @@ void *consumer_loop(void *arg) {
   V4l2Out *out = v4l2_out_open(args->outpath, args->frame_width,
                                args->frame_height, V4L2_PIX_FMT_YUV422P);
   if (!out) {
-    atomic_store(args->is_running, false);
+    __atomic_store_n(args->is_running, false, __ATOMIC_SEQ_CST);
     return NULL;
   }
 
@@ -312,11 +309,9 @@ void *consumer_loop(void *arg) {
   };
   int64_t last_health_pts = -1;
 
-  while (atomic_load(args->is_running) ||
-         atomic_load_explicit(&args->ring_buffer_out->head,
-                              memory_order_relaxed) !=
-             atomic_load_explicit(&args->ring_buffer_out->tail,
-                                  memory_order_relaxed)) {
+  while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST) ||
+         __atomic_load_n(&args->ring_buffer_out->head, __ATOMIC_RELAXED) !=
+             __atomic_load_n(&args->ring_buffer_out->tail, __ATOMIC_RELAXED)) {
 
     VideoFrame *frame = NULL;
 
@@ -334,7 +329,7 @@ void *consumer_loop(void *arg) {
       // NULL: this frame must go back to the pool regardless of
       // is_running (which the very next line is about to clear anyway).
       ring_push_wait(args->ring_buffer_free, frame, NULL);
-      atomic_store(args->is_running, false);
+      __atomic_store_n(args->is_running, false, __ATOMIC_SEQ_CST);
       break;
     }
 
@@ -430,13 +425,13 @@ static void log_ring_stats(const char *name, const FrameRingBuffer *rb) {
 void *stats_loop(void *arg) {
   StatsArgs *args = (StatsArgs *)arg;
 
-  while (atomic_load(args->is_running)) {
-    for (int waited_ms = 0;
-        waited_ms < STATS_LOG_INTERVAL_MS && atomic_load(args->is_running);
-        waited_ms += 100) {
+  while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
+    for (int waited_ms = 0; waited_ms < STATS_LOG_INTERVAL_MS &&
+                            __atomic_load_n(args->is_running, __ATOMIC_SEQ_CST);
+         waited_ms += 100) {
       sleep_us(100000); // 100ms chunks so shutdown is noticed promptly
     }
-    if (!atomic_load(args->is_running))
+    if (!__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST))
       break; // don't log a final partial-interval snapshot on shutdown --
              // eeye.c's main() logs one definitive snapshot after every
              // other thread has joined instead.
@@ -452,12 +447,9 @@ void *stats_loop(void *arg) {
 
     if (args->effects_timing) {
       EffectsTiming *t = args->effects_timing;
-      uint64_t frames =
-          atomic_exchange_explicit(&t->frames, 0, memory_order_relaxed);
-      uint64_t total =
-          atomic_exchange_explicit(&t->total_ns, 0, memory_order_relaxed);
-      uint64_t max =
-          atomic_exchange_explicit(&t->max_ns, 0, memory_order_relaxed);
+      uint64_t frames = __atomic_exchange_n(&t->frames, 0, __ATOMIC_RELAXED);
+      uint64_t total = __atomic_exchange_n(&t->total_ns, 0, __ATOMIC_RELAXED);
+      uint64_t max = __atomic_exchange_n(&t->max_ns, 0, __ATOMIC_RELAXED);
       if (frames > 0)
         printf("  effects: %llu frames, avg %.2f ms, max %.2f ms\n",
                (unsigned long long)frames, (double)total / frames / 1e6,

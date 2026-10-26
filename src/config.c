@@ -1,4 +1,4 @@
-// _POSIX_C_SOURCE for strtol/etc under -std=c23's strict ISO mode; matches
+// _POSIX_C_SOURCE for strtol/etc under -std=c99's strict ISO mode; matches
 // the same guard in video_threads.c.
 #define _POSIX_C_SOURCE 200809L
 
@@ -7,7 +7,6 @@
 #include <linux/limits.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,10 +14,10 @@
 #include <sys/inotify.h>
 #include <unistd.h>
 
-constexpr size_t config_ring_size = 8;
+static const size_t config_ring_size = 8;
 
 struct ConfigWatcher {
-  atomic_bool *is_running;
+  bool *is_running; // atomic (see compat.h)
 
   pthread_t thread;
   bool thread_started;
@@ -33,10 +32,11 @@ struct ConfigWatcher {
   // called either synchronously during config_watch_start() or from the
   // one reload thread -- those two writers are ordered by pthread_create's
   // happens-before, so no lock is needed on the ring itself. `current` is
-  // the only field readers touch, and it's the one under atomics.
+  // the only field readers touch, and it's the one under atomics (see
+  // compat.h).
   Config ring[8];
   size_t ring_pos;
-  _Atomic(const Config *) current;
+  const Config *current;
 };
 
 static const Config config_defaults = {
@@ -564,7 +564,7 @@ static bool parse_chain(Cursor *c, EffectStage *stages, size_t *stage_count) {
       skip_ws(c);
       if (count >= max_chain_stages) {
         printf("Config: \"chain\" has more than %zu stages\n",
-               max_chain_stages);
+               (size_t)max_chain_stages);
         return false;
       }
       if (!parse_effect_stage(c, &stages[count])) {
@@ -1024,7 +1024,7 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
   size_t slot = w->ring_pos % config_ring_size;
   w->ring_pos++;
   w->ring[slot] = *parsed;
-  atomic_store_explicit(&w->current, &w->ring[slot], memory_order_release);
+  __atomic_store_n(&w->current, &w->ring[slot], __ATOMIC_RELEASE);
 }
 
 // Writes "<config_path>.status" with a one-line {"ok":true|false} verdict
@@ -1069,7 +1069,7 @@ static void *config_watch_thread(void *arg) {
   // back-to-back, not just read as raw bytes.
   char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
 
-  while (atomic_load(w->is_running)) {
+  while (__atomic_load_n(w->is_running, __ATOMIC_SEQ_CST)) {
     struct pollfd pfd = {.fd = w->inotify_fd, .events = POLLIN, .revents = 0};
     // Short timeout so a shutdown request is noticed within 200ms instead
     // of blocking on read() until the next file change, which might never
@@ -1103,7 +1103,7 @@ static void *config_watch_thread(void *arg) {
   return NULL;
 }
 
-ConfigWatcher *config_watch_start(const char *path, atomic_bool *is_running) {
+ConfigWatcher *config_watch_start(const char *path, bool *is_running) {
   ConfigWatcher *w = (ConfigWatcher *)calloc(1, sizeof(ConfigWatcher));
   if (!w)
     return NULL;
@@ -1175,5 +1175,5 @@ void config_watch_stop(ConfigWatcher *watcher) {
 }
 
 const Config *config_current(const ConfigWatcher *watcher) {
-  return atomic_load_explicit(&watcher->current, memory_order_acquire);
+  return __atomic_load_n(&watcher->current, __ATOMIC_ACQUIRE);
 }

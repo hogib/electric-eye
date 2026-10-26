@@ -1,10 +1,11 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode, which hides several socket-adjacent declarations unless a
 // feature-test macro asks for them explicitly. Same guard as
 // config.c/eeye.c/v4l2_in.c.
 #define _POSIX_C_SOURCE 200809L
 
 #include "stream_server.h"
+#include "turbojpeg_compat.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,7 +13,6 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +21,6 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
-#include <turbojpeg.h>
 #include <unistd.h>
 
 // How long the stream thread gives one frame to reach the viewer, in
@@ -30,11 +29,11 @@
 // send, so a viewer draining slowly could hold a frame far past it. This no
 // longer bounds the virtual camera (sending is off consumer_loop's thread
 // now), only how stale the preview is allowed to get.
-static constexpr int send_timeout_ms = 200;
+static const int send_timeout_ms = 200;
 
 // How often the stream thread wakes with nothing to do, to notice a new
 // viewer or shutdown.
-static constexpr int idle_poll_ms = 200;
+static const int idle_poll_ms = 200;
 
 // One frame's planes, copied out of the pipeline so the frame itself can go
 // straight back to the pool.
@@ -51,14 +50,14 @@ struct StreamServer {
   int listen_fd;
   int client_fd; // -1 when no client is connected; stream thread only
   // Mirrors client_fd >= 0 for the offering thread, so an unwatched stream
-  // costs it one atomic load per frame and no copy.
-  atomic_bool viewer;
+  // costs it one atomic load per frame and no copy. Atomic (see compat.h).
+  bool viewer;
   tjhandle encoder;
   unsigned char *jpeg_buf; // Reused across frames -- see encode_and_send.
   unsigned long jpeg_buf_cap;
 
   pthread_t thread;
-  atomic_bool quit;
+  bool quit; // atomic (see compat.h)
 
   // The mailbox. `pending` is written by stream_server_offer_frame and
   // swapped with `working` by the stream thread, both under `lock`; the
@@ -144,8 +143,8 @@ StreamServer *stream_server_open(uint16_t port) {
   s->listen_fd = fd;
   s->client_fd = -1;
   s->encoder = encoder;
-  atomic_init(&s->viewer, false);
-  atomic_init(&s->quit, false);
+  s->viewer = false;
+  s->quit = false;
   pthread_mutex_init(&s->lock, NULL);
   // Monotonic, so the idle wake-up below isn't stretched by a wall-clock
   // step (a Pi has no RTC).
@@ -174,7 +173,7 @@ static void drop_client(StreamServer *s) {
     close(s->client_fd);
     s->client_fd = -1;
   }
-  atomic_store(&s->viewer, false);
+  __atomic_store_n(&s->viewer, false, __ATOMIC_SEQ_CST);
 }
 
 // Accepts at most one pending connection per call. Called on every pass
@@ -206,7 +205,7 @@ static void accept_pending(StreamServer *s) {
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
   s->client_fd = fd;
-  atomic_store(&s->viewer, true);
+  __atomic_store_n(&s->viewer, true, __ATOMIC_SEQ_CST);
   printf("stream_server: viewer connected\n");
 }
 
@@ -279,9 +278,9 @@ static void encode_and_send(StreamServer *s, const PreviewFrame *f) {
     return; // Allocation failed; nothing to send this frame.
 
   unsigned long jpeg_size = 0;
-  if (tjCompressFromYUVPlanes(s->encoder, planes, (int)f->width, f->strides,
-                              (int)f->height, TJSAMP_422, &s->jpeg_buf,
-                              &jpeg_size, f->quality,
+  if (tjCompressFromYUVPlanes(s->encoder, TJ_SRC(planes), (int)f->width,
+                              TJ_SRC(f->strides), (int)f->height, TJSAMP_422,
+                              &s->jpeg_buf, &jpeg_size, f->quality,
                               TJFLAG_FASTDCT | TJFLAG_NOREALLOC) < 0) {
     printf("stream_server: tjCompressFromYUVPlanes failed: %s\n",
            tjGetErrorStr2(s->encoder));
@@ -298,7 +297,7 @@ static void encode_and_send(StreamServer *s, const PreviewFrame *f) {
 
 static void *stream_loop(void *arg) {
   StreamServer *s = arg;
-  while (!atomic_load(&s->quit)) {
+  while (!__atomic_load_n(&s->quit, __ATOMIC_SEQ_CST)) {
     accept_pending(s);
     if (s->client_fd < 0) {
       // Nobody watching: sleep on the listening socket itself.
@@ -337,7 +336,7 @@ static void *stream_loop(void *arg) {
 
 bool stream_server_offer_frame(StreamServer *s, const VideoFrame *frame,
                                int quality) {
-  if (!s || !atomic_load(&s->viewer))
+  if (!s || !__atomic_load_n(&s->viewer, __ATOMIC_SEQ_CST))
     return false; // no one watching -- skip the copy entirely
 
   const size_t total =
@@ -388,7 +387,7 @@ void stream_server_close(StreamServer *s) {
   if (!s)
     return;
 
-  atomic_store(&s->quit, true);
+  __atomic_store_n(&s->quit, true, __ATOMIC_SEQ_CST);
   pthread_mutex_lock(&s->lock);
   pthread_cond_signal(&s->ready);
   pthread_mutex_unlock(&s->lock);

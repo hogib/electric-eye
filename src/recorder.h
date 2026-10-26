@@ -30,7 +30,7 @@ typedef struct Recorder Recorder;
 // Frames the writer may hold at once. Each is out of the pool while it
 // waits, so this trades burst tolerance against frames available to the
 // camera (see frame_pool_size in eeye.c).
-constexpr unsigned recorder_max_queued = 3;
+enum { recorder_max_queued = 3 };
 
 // What consumer_loop folds into its health snapshot.
 typedef struct {

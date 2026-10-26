@@ -2,11 +2,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-constexpr uint8_t y_plain_max_jpeg = 255u;
-constexpr uint8_t y_plain_min_jpeg = 0u;
+enum { y_plain_max_jpeg = 255, y_plain_min_jpeg = 0 };
 
-constexpr uint8_t y_plain_max_std = 235u;
-constexpr uint8_t y_plain_min_std = 16u;
+enum { y_plain_max_std = 235, y_plain_min_std = 16 };
 
 // src/dst need not be the same buffer -- effect_chain.c calls this with
 // src pointing at whichever chain buffer is current and dst pointing at

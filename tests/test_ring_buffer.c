@@ -175,7 +175,7 @@ static void test_concurrent_pushers_lose_nothing(void) {
 static void test_pop_wait_returns_on_shutdown(void) {
   FrameRingBuffer rb;
   ring_init(&rb);
-  atomic_bool running = false; // already shutting down
+  bool running = false; // already shutting down
   void *out = NULL;
   CHECK(!ring_pop_wait(&rb, &out, &running));
   ring_destroy(&rb);

@@ -142,9 +142,16 @@ too.
 
 Two semaphores (`filled`, `empty`) sit on top as pure wakeup signals. They never gate
 correctness — the head/tail scheme does that — they only decide whether a waiter blocks
-or spins.
+or spins. They are `MonoSem`, a mutex+condvar counting semaphore, not `sem_t`: their
+timeouts have to run on `CLOCK_MONOTONIC` (a Pi has no RTC, and timesyncd can step the
+wall clock), and `sem_t` can only do that through `sem_clockwait`, which needs glibc
+2.30.
 
-`ring_push_wait` / `ring_pop_wait` take an `atomic_bool *is_running`. They wake up on a
+Variables shared between threads are plain types accessed only through the GCC
+`__atomic` builtins rather than C11 `<stdatomic.h>`, which old compilers lack; see
+`src/compat.h`.
+
+`ring_push_wait` / `ring_pop_wait` take a `bool *is_running` (atomic). They wake up on a
 bounded timeout (~200ms) to re-check it, so shutdown is noticed promptly rather than
 deadlocking on an empty ring. Passing `NULL` means "this must complete regardless",
 which is the frame-leak guard above.
@@ -189,7 +196,8 @@ geometry and every frame in it has to match what the camera is eventually opened
 ## Shutdown
 
 A signal handler sets `is_running = false` — nothing else, because `printf` is not
-signal-safe. There is a `static_assert` that `atomic_bool` is lock-free, since a
+signal-safe. There is a compile-time check (`__GCC_ATOMIC_BOOL_LOCK_FREE`) that `bool` atomics are
+lock-free, since a
 lock-based atomic would mean the handler could touch a mutex from arbitrary interrupted
 context.
 

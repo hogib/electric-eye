@@ -5,8 +5,8 @@
 #include <stdlib.h>
 
 /* Constants */
-constexpr uint32_t max_planes = 3;
-constexpr uint32_t max_stride = 3;
+enum { max_planes = 3 };
+enum { max_stride = 3 };
 
 typedef struct {
   uint32_t height;

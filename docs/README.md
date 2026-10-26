@@ -6,7 +6,7 @@ built and what will bite you when you modify it.
 
 ## What it is
 
-A realtime camera effects pipeline in C23. It captures frames, runs them through a
+A realtime camera effects pipeline in C99 (GNU dialect, GCC 4.7+ or clang). It captures frames, runs them through a
 configurable chain of image operators, and publishes the result as a
 [v4l2loopback](https://github.com/umlaeute/v4l2loopback) virtual camera. It targets a
 Raspberry Pi in a submersible ROV, controlled from a topside laptop over a direct
@@ -88,7 +88,7 @@ namespacing C gives you.
 | `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |
 
-Python lives outside the meson build: `pi/` (drone side), `topside/`, `tools/`.
+Python lives outside the C build: `pi/` (drone side), `topside/`, `tools/`.
 
 ## Conventions worth knowing before you edit
 

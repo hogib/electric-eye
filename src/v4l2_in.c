@@ -1,4 +1,4 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode, which hides open()/mmap()/poll() and friends unless a
 // feature-test macro asks for them explicitly. Same guard as
 // config.c/eeye.c.
@@ -29,7 +29,7 @@
 #define GS_NEON_ARM32 1
 #endif
 
-constexpr uint32_t v4l2_in_max_buffers = 8;
+static const uint32_t v4l2_in_max_buffers = 8;
 
 struct V4l2In {
   int fd;
@@ -330,7 +330,7 @@ static bool try_set_format(int fd, uint32_t fourcc, uint32_t width,
 // noise between nominally-identical ratios (a 4:3 mode listed as 352x288
 // is really 11:9, ~1.9% off, and correctly does *not* get grouped with a
 // true 4:3 mode by this).
-constexpr int64_t aspect_group_tolerance = 100;
+static const int64_t aspect_group_tolerance = 100;
 
 // |w/h - want_w/want_h|, scaled by 10000 to stay in integer math. Cross-
 // multiplied so neither division can round before the comparison.
@@ -540,10 +540,8 @@ V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
 
-  // device_caps describes this specific node; capabilities is the union
-  // across every node the driver owns. Same distinction as v4l2_out.c.
-  uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps
-                                                            : cap.capabilities;
+  // This node's own caps, not the driver-wide union (see v4l2_ioctl.h).
+  uint32_t caps = v4l2_node_caps(&cap);
   if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) {
     printf("%s does not support video capture (caps 0x%08x)\n", path, caps);
     close(fd);

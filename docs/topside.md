@@ -1,6 +1,6 @@
 # Topside
 
-Everything network-facing. All Python, standard library only, outside the meson build.
+Everything network-facing. All Python, standard library only, outside the C build.
 
 | File | Runs on | Role |
 |---|---|---|

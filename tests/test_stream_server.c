@@ -12,8 +12,8 @@
 static uint16_t port;
 
 // A port nothing is listening on, from the kernel's ephemeral range. Picked
-// per test: meson runs repeated iterations of this suite in parallel, so a
-// fixed or pid-derived port can collide.
+// per test: the suite may run alongside other copies of itself (repeated
+// runs in parallel), so a fixed or pid-derived port can collide.
 static uint16_t pick_port(void) {
   int fd = socket(AF_INET6, SOCK_STREAM, 0);
   struct sockaddr_in6 addr = {.sin6_family = AF_INET6,
@@ -64,7 +64,7 @@ static int connect_viewer(int rcvbuf) {
 
 static bool wait_viewer(StreamServer *s, bool want) {
   for (int i = 0; i < 300; i++) {
-    if (atomic_load(&s->viewer) == want)
+    if (__atomic_load_n(&s->viewer, __ATOMIC_SEQ_CST) == want)
       return true;
     sleep_ms(10);
   }
@@ -165,7 +165,7 @@ static void test_stalled_viewer_never_blocks_offer(void) {
     double dt = now_ms_d() - t0;
     if (dt > worst)
       worst = dt;
-    if (!atomic_load(&s->viewer)) {
+    if (!__atomic_load_n(&s->viewer, __ATOMIC_SEQ_CST)) {
       dropped = true;
       break;
     }
@@ -196,7 +196,8 @@ static void test_new_viewer_replaces_old_and_close_is_prompt(void) {
   setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   char byte;
   CHECK(recv(a, &byte, 1, 0) == 0); // EOF: the server dropped viewer a
-  CHECK(atomic_load(&s->viewer)); // and b is the viewer, with no gap
+  // ...and b is the viewer, with no gap.
+  CHECK(__atomic_load_n(&s->viewer, __ATOMIC_SEQ_CST));
   double t0 = now_ms_d();
   stream_server_close(s);
   CHECK(now_ms_d() - t0 < 1000.0);

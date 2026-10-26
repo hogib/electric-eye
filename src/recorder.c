@@ -1,4 +1,4 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode otherwise. Same guard as video_threads.c/config.c.
 #define _POSIX_C_SOURCE 200809L
 
@@ -22,7 +22,7 @@ typedef struct {
 // Enough for recorder_max_queued frames with a target change between
 // every pair: consecutive target changes collapse into one entry (only
 // the latest matters), so frames and targets can at most alternate.
-constexpr unsigned recorder_queue_cap = 2 * recorder_max_queued + 2;
+enum { recorder_queue_cap = 2 * recorder_max_queued + 2 };
 
 struct Recorder {
   pthread_t thread;

@@ -1,21 +1,33 @@
 #pragma once
+#include "compat.h"
 #include <pthread.h>
-#include <semaphore.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-constexpr unsigned int ring_buffer_size = 32;
+enum { ring_buffer_size = 32 };
 
-#if (ring_buffer_size & (ring_buffer_size - 1)) != 0
-#error "ring_buffer_size must be a power of two!"
-#endif
+STATIC_ASSERT((ring_buffer_size & (ring_buffer_size - 1)) == 0,
+              "ring_buffer_size must be a power of two!");
 
+// A counting semaphore whose timed wait runs on CLOCK_MONOTONIC. A POSIX
+// sem_t can only time out against CLOCK_REALTIME (sem_clockwait, the
+// monotonic variant, is glibc 2.30+), so this is the classic mutex+condvar
+// build of one, with the condvar's clock set to monotonic --
+// pthread_condattr_setclock() has been in glibc since 2.3.3.
+typedef struct {
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  unsigned int count;
+} MonoSem;
+
+// Every size_t/uint_fast64_t field below, and *is_running in the wait
+// functions, is atomic: only ever accessed through the __atomic builtins
+// (see compat.h).
 typedef struct FrameRingBuffer {
   void *buffer[ring_buffer_size];
-  atomic_size_t head; // Written by Producer
-  atomic_size_t tail; // Written by Consumer
+  size_t head; // Written by Producer
+  size_t tail; // Written by Consumer
 
   // filled/empty are pure wakeup signals layered on top of the lock-free
   // head/tail scheme above -- they never gate correctness, only whether a
@@ -23,8 +35,8 @@ typedef struct FrameRingBuffer {
   // (posted after a successful push, waited on before a pop); empty counts
   // free slots (posted after a successful pop, waited on before a push).
   // Both start matching a freshly-init'd ring: filled=0, empty=capacity.
-  sem_t filled;
-  sem_t empty;
+  MonoSem filled;
+  MonoSem empty;
 
   // ring_push() takes this internally, making it safe for more than one
   // thread to push to the same ring -- which the three-ring pipeline
@@ -44,9 +56,9 @@ typedef struct FrameRingBuffer {
   // ring_push_wait() itself isn't lock-protected before it calls
   // ring_push() -- and more than one thread can be waiting to push to the
   // same ring at once (again, the shared free-list ring).
-  atomic_size_t high_water; // largest occupancy ever observed on a push
-  atomic_uint_fast64_t full_stalls;  // ring_push_wait() timeouts (ring full)
-  atomic_uint_fast64_t empty_stalls; // ring_pop_wait() timeouts (ring empty)
+  size_t high_water;          // largest occupancy ever observed on a push
+  uint_fast64_t full_stalls;  // ring_push_wait() timeouts (ring full)
+  uint_fast64_t empty_stalls; // ring_pop_wait() timeouts (ring empty)
 } FrameRingBuffer;
 
 // Snapshot of one ring's diagnostics, for logging/tuning -- see
@@ -88,7 +100,7 @@ bool ring_pop(FrameRingBuffer *rb, void **frame_ptr);
  * is_running: if non-NULL, the wait gives up and returns false once
  * *is_running becomes false while still waiting -- for a call site that
  * should abandon its attempt on shutdown (mirrors the original code's
- * `while (!ring_push(...) && atomic_load(is_running))` pattern). Pass NULL
+ * `while (!ring_push(...) && is_running)` pattern). Pass NULL
  * for a call site that must never abandon its frame instead (e.g.
  * returning a frame to the free-list ring) -- mirrors the original's bare
  * `while (!ring_push(...))` with no is_running check at all. Either way,
@@ -96,10 +108,10 @@ bool ring_pop(FrameRingBuffer *rb, void **frame_ptr);
  * the semaphore accounting has already guaranteed it will succeed.
  */
 bool ring_push_wait(FrameRingBuffer *rb, void *frame_ptr,
-                    const atomic_bool *is_running);
+                    const bool *is_running);
 
 bool ring_pop_wait(FrameRingBuffer *rb, void **frame_ptr,
-                   const atomic_bool *is_running);
+                   const bool *is_running);
 
 // Fills *out with a point-in-time snapshot of rb's diagnostics. Safe to call
 // from any thread at any time -- every field it reads is atomic, and none

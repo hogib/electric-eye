@@ -1,8 +1,8 @@
 #include "jpeg_decode.h"
+#include "turbojpeg_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <turbojpeg.h>
 
 struct JpegDecoder {
   tjhandle handle;
@@ -241,7 +241,7 @@ static JpegDecodeResult decode_420_to_i422(JpegDecoder *dec,
   int strides[3] = {(int)frame->stride[0], (int)chroma_stride,
                     (int)chroma_stride};
 
-  if (tjDecompressToYUVPlanes(dec->handle, data, size, planes,
+  if (tjDecompressToYUVPlanes(dec->handle, TJ_SRC(data), size, planes,
                               (int)frame->width, strides, (int)frame->height,
                               0) < 0) {
     printf("jpeg_decode: tjDecompressToYUVPlanes failed: %s\n",
@@ -289,7 +289,7 @@ JpegDecodeResult jpeg_decode_frame(JpegDecoder *dec, const uint8_t *data,
 static JpegDecodeResult decode_frame(JpegDecoder *dec, const uint8_t *data,
                                      size_t size, VideoFrame *frame) {
   int jw, jh, jsubsamp, jcolorspace;
-  if (tjDecompressHeader3(dec->handle, data, size, &jw, &jh, &jsubsamp,
+  if (tjDecompressHeader3(dec->handle, TJ_SRC(data), size, &jw, &jh, &jsubsamp,
                           &jcolorspace) < 0) {
     printf("jpeg_decode: tjDecompressHeader3 failed: %s\n",
            tjGetErrorStr2(dec->handle));
@@ -334,7 +334,7 @@ static JpegDecodeResult decode_frame(JpegDecoder *dec, const uint8_t *data,
   int strides[3] = {(int)frame->stride[0], (int)frame->stride[1],
                     (int)frame->stride[2]};
 
-  if (tjDecompressToYUVPlanes(dec->handle, data, size, planes,
+  if (tjDecompressToYUVPlanes(dec->handle, TJ_SRC(data), size, planes,
                               (int)frame->width, strides, (int)frame->height,
                               0) < 0) {
     printf("jpeg_decode: tjDecompressToYUVPlanes failed: %s\n",

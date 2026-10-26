@@ -1,9 +1,10 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode, which hides write()/STDOUT_FILENO in <unistd.h> unless a
 // feature-test macro asks for them explicitly. Same guard as
 // video_threads.c/config.c.
 #define _POSIX_C_SOURCE 200809L
 
+#include "compat.h"
 #include "config.h"
 #include "frame_ring_buffer.h"
 #include "rpicam_in.h"
@@ -16,10 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <threads.h>
 #include <unistd.h>
 
-// Not declared by <unistd.h> under plain -std=c23 + _POSIX_C_SOURCE (it's
+// Not declared by <unistd.h> under plain -std=c99 + _POSIX_C_SOURCE (it's
 // specified by POSIX as available whenever a conforming environment defines
 // it, but glibc's strict-ISO mode still doesn't expose the declaration here
 // the way it does write()/STDOUT_FILENO above) -- declare it directly rather
@@ -35,14 +35,15 @@ extern char **environ;
 
 // virtual_cam_ensure_loaded() is what actually makes virtual_cam_device_path
 // exist; cons_args.outpath below points at the same path.
-constexpr uint32_t virtual_cam_video_nr = 10;
-constexpr char virtual_cam_card_label[] = "VirtualCam";
-constexpr char virtual_cam_device_path[] = "/dev/video10";
+static const uint32_t virtual_cam_video_nr = 10;
+static const char virtual_cam_card_label[] = "VirtualCam";
+static const char virtual_cam_device_path[] = "/dev/video10";
 
 // Live-preview stream tap (see stream_server.h). Off by default (Config's
 // stream_frame_interval starts at 0); this is only the port it listens on
-// once a config turns it on.
-constexpr uint16_t stream_server_port = 9000;
+// once a config turns it on. An enum, not a const variable, because
+// cons_args' static initializer below needs a constant expression.
+enum { stream_server_port = 9000 };
 
 // Frames in circulation. Not the ring capacity (31): every frame in the
 // pool can be queued in front of the virtual camera at once, so this is
@@ -52,30 +53,32 @@ constexpr uint16_t stream_server_port = 9000;
 // camera driver drops its oldest frames instead, which is the right trade
 // for a live view. Also the memory bill: each frame is three full I422
 // buffers, ~5.5MB at 720p.
-constexpr unsigned int frame_pool_size = 8;
-static_assert(frame_pool_size <= ring_buffer_size - 1,
+enum { frame_pool_size = 8 };
+STATIC_ASSERT(frame_pool_size <= ring_buffer_size - 1,
               "every pooled frame must fit in the free ring at once");
 
 FrameRingBuffer ring_buffer_in;
 FrameRingBuffer ring_buffer_out;
 FrameRingBuffer ring_buffer_free;
-atomic_bool is_running = true;
+bool is_running = true; // atomic (see compat.h)
 
-// atomic_store() on a lock-free type and write() are among the few
+// An atomic store to a lock-free type and write() are among the few
 // operations POSIX guarantees are safe to call from a signal handler --
 // printf is not one of them, since it can deadlock if the signal lands
 // while the interrupted code already holds stdio's internal lock. This
-// guarantee only holds because atomic_bool is required to be lock-free
-// here: a lock-based atomic would mean this handler could call into a
-// mutex from arbitrary interrupted context, which is not signal-safe.
-static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
-             "is_running must be lock-free to set from a signal handler");
+// guarantee only holds because a bool is required to be lock-free here: a
+// lock-based atomic would mean this handler could call into a mutex from
+// arbitrary interrupted context, which is not signal-safe. GCC (4.7+) and
+// clang both predefine this macro alongside the __atomic builtins.
+#if !defined(__GCC_ATOMIC_BOOL_LOCK_FREE) || __GCC_ATOMIC_BOOL_LOCK_FREE != 2
+#error "is_running must be lock-free to set from a signal handler"
+#endif
 
 static void handle_shutdown_signal(int sig) {
   (void)sig;
   static const char msg[] = "\nShutting down...\n";
   write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-  atomic_store(&is_running, false);
+  __atomic_store_n(&is_running, false, __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -342,13 +345,13 @@ int main(int argc, char **argv) {
   // these frames invisible to producer_loop -- the ring held them, but
   // nothing was ever posted to say so. NULL is safe here (never give up
   // rather than abandon a frame) since is_running is already true and
-  // there is always enough room: the static_assert on frame_pool_size
+  // there is always enough room: the STATIC_ASSERT on frame_pool_size
   // keeps it within empty's initial capacity.
   for (unsigned int i = 0; i < pool_size; ++i) {
     ring_push_wait(&ring_buffer_free, pool[i], NULL);
   }
 
-  atomic_store(&is_running, true);
+  __atomic_store_n(&is_running, true, __ATOMIC_SEQ_CST);
 
   ConfigWatcher *config_watcher = config_watch_start(config_path, &is_running);
   if (!config_watcher) {

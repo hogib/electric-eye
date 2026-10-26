@@ -38,12 +38,15 @@ Edit `eeye_config.json` while it runs; changes apply in ~200ms with no restart.
 ### Manual build
 
 ```sh
-meson setup builddir && meson compile -C builddir
+make
 ./builddir/eeye [config_path]     # default: ./eeye_config.json
 ```
 
-Needs `meson`, `ninja`, a C23 compiler, and OpenMP. `libturbojpeg` is used if
-present and built from source automatically if not.
+Needs GNU make, a C99 compiler (GCC 4.7+ or clang), and libturbojpeg 1.4+
+(`libturbojpeg0-dev` on Debian and Raspberry Pi OS). OpenMP is used when the
+compiler has it. Old toolchains are fine: this builds on Debian 7 onward. A
+distro too old to package libturbojpeg 1.4 can point the build at one built from
+source; see the top of the `Makefile`.
 
 Running by hand needs `CAP_SYS_MODULE` to load v4l2loopback — use `sudo`, or
 pre-load the module yourself:
@@ -574,9 +577,9 @@ fine on a shared network.
 ## Development
 
 ```sh
-meson setup builddir       # once, or after meson.build changes
-meson compile -C builddir
-meson test -C builddir     # 12 suites
+make                       # builddir/eeye
+make -j check              # 14 suites
+make BUILD=debug           # builddir/eeye-d, unoptimized
 ```
 
 **[`docs/`](docs/) has the internal documentation** — architecture, both capture
@@ -592,4 +595,4 @@ where grayscale/invert/threshold/tint/light live, fused into LUTs), and config
 hot-reload (`config.c`), wired together in `video_threads.c` / `eeye.c`.
 
 `pi/`, `topside/`, and `tools/` are standalone Python — stdlib only, not part of
-the meson build.
+the C build.

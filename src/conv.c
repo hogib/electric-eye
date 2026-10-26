@@ -1,4 +1,5 @@
 #include "conv.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -391,7 +392,7 @@ static void blur_row_v(const uint8_t *r_m2, const uint8_t *r_m1,
 
 // Rows of `row_cap` bytes each thread needs: the 5-row rolling window, plus
 // the two rows just below its band (see blur_plane_team).
-constexpr uint32_t blur_rows_per_thread = 7;
+static const uint32_t blur_rows_per_thread = 7;
 
 static uint8_t *blur_rows;    // team_size * blur_rows_per_thread rows
 static size_t blur_rows_cap;
@@ -603,7 +604,7 @@ static void upsample_bilinear2x_team(const uint8_t *small, uint32_t half_w,
 // it, the linear-in-passes savings from blurring a quarter as many pixels
 // per pass clearly wins, and the softening those two extra resize steps
 // add is comparatively unnoticeable on top of an already-heavy blur.
-constexpr uint32_t halfres_blur_pass_threshold = 4;
+static const uint32_t halfres_blur_pass_threshold = 4;
 
 // Team-wide: picks the full- or half-resolution path for one plane.
 // `halfres` is decided once per call by the caller (blur_prepare), so every

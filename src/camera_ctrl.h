@@ -36,8 +36,9 @@
  */
 
 // Distinguishes "the operator did not mention this" from any value they
-// could legitimately ask for. Chosen well outside every field's range.
-constexpr int32_t camera_ctrl_unset = INT32_MIN;
+// could legitimately ask for. Chosen well outside every field's range. An
+// enum so config.c's static config_defaults can use it in an initializer.
+enum { camera_ctrl_unset = INT32_MIN };
 
 typedef struct {
   // Auto toggles. These must be applied *before* their manual siblings:

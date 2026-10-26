@@ -55,7 +55,7 @@ static void pool_init(Pool *p) {
 
 static VideoFrame *take(Pool *p, uint8_t tag) {
   VideoFrame *f = NULL;
-  static atomic_bool running = true; // never cleared: the pool always has one
+  static bool running = true; // never cleared: the pool always has one
   CHECK(ring_pop_wait(&p->free_ring, (void **)&f, &running));
   memset(f->raw_data, tag, f->plane_sizes[0] + f->plane_sizes[1] +
                                f->plane_sizes[2]);

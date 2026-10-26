@@ -1,4 +1,4 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode, which hides pipe()/fork()/kill() unless a feature-test macro
 // asks for them explicitly. Same guard as v4l2_in.c/config.c/eeye.c.
 #define _POSIX_C_SOURCE 200809L
@@ -22,19 +22,19 @@
 // sees only what arrives here. Compression artifacts introduced at this
 // point are permanent; the preview can afford them because it is a
 // throwaway copy, this cannot.
-constexpr unsigned rpicam_jpeg_quality = 93;
+static const unsigned rpicam_jpeg_quality = 93;
 
 // Upper bound on one buffered JPEG. A 4:2:0 frame at quality 93 runs a few
 // hundred KB even at 1080p, so this is generous headroom rather than a
 // tight fit -- but it is a hard cap: a stream that never yields a complete
 // frame within it is treated as a protocol failure instead of growing the
 // buffer without limit.
-constexpr size_t rpicam_max_frame_bytes = 16u * 1024 * 1024;
+static const size_t rpicam_max_frame_bytes = 16u * 1024 * 1024;
 
 // How long to wait for data before concluding the child has wedged. The
 // child is spawned with a framerate, so frames should arrive on that
 // cadence; this is several frame intervals even at low rates.
-constexpr int rpicam_poll_timeout_ms = 4000;
+static const int rpicam_poll_timeout_ms = 4000;
 
 struct RpicamIn {
   pid_t child;
@@ -184,8 +184,8 @@ static size_t find_jpeg_end_resumable(const uint8_t *data, size_t size,
 }
 
 // The one-shot form, for callers (and tests) with a complete buffer.
-[[maybe_unused]] static size_t find_jpeg_end(const uint8_t *data,
-                                             size_t size) {
+__attribute__((unused)) static size_t find_jpeg_end(const uint8_t *data,
+                                                    size_t size) {
   size_t resume = 0;
   return find_jpeg_end_resumable(data, size, &resume);
 }

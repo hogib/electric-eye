@@ -1,16 +1,15 @@
 #pragma once
 #include "config.h"
 #include "frame_ring_buffer.h"
-#include <stdatomic.h>
 #include <stdint.h>
-#include <threads.h>
+#include <time.h>
 
 static inline void sleep_us(long microseconds) {
   struct timespec ts;
   ts.tv_sec = microseconds / 1000000;
   ts.tv_nsec = (microseconds % 1000000) * 1000;
 
-  thrd_sleep(&ts, NULL);
+  nanosleep(&ts, NULL);
 }
 
 // frame_width/frame_height here (as in WorkerArgs and ConsumerArgs) are the
@@ -29,7 +28,7 @@ typedef struct {
   // Which pixel format to demand; the rpicam backend only distinguishes
   // yuv420 from everything else (MJPEG).
   CaptureFormat capture_format;
-  atomic_bool *is_running;
+  bool *is_running;
   // Camera controls are hot-reloadable, so the producer needs the live
   // config too -- it is the only thread that holds the camera device.
   const ConfigWatcher *config;
@@ -45,15 +44,16 @@ typedef struct {
 // How long apply_effect_chain() takes per frame, accumulated by
 // effects_loop and logged (then reset) by stats_loop. The number to watch
 // when tuning OpenMP or the chain on real hardware. Diagnostic only, so
-// every access is relaxed.
+// every access is relaxed. All three are atomic (see compat.h), as is
+// *is_running in every args struct below.
 typedef struct {
-  atomic_uint_fast64_t frames;
-  atomic_uint_fast64_t total_ns;
-  atomic_uint_fast64_t max_ns;
+  uint_fast64_t frames;
+  uint_fast64_t total_ns;
+  uint_fast64_t max_ns;
 } EffectsTiming;
 
 typedef struct {
-  atomic_bool *is_running;
+  bool *is_running;
   FrameRingBuffer *ring_buffer_in;
   FrameRingBuffer *ring_buffer_out;
   const ConfigWatcher *config;
@@ -64,7 +64,7 @@ typedef struct {
 
 typedef struct {
   const char *outpath;
-  atomic_bool *is_running;
+  bool *is_running;
   FrameRingBuffer *ring_buffer_out;
   FrameRingBuffer *ring_buffer_free;
   const ConfigWatcher *config; // for the recording/stream taps' config
@@ -80,7 +80,7 @@ typedef struct {
 // All three rings, read-only from here -- stats_loop only ever calls
 // ring_get_stats() on them, never pushes/pops.
 typedef struct {
-  atomic_bool *is_running;
+  bool *is_running;
   EffectsTiming *effects_timing;
   const FrameRingBuffer *ring_buffer_in;
   const FrameRingBuffer *ring_buffer_out;

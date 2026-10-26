@@ -52,11 +52,9 @@ V4l2Out *v4l2_out_open(const char *path, uint32_t width, uint32_t height,
     return NULL;
   }
 
-  // device_caps describes this specific node; capabilities is the union across
-  // every node the driver owns, so it can advertise OUTPUT for a node that
-  // does not have it. Only trust device_caps when the driver says it is valid.
-  uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps
-                                                            : cap.capabilities;
+  // This node's own caps: the driver-wide union can advertise OUTPUT for a
+  // node that does not have it (see v4l2_ioctl.h).
+  uint32_t caps = v4l2_node_caps(&cap);
   if (!(caps & V4L2_CAP_VIDEO_OUTPUT)) {
     // With exclusive_caps=1 the loopback advertises OUTPUT only until a
     // consumer opens it for reading, after which later openers see CAPTURE.

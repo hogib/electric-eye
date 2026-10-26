@@ -1,4 +1,4 @@
-// _POSIX_C_SOURCE before any header include: -std=c23 puts glibc in strict
+// _POSIX_C_SOURCE before any header include: -std=c99 puts glibc in strict
 // ISO mode, which hides nanosleep() unless a feature-test macro asks for it
 // explicitly. Same guard as config.c/eeye.c/v4l2_in.c.
 #define _POSIX_C_SOURCE 200809L

@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Minimal assertion harness. No framework: these tests link against the
- * project's own translation units and run under meson test, and a
+ * project's own translation units and run under `make check`, and a
  * dependency would be one more thing to install on a Pi before the tests
  * can be trusted.
  *

@@ -1,6 +1,6 @@
 # Testing
 
-14 suites, ~190 tests, run with `meson test -C builddir`.
+14 suites, ~190 tests, run with `make check` (`-j` runs them in parallel).
 
 ## The suites
 
@@ -34,9 +34,9 @@ That reaches file-static functions — `parse_config`, `find_jpeg_end`, `conside
 `scale_to_range` — without widening their visibility in the shipping build just to make
 them testable.
 
-Extra translation units a test needs are listed in `test_extra_sources` in
-`meson.build`. If a test fails to link with undefined references, that map is where to
-add them.
+Extra translation units a test needs are listed as `test_<name>_SRC` in the
+`Makefile`. If a test fails to link with undefined references, that is where to add
+them.
 
 ## The harness
 
@@ -112,7 +112,7 @@ It proves the two agree, **not that either is right**. So also cross-compile the
 project's own test suites and run them under emulation with NEON active:
 
 ```sh
-aarch64-linux-gnu-gcc -std=gnu23 -O2 -I src -I tests -o t_canny \
+aarch64-linux-gnu-gcc -std=gnu99 -O2 -I src -I tests -o t_canny \
     tests/test_canny.c src/conv.c src/video_frame.c -lm
 qemu-aarch64-static -L /usr/aarch64-linux-gnu ./t_canny
 ```
@@ -153,10 +153,11 @@ setting values through `eeye` and reading them back with `v4l2-ctl` — brightne
 ## Adding a suite
 
 1. Write `tests/test_<name>.c` using the harness.
-2. Add `'<name>': [...]` to `test_extra_sources` in `meson.build`, listing any extra
-   `.c` files it needs.
-3. `meson setup --reconfigure builddir && meson test -C builddir`.
+2. Add `<name>` to `TESTS` in the `Makefile`, and a `test_<name>_SRC :=` line listing
+   any extra `.c` files it needs.
+3. `make check` (or `make check-<name>` for just that suite).
 
-Python suites are registered separately near the bottom of `meson.build` and run via
-`find_program('python3')`. They fall back to IPv4 loopback where IPv6 loopback is
+Python suites are registered separately near the bottom of the `Makefile` as
+`check-topside` / `check-record`, and run with `$(PYTHON)` (default `python3`); they
+are skipped where it isn't installed. They fall back to IPv4 loopback where IPv6 loopback is
 unavailable, so they run in containers rather than being silently skipped.

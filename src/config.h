@@ -1,6 +1,5 @@
 #pragma once
 #include "camera_ctrl.h"
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -123,11 +122,11 @@ typedef struct {
 // (see config.c) on every reload, and keeping it a plain, pointer-free POD
 // struct is what makes that ring safe without any per-slot allocation or
 // cleanup. 8 is comfortably past any chain that makes visual sense.
-constexpr size_t max_chain_stages = 8;
+enum { max_chain_stages = 8 };
 
 // Shared with consumer_loop's own local copy of the current recording
 // path (see video_threads.c), so the two can never drift out of sync.
-constexpr size_t max_record_path_len = 256;
+enum { max_record_path_len = 256 };
 
 typedef struct {
   EffectStage stages[max_chain_stages];
@@ -332,7 +331,7 @@ typedef struct ConfigWatcher ConfigWatcher;
  * ConsumerArgs: the caller flips it to false to signal every thread,
  * including this one, to shut down.
  */
-ConfigWatcher *config_watch_start(const char *path, atomic_bool *is_running);
+ConfigWatcher *config_watch_start(const char *path, bool *is_running);
 
 void config_watch_stop(ConfigWatcher *watcher);
 
