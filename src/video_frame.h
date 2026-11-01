@@ -55,6 +55,10 @@ typedef struct {
   // until the effects thread has measured this frame.
   FrameStats stats;
 
+  // Set by the effect chain: the work planes' chroma is all 128 (the chain
+  // ends in an edge map or grayscale), so the frame bus need not copy it.
+  bool chroma_neutral;
+
   // The three allocations behind the role pointers above. Roles can move
   // between them -- effect_chain.c swaps work and spare instead of copying
   // one into the other, and points work at raw for an empty chain -- so

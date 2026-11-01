@@ -61,6 +61,17 @@ void fbus_writer_publish(FbusWriter *w, const uint8_t *const planes[3],
                          int64_t frame_no, uint64_t capture_mono_ns);
 
 /*
+ * The same, for a frame whose chroma planes are known to be all 128 (an
+ * edge map: sobel, LoG, canny, grayscale). Only luma is copied; a slot's
+ * chroma is filled with 128 the first time it gets such a frame, and left
+ * as it is after that. Readers see exactly the bytes a full copy would
+ * have written. `chroma_neutral` false is plain fbus_writer_publish.
+ */
+void fbus_writer_publish_frame(FbusWriter *w, const uint8_t *const planes[3],
+                               int64_t frame_no, uint64_t capture_mono_ns,
+                               bool chroma_neutral);
+
+/*
  * Marks the stream closed, stops the heartbeat, and removes the file if it
  * is still ours (a newer writer may have replaced it). Readers see the
  * stream as gone at once. Safe on NULL.

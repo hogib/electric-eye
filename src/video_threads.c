@@ -400,8 +400,10 @@ void *consumer_loop(void *arg) {
 
     // raw_planes is never written by the effect chain (see
     // video_frame.h), so it is the camera's frame as captured.
-    fbus_writer_publish(bus_pilot, (const uint8_t *const *)frame->planes,
-                        frame->pts, frame->capture_ns);
+    fbus_writer_publish_frame(bus_pilot,
+                              (const uint8_t *const *)frame->planes,
+                              frame->pts, frame->capture_ns,
+                              frame->chroma_neutral);
     fbus_writer_publish(bus_raw, (const uint8_t *const *)frame->raw_planes,
                         frame->pts, frame->capture_ns);
 

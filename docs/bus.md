@@ -33,6 +33,12 @@ filters in it that are there for a human.
   machine. `capture_real_ns` is the same moment on the wall clock, for lining up with
   data from another machine (whose clock you then need synced — chrony).
 - **Same machine only.** The bus never crosses the tether; `hellion` does that.
+- **Every slot holds every byte of its frame.** A writer may avoid re-copying chroma it
+  knows is all 128 (an edge map: `eeye`'s `pilot` after sobel, LoG, canny or grayscale)
+  by filling a slot with 128 once and leaving it (`fbus_writer_publish_frame`), but what
+  a reader copies out is exactly what a full copy would have written. The writer keeps
+  the layout it created in its own memory rather than trusting the shared header, so a
+  file damaged by something else in the group cannot steer its copies.
 
 ## Reading from C
 

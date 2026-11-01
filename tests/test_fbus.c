@@ -121,6 +121,45 @@ static void test_publish_then_read(void) {
   free(out.buf);
 }
 
+// A frame published as chroma-neutral reads back with all-128 chroma
+// whatever the caller's chroma planes held (they are not copied: a slot is
+// filled once and then left), and a slot that held a full-colour frame in
+// between gets its 128s back. Several laps of the slots, mixed.
+static void test_neutral_chroma_publish(void) {
+  FbusWriter *w = fbus_writer_open("t-neutral", 64, 32);
+  CHECK(w != NULL);
+  FbusReader *r = fbus_reader_open("t-neutral", NULL);
+  CHECK(r != NULL);
+  if (!w || !r)
+    return;
+  Planes in, out;
+  planes_init(&in, 64, 32);
+  planes_init(&out, 64, 32);
+  static const bool neutral[] = {1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1};
+  for (int i = 0; i < 16; i++) {
+    memset(in.planes[0], 10 + i, in.bytes[0]);
+    // Neutral frames carry garbage chroma: it must not be what readers see.
+    memset(in.planes[1], neutral[i] ? 0xEE : 60 + i, in.bytes[1]);
+    memset(in.planes[2], neutral[i] ? 0x11 : 90 + i, in.bytes[2]);
+    fbus_writer_publish_frame(w, cplanes(&in), i, 0, neutral[i]);
+    CHECK_EQ_INT(fbus_reader_next(r, out.planes, 1000, NULL), FBUS_FRAME);
+    bool ok = out.planes[0][0] == (uint8_t)(10 + i) &&
+              out.planes[0][in.bytes[0] - 1] == (uint8_t)(10 + i);
+    for (size_t j = 0; j < in.bytes[1]; j++) {
+      uint8_t wu = neutral[i] ? 128 : (uint8_t)(60 + i);
+      uint8_t wv = neutral[i] ? 128 : (uint8_t)(90 + i);
+      ok &= out.planes[1][j] == wu && out.planes[2][j] == wv;
+    }
+    if (!ok)
+      printf("    frame %d (neutral %d) read back wrong\n", i, neutral[i]);
+    CHECK(ok);
+  }
+  fbus_reader_close(r);
+  fbus_writer_close(w);
+  free(in.buf);
+  free(out.buf);
+}
+
 static void test_reader_gets_newest_and_counts_skips(void) {
   FbusWriter *w = fbus_writer_open("t-skip", 16, 8);
   FbusReader *r = fbus_reader_open("t-skip", NULL);
@@ -560,6 +599,7 @@ int main(void) {
   setenv("EEYE_BUS_DIR", bus_dir, 1);
 
   RUN_TEST(test_publish_then_read);
+  RUN_TEST(test_neutral_chroma_publish);
   RUN_TEST(test_reader_gets_newest_and_counts_skips);
   RUN_TEST(test_reader_wakes_on_publish);
   RUN_TEST(test_close_makes_stream_gone);

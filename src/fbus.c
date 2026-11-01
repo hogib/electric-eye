@@ -158,6 +158,15 @@ struct FbusWriter {
   dev_t dev;
   ino_t ino;
   uint64_t seq; // frames published (mirrors hdr->write_seq)
+  // The layout this writer created, kept here rather than read back from
+  // the shared header on every frame: anything in the stream's group can
+  // write to that file, and a corrupted header must not be able to steer
+  // the writer's copies out of bounds.
+  size_t plane_offset[3], plane_bytes[3];
+  size_t slots_offset, slot_stride, slot_header_bytes;
+  uint32_t slot_count;
+  // Which slots already hold all-128 chroma (fbus_writer_publish_frame).
+  bool slot_neutral[fbus_slot_count];
 
   pthread_t heartbeat;
   bool heartbeat_started;
@@ -276,6 +285,14 @@ FbusWriter *fbus_writer_open(const char *name, uint32_t width,
   h->slot_header_bytes = fbus_slot_header_bytes;
   h->slot_stride = slot_stride;
   h->slots_offset = fbus_header_bytes;
+  for (int p = 0; p < 3; p++) {
+    w->plane_offset[p] = h->plane_offset[p];
+    w->plane_bytes[p] = h->plane_bytes[p];
+  }
+  w->slots_offset = h->slots_offset;
+  w->slot_stride = h->slot_stride;
+  w->slot_header_bytes = h->slot_header_bytes;
+  w->slot_count = h->slot_count;
   h->writer_pid = (int32_t)getpid();
   h->created_real_ns = clock_ns(CLOCK_REALTIME);
   h->heartbeat_mono_ns = mono_ns();
@@ -306,20 +323,38 @@ FbusWriter *fbus_writer_open(const char *name, uint32_t width,
 
 void fbus_writer_publish(FbusWriter *w, const uint8_t *const planes[3],
                          int64_t frame_no, uint64_t capture_mono_ns) {
+  fbus_writer_publish_frame(w, planes, frame_no, capture_mono_ns, false);
+}
+
+void fbus_writer_publish_frame(FbusWriter *w, const uint8_t *const planes[3],
+                               int64_t frame_no, uint64_t capture_mono_ns,
+                               bool chroma_neutral) {
   if (!w)
     return;
   FbusHeader *h = w->hdr;
   uint64_t n = w->seq + 1;
-  FbusSlotHeader *s = slot_at(w->base, h, (n - 1) % h->slot_count);
-  uint8_t *data = (uint8_t *)s + h->slot_header_bytes;
+  uint32_t k = (uint32_t)((n - 1) % w->slot_count);
+  FbusSlotHeader *s =
+      (FbusSlotHeader *)(w->base + w->slots_offset + k * w->slot_stride);
+  uint8_t *data = (uint8_t *)s + w->slot_header_bytes;
 
   // Seqlock write: odd while the slot is inconsistent. The release fence
   // keeps the odd value from being reordered after the copies.
   __atomic_store_n(&s->seq, 2 * n - 1, __ATOMIC_RELAXED);
   __atomic_thread_fence(__ATOMIC_RELEASE);
 
-  for (int p = 0; p < 3; p++)
-    memcpy(data + h->plane_offset[p], planes[p], h->plane_bytes[p]);
+  memcpy(data + w->plane_offset[0], planes[0], w->plane_bytes[0]);
+  if (!chroma_neutral) {
+    memcpy(data + w->plane_offset[1], planes[1], w->plane_bytes[1]);
+    memcpy(data + w->plane_offset[2], planes[2], w->plane_bytes[2]);
+    w->slot_neutral[k] = false;
+  } else if (!w->slot_neutral[k]) {
+    // An edge map's chroma is all 128: written once per slot, then left.
+    // Half the bytes of a 4:2:2 frame not copied, every frame after.
+    memset(data + w->plane_offset[1], 128, w->plane_bytes[1]);
+    memset(data + w->plane_offset[2], 128, w->plane_bytes[2]);
+    w->slot_neutral[k] = true;
+  }
 
   uint64_t now = mono_ns();
   s->frame_no = frame_no;

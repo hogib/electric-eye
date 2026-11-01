@@ -440,6 +440,52 @@ static void same_output(const EffectStage *with, size_t nw,
   vf_free(fb);
 }
 
+// The chain says its output chroma is neutral only when it is: every
+// chroma byte 128, on varied content -- and does not say so when it isn't.
+static void test_chroma_neutral_flag(void) {
+  static const struct {
+    EffectType stages[3];
+    size_t n;
+    bool neutral;
+  } cases[] = {
+      {{EFFECT_SOBEL}, 1, true},
+      {{EFFECT_BLUR, EFFECT_SOBEL}, 2, true},
+      {{EFFECT_SOBEL, EFFECT_BLUR}, 2, true},
+      {{EFFECT_CANNY, EFFECT_INVERT, EFFECT_CONTRAST}, 3, true},
+      {{EFFECT_GRAYSCALE, EFFECT_THRESHOLD}, 2, true},
+      {{EFFECT_LOG}, 1, true},
+      {{EFFECT_SOBEL, EFFECT_TINT}, 2, false},
+      {{EFFECT_BLUR}, 1, false},
+      {{EFFECT_NONE}, 0, false},
+  };
+  for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+    Config cfg = {0};
+    cfg.stage_count = cases[c].n;
+    for (size_t i = 0; i < cases[c].n; i++) {
+      cfg.stages[i].effect = cases[c].stages[i];
+      cfg.stages[i].blur_strength = 5; // the half-resolution path too
+      cfg.stages[i].tint_u = 90;
+      cfg.stages[i].tint_strength = 200;
+      cfg.stages[i].canny_low = 40;
+      cfg.stages[i].canny_high = 90;
+      cfg.stages[i].canny_strength = 1;
+      cfg.stages[i].log_strength = 1;
+    }
+    VideoFrame *f = make_frame(64, 32, (unsigned)(31 + c));
+    apply_effect_chain(f, &cfg);
+    CHECK_EQ_INT(f->chroma_neutral, cases[c].neutral);
+    if (cases[c].neutral) {
+      bool all128 = true;
+      for (size_t i = 0; i < f->plane_sizes[1]; i++)
+        all128 &= f->planes[1][i] == 128 && f->planes[2][i] == 128;
+      if (!all128)
+        printf("    case %zu: flagged neutral, but chroma is not all 128\n", c);
+      CHECK(all128);
+    }
+    vf_free(f);
+  }
+}
+
 static void test_dead_chroma_is_skipped_invisibly(void) {
   EffectStage tint = {.effect = EFFECT_TINT, .tint_u = 90, .tint_v = 150,
                       .tint_strength = 180};
@@ -543,5 +589,6 @@ int main(void) {
   RUN_TEST(test_empty_chain_aliasing_is_undone_next_frame);
   RUN_TEST(test_auto_visibility_runs_first);
   RUN_TEST(test_dead_chroma_is_skipped_invisibly);
+  RUN_TEST(test_chroma_neutral_flag);
   TEST_MAIN_END();
 }

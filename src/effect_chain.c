@@ -247,6 +247,22 @@ static void compute_chroma_liveness(const Config *cfg,
 
 static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur);
 
+// Whether the chain's output chroma is all 128 whatever the input: its
+// last stage that does anything to chroma resets it (sobel, LoG, canny,
+// grayscale), and everything after either passes chroma through or, like
+// blur, keeps a uniform plane exactly uniform. The frame bus then copies
+// luma only (fbus_writer_publish_frame).
+static bool output_chroma_neutral(const Config *cfg) {
+  for (size_t i = cfg->stage_count; i-- > 0;) {
+    EffectType e = cfg->stages[i].effect;
+    if (kills_chroma(e))
+      return true;
+    if (!passes_chroma(e) && e != EFFECT_BLUR)
+      return false; // tint, light
+  }
+  return false; // the camera's chroma (or auto visibility's)
+}
+
 void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
   apply_effect_chain_auto(frame, cfg, NULL, NULL);
 }
@@ -260,6 +276,7 @@ void apply_effect_chain_auto(VideoFrame *frame, const Config *cfg,
 
   ChainBuf cur = CHAIN_RAW;
   frame->stats.auto_on = false;
+  frame->chroma_neutral = output_chroma_neutral(cfg);
   if (cfg->auto_visibility && av && stats) {
     const uint8_t *src[3] = {frame->raw_planes[0], frame->raw_planes[1],
                              frame->raw_planes[2]};
