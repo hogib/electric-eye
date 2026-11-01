@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "json_cursor.h"
+
 /*
  * Camera controls -- exposure, gain, white balance and the usual image
  * adjustments -- expressed once, portably, and applied by whichever
@@ -71,6 +73,26 @@ typedef struct {
 
 // All fields unset -- the state meaning "change nothing".
 void camera_ctrl_init(CameraControls *c);
+
+/*
+ * The "camera" object of a config, as JSON: shared by eeye's config and
+ * hellion, which carries it to the ROV in placement A. Fields present in
+ * the object are set in *out; absent ones are left as they were (so the
+ * caller decides the defaults). Unknown keys, wrong types and values out
+ * of range are refused with the reason in err.
+ *
+ * camera_ctrl_parse reads one object at a cursor (json_cursor.h);
+ * camera_ctrl_parse_json a whole document that is nothing but that object.
+ */
+bool camera_ctrl_parse(Cursor *c, CameraControls *out, char *err,
+                       size_t err_cap);
+bool camera_ctrl_parse_json(const char *json, size_t len, CameraControls *out,
+                            char *err, size_t err_cap);
+
+// The fields of `c` that are set, as a JSON object camera_ctrl_parse_json
+// reads back to the same controls. Returns its length, or -1 if `cap` is
+// too small.
+int camera_ctrl_to_json(const CameraControls *c, char *out, size_t cap);
 
 // Whether any field is actually set. Lets callers skip the whole apply
 // path (and its logging) when no controls are configured at all.

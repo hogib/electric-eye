@@ -1,4 +1,5 @@
 #pragma once
+#include "camera_ctrl.h"
 #include "hconfig.h"
 #include "hstatus.h"
 #include <stdbool.h>
@@ -23,6 +24,28 @@ typedef struct Pipeline Pipeline;
 
 // Starts the pipeline's threads. They run until pipeline_stop().
 Pipeline *pipeline_start(const PipelineConfig *cfg);
+
+// The same, for a camera source, opening the camera with `camera` (NULL:
+// no controls) rather than applying them a moment later -- which for the
+// Pi camera would mean restarting rpicam-vid straight away.
+Pipeline *pipeline_start_with_camera(const PipelineConfig *cfg,
+                                     const CameraControls *camera);
+
+// Whether the source is a camera (v4l2: or rpicam), the only kind camera
+// controls apply to.
+bool pipeline_has_camera(const Pipeline *p);
+
+// New camera controls. The source thread applies them before its next
+// frame: ioctls on a V4L2 camera; for the Pi camera, a restart of
+// rpicam-vid (a ~1s gap; rpicam takes controls only on its command line).
+// The same controls again change nothing. They are also what the camera
+// is opened with after a reconnect.
+void pipeline_set_camera(Pipeline *p, const CameraControls *c);
+
+// Waits up to timeout_ms for the latest controls to be applied. Returns 1
+// when they were (*applied: how many the camera accepted), 0 when the
+// camera is not open (they apply when it opens), -1 on timeout.
+int pipeline_camera_wait(Pipeline *p, int timeout_ms, int *applied);
 
 // Fills `out` for the status file, including fps since the last call.
 void pipeline_status(Pipeline *p, HsPipeline *out);

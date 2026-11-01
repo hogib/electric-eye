@@ -534,8 +534,23 @@ async function applyConfig() {
     } else {
       let data;
       try { data = JSON.parse(text); } catch { data = {}; }
-      if (data.eeye_accepted === true) {
-        status.textContent = "Applied -- eeye confirmed it took effect.";
+      if (data.eeye_accepted === true && data.camera && data.camera.error) {
+        // Placement A: the effects took, the camera is on the ROV and the
+        // controls did not get there. Said plainly: the sliders now show
+        // values the camera is not using.
+        status.textContent = "Effects applied, but the camera settings did "
+          + "NOT reach the ROV's camera: " + data.camera.error;
+        status.className = "err";
+      } else if (data.eeye_accepted === true && data.camera &&
+                 data.camera.applied === false) {
+        status.textContent = "Applied. The ROV kept the camera settings, but "
+          + (data.camera.detail || "its camera has not taken them yet") + ".";
+        status.className = "ok";
+      } else if (data.eeye_accepted === true) {
+        status.textContent = data.camera
+          ? "Applied -- eeye confirmed it, and the ROV's camera took the "
+            + "settings."
+          : "Applied -- eeye confirmed it took effect.";
         status.className = "ok";
       } else if (data.eeye_accepted === false) {
         status.textContent = "eeye REJECTED it and kept the previous "

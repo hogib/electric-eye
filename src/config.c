@@ -425,116 +425,12 @@ static bool parse_chain(Cursor *c, EffectStage *stages, size_t *stage_count) {
 // while the real per-device clamping happens in camera_ctrl_apply, which
 // is the only place that knows what a given camera actually accepts.
 static bool parse_camera(Cursor *c, CameraControls *out) {
-  if (!cur_expect(c, '{')) {
-    printf("Config: expected '{' for \"camera\"\n");
+  char err[160];
+  if (!camera_ctrl_parse(c, out, err, sizeof err)) {
+    printf("Config: %s\n", err);
     return false;
   }
-  skip_ws(c);
-
-  char ch;
-  if (cur_peek(c, &ch) && ch == '}') {
-    c->pos++;
-    return true; // an empty object is valid: it changes nothing
-  }
-
-  for (;;) {
-    char key[32];
-    skip_ws(c);
-    if (!parse_string(c, key, sizeof key)) {
-      printf("Config: expected a quoted key in \"camera\"\n");
-      return false;
-    }
-    skip_ws(c);
-    if (!cur_expect(c, ':')) {
-      printf("Config: expected ':' after \"%s\" in \"camera\"\n", key);
-      return false;
-    }
-    skip_ws(c);
-
-    bool ok;
-    int32_t lo = 0, hi = 0;
-    int32_t *target = NULL;
-    if (strcmp(key, "auto_exposure") == 0) {
-      bool b;
-      ok = parse_bool(c, &b);
-      if (ok)
-        out->auto_exposure = b ? 1 : 0;
-    } else if (strcmp(key, "auto_white_balance") == 0) {
-      bool b;
-      ok = parse_bool(c, &b);
-      if (ok)
-        out->auto_white_balance = b ? 1 : 0;
-    } else if (strcmp(key, "keep_framerate") == 0) {
-      bool b;
-      ok = parse_bool(c, &b);
-      if (ok)
-        out->keep_framerate = b ? 1 : 0;
-    } else if (strcmp(key, "exposure") == 0) {
-      target = &out->exposure;
-      lo = 1;
-      hi = 10000000; // 10s; past any sane video exposure
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "gain") == 0) {
-      target = &out->gain;
-      lo = 0;
-      hi = 100;
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "white_balance") == 0) {
-      target = &out->white_balance;
-      lo = 1000;
-      hi = 15000; // Kelvin, generously past any camera's range
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "brightness") == 0) {
-      target = &out->brightness;
-      lo = -100;
-      hi = 100;
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "contrast") == 0) {
-      target = &out->contrast;
-      lo = 0;
-      hi = 200;
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "saturation") == 0) {
-      target = &out->saturation;
-      lo = 0;
-      hi = 200;
-      ok = parse_i32(c, target);
-    } else if (strcmp(key, "sharpness") == 0) {
-      target = &out->sharpness;
-      lo = 0;
-      hi = 200;
-      ok = parse_i32(c, target);
-    } else {
-      printf("Config: unknown key \"%s\" in \"camera\"\n", key);
-      return false;
-    }
-
-    if (!ok) {
-      printf("Config: invalid value for \"%s\" in \"camera\"\n", key);
-      return false;
-    }
-    if (target && (*target < lo || *target > hi)) {
-      printf("Config: \"%s\" must be between %d and %d (got %d)\n", key, lo,
-             hi, *target);
-      return false;
-    }
-
-    skip_ws(c);
-    if (!cur_peek(c, &ch)) {
-      printf("Config: unterminated \"camera\" object\n");
-      return false;
-    }
-    if (ch == ',') {
-      c->pos++;
-      continue;
-    }
-    if (ch == '}') {
-      c->pos++;
-      return true;
-    }
-    printf("Config: expected ',' or '}' after \"%s\" in \"camera\"\n", key);
-    return false;
-  }
+  return true;
 }
 
 // Logged once per process, not on every reload of the same file.

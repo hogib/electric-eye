@@ -32,6 +32,9 @@ static const int snapshot_quality = 92;
 // ~200ms; this leaves room for a busy Pi.
 static const int verdict_wait_ms = 3000;
 static const int peer_timeout_ms = 3000;
+// Forwarding camera controls: the ROV answers once the camera has taken
+// them, up to 4s for a Pi camera restart, plus the tether.
+static const int camera_forward_ms = 5000;
 
 // How often the side with "peer" set talks to the other side, and how
 // long it waits for an answer.
@@ -42,6 +45,11 @@ struct Control {
   HellionConfig cfg;
   HttpServer *http;
   HRec *rec;
+  Pipeline *pipes[hcfg_max_pipelines];
+  size_t pipe_count;
+  // POST /camera, one at a time: each waits for the camera to take its
+  // controls, and two interleaved would each report the other's result.
+  pthread_mutex_t camera_lock;
   int previews; // atomic (see compat.h)
 
   pthread_mutex_t lock; // the status snapshot and the peer view
@@ -302,6 +310,9 @@ static const char *wait_verdict(const char *status_path, uint64_t before) {
   return "null";
 }
 
+static void forward_camera(Control *ctl, const char *body, size_t len,
+                           char *out, size_t cap);
+
 // Writes eeye's config the way eeye's watcher expects (a temp file in the
 // same directory, renamed over), then waits for eeye's verdict in
 // "<config>.status". Its mtime is compared to the nanosecond: a fast
@@ -358,8 +369,12 @@ static void write_eeye_config(Control *ctl, HttpConn *conn, const char *body,
                       restored ? "true" : "false");
     return;
   }
-  http_respond_json(conn, 200, "{\"written\":true,\"eeye_accepted\":%s}\n",
-                    verdict);
+  char camera[800] = "";
+  if (strcmp(verdict, "true") == 0 &&
+      strcmp(ctl->cfg.camera_controls, "peer") == 0)
+    forward_camera(ctl, body, len, camera, sizeof camera);
+  http_respond_json(conn, 200, "{\"written\":true,\"eeye_accepted\":%s%s}\n",
+                    verdict, camera);
 }
 
 // eeye's health file with "age_s" added: a file that stopped being
@@ -382,6 +397,223 @@ static bool eeye_health(Control *ctl, char *out, size_t cap) {
                (double)(now.tv_nsec - st.st_mtim.tv_nsec) / 1e9;
   snprintf(out, cap, "%s,\"age_s\":%.1f}", buf, age < 0 ? 0 : age);
   return true;
+}
+
+// ---- Camera controls ------------------------------------------------------
+
+static void camera_defaults(CameraControls *c) {
+  camera_ctrl_init(c);
+  c->keep_framerate = 1; // eeye's default too: see camera_ctrl.h
+}
+
+bool control_load_camera(const char *path, CameraControls *out, char *err,
+                         size_t err_cap) {
+  camera_defaults(out);
+  err[0] = '\0';
+  char buf[1024];
+  size_t n = 0;
+  struct stat st;
+  if (stat(path, &st) != 0 && errno == ENOENT)
+    return true;
+  if (!read_file(path, buf, sizeof buf, &n, NULL)) {
+    snprintf(err, err_cap, "cannot read %.200s", path);
+    return false;
+  }
+  CameraControls parsed = *out;
+  if (!camera_ctrl_parse_json(buf, n, &parsed, err, err_cap))
+    return false;
+  *out = parsed;
+  return true;
+}
+
+// POST /camera: controls for the camera(s) here. The body is a "camera"
+// object, exactly as in eeye's config: a field left out is left as the
+// camera has it.
+static void serve_camera_post(Control *ctl, HttpConn *conn, const char *body,
+                              size_t len) {
+  CameraControls cc;
+  camera_defaults(&cc);
+  char err[200];
+  if (!body || !camera_ctrl_parse_json(body, len, &cc, err, sizeof err)) {
+    char esc[300];
+    json_escape(body ? err : "expected a JSON object", esc, sizeof esc);
+    http_respond_json(conn, 400, "{\"error\":\"%s\"}\n", esc);
+    return;
+  }
+  bool any = false;
+  for (size_t i = 0; i < ctl->pipe_count; i++)
+    any |= ctl->pipes[i] && pipeline_has_camera(ctl->pipes[i]);
+  if (!any) {
+    http_respond_json(conn, 409,
+                      "{\"error\":\"no camera source on this hellion\"}\n");
+    return;
+  }
+
+  pthread_mutex_lock(&ctl->camera_lock);
+  // Kept first, so a restart puts back what was asked for even if the
+  // camera is unplugged right now.
+  char json[512];
+  int jn = camera_ctrl_to_json(&cc, json, sizeof json);
+  bool saved = jn > 0 && replace_file(ctl->cfg.camera_file, json, (size_t)jn);
+  if (!saved)
+    printf("hellion: could not save camera controls to %s: %s\n",
+           ctl->cfg.camera_file, strerror(errno));
+
+  int applied = 0, result = 1;
+  for (size_t i = 0; i < ctl->pipe_count; i++) {
+    if (!ctl->pipes[i] || !pipeline_has_camera(ctl->pipes[i]))
+      continue;
+    pipeline_set_camera(ctl->pipes[i], &cc);
+    int n = 0;
+    // Long enough for rpicam-vid to restart and deliver a frame.
+    int r = pipeline_camera_wait(ctl->pipes[i], 4000, &n);
+    applied += r == 1 ? n : 0;
+    if (r < result)
+      result = r;
+  }
+  pthread_mutex_unlock(&ctl->camera_lock);
+  printf("hellion: camera controls %s: %s\n", jn > 0 ? json : "?",
+         result == 1   ? "applied"
+         : result == 0 ? "kept; the camera is not open, they apply when it is"
+                       : "kept; the camera has not taken them yet");
+  http_respond_json(conn, 200,
+                    "{\"applied\":%s,\"controls\":%d,\"saved\":%s,"
+                    "\"detail\":\"%s\"}\n",
+                    result == 1 ? "true" : "false", applied,
+                    saved ? "true" : "false",
+                    result == 1   ? ""
+                    : result == 0 ? "the camera is not open; they apply when it is"
+                                  : "the camera has not taken them yet");
+}
+
+static void serve_camera_get(Control *ctl, HttpConn *conn) {
+  CameraControls cc;
+  char err[200], json[512];
+  bool ok = control_load_camera(ctl->cfg.camera_file, &cc, err, sizeof err);
+  if (camera_ctrl_to_json(&cc, json, sizeof json) < 0)
+    snprintf(json, sizeof json, "{}");
+  char esc[300];
+  json_escape(err, esc, sizeof esc);
+  http_respond_json(conn, 200, "{\"controls\":%s,\"error\":\"%s\"}\n", json,
+                    ok ? "" : esc);
+}
+
+// Skips one JSON value of any kind at buf[*i]. Enough of JSON for finding
+// a key in a document eeye has already accepted, not a validator.
+static bool skip_json_value(const char *buf, size_t len, size_t *i) {
+  int depth = 0;
+  bool in_string = false;
+  for (; *i < len; (*i)++) {
+    char ch = buf[*i];
+    if (in_string) {
+      if (ch == '\\')
+        (*i)++;
+      else if (ch == '"') {
+        in_string = false;
+        if (depth == 0) {
+          (*i)++;
+          return true;
+        }
+      }
+    } else if (ch == '"') {
+      in_string = true;
+    } else if (ch == '{' || ch == '[') {
+      depth++;
+    } else if (ch == '}' || ch == ']') {
+      if (depth == 0)
+        return true; // the end of the enclosing object: a scalar ended
+      if (--depth == 0) {
+        (*i)++;
+        return true;
+      }
+    } else if (ch == ',' && depth == 0) {
+      return true;
+    }
+  }
+  return depth == 0 && !in_string;
+}
+
+// The value of top-level `key` in a JSON object, as [*start, *end).
+static bool find_top_level(const char *buf, size_t len, const char *key,
+                           size_t *start, size_t *end) {
+  size_t i = 0;
+  while (i < len && buf[i] != '{')
+    i++;
+  if (i++ == len)
+    return false;
+  size_t key_len = strlen(key);
+  while (i < len) {
+    while (i < len && (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\r' ||
+                       buf[i] == '\t' || buf[i] == ','))
+      i++;
+    if (i >= len || buf[i] != '"')
+      return false;
+    size_t k0 = ++i;
+    while (i < len && buf[i] != '"')
+      i += buf[i] == '\\' ? 2 : 1;
+    if (i >= len)
+      return false;
+    bool match = i - k0 == key_len && memcmp(buf + k0, key, key_len) == 0;
+    i++;
+    while (i < len && buf[i] != ':')
+      i++;
+    if (i++ >= len)
+      return false;
+    while (i < len && (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\r' ||
+                       buf[i] == '\t'))
+      i++;
+    size_t v0 = i;
+    if (!skip_json_value(buf, len, &i))
+      return false;
+    if (match) {
+      *start = v0;
+      *end = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Placement A, topside: the "camera" object of a config eeye accepted, on
+// to the ROV's camera. Writes `"camera":{...}` (the peer's answer, or an
+// error) into out for the response; "" when there was nothing to send.
+static void forward_camera(Control *ctl, const char *body, size_t len,
+                           char *out, size_t cap) {
+  out[0] = '\0';
+  size_t a, b;
+  if (!find_top_level(body, len, "camera", &a, &b) || body[a] != '{')
+    return;
+  CameraControls cc;
+  camera_ctrl_init(&cc);
+  char err[200], json[512];
+  if (!camera_ctrl_parse_json(body + a, b - a, &cc, err, sizeof err) ||
+      camera_ctrl_to_json(&cc, json, sizeof json) < 0) {
+    char esc[300];
+    json_escape(err, esc, sizeof esc);
+    snprintf(out, cap, ",\"camera\":{\"error\":\"%s\"}", esc);
+    return;
+  }
+  char resp[512];
+  size_t rlen = 0;
+  int status = http_call(ctl->cfg.peer, "POST", "/camera", json, strlen(json),
+                         resp, sizeof resp - 1, &rlen, camera_forward_ms, err,
+                         sizeof err);
+  while (rlen > 0 && (resp[rlen - 1] == '\n' || resp[rlen - 1] == ' '))
+    rlen--;
+  resp[rlen] = '\0';
+  if (status == 200 && rlen > 1 && resp[0] == '{') {
+    snprintf(out, cap, ",\"camera\":%s", resp);
+    return;
+  }
+  char why[512], esc[700];
+  if (status < 0)
+    snprintf(why, sizeof why, "ROV (%.100s): %.200s", ctl->cfg.peer, err);
+  else
+    snprintf(why, sizeof why, "ROV (%.100s) answered %d: %.200s",
+             ctl->cfg.peer, status, resp);
+  json_escape(why, esc, sizeof esc);
+  printf("hellion: camera controls did not reach the camera: %s\n", why);
+  snprintf(out, cap, ",\"camera\":{\"error\":\"%s\"}", esc);
 }
 
 static void proxy_to_peer(Control *ctl, HttpConn *conn, const char *method,
@@ -734,6 +966,10 @@ static void handle(HttpConn *conn, const HttpRequest *req, const char *body,
       http_respond_json(conn, 404, "{\"error\":\"no eeye health here\"}\n");
   } else if (get && strcmp(req->path, "/api/status") == 0) {
     serve_status(ctl, conn);
+  } else if (post && strcmp(req->path, "/camera") == 0) {
+    serve_camera_post(ctl, conn, body, len);
+  } else if (get && strcmp(req->path, "/camera") == 0) {
+    serve_camera_get(ctl, conn);
   } else if (!get && !post) {
     http_respond_json(conn, 405, "{\"error\":\"method not allowed\"}\n");
   } else {
@@ -741,7 +977,8 @@ static void handle(HttpConn *conn, const HttpRequest *req, const char *body,
   }
 }
 
-Control *control_start(const HellionConfig *cfg, HRec *rec) {
+Control *control_start(const HellionConfig *cfg, HRec *rec, Pipeline **pipes,
+                       size_t pipe_count) {
   if (!cfg->control[0])
     return NULL;
   Control *ctl = (Control *)calloc(1, sizeof *ctl);
@@ -749,13 +986,17 @@ Control *control_start(const HellionConfig *cfg, HRec *rec) {
     return NULL;
   ctl->cfg = *cfg;
   ctl->rec = rec;
+  for (size_t i = 0; i < pipe_count && i < hcfg_max_pipelines; i++)
+    ctl->pipes[ctl->pipe_count++] = pipes[i];
   pthread_mutex_init(&ctl->lock, NULL);
+  pthread_mutex_init(&ctl->camera_lock, NULL);
   char err[200];
   ctl->http = http_start(cfg->control, max_connections, handle, ctl, err,
                          sizeof err);
   if (!ctl->http) {
     printf("hellion: web page and API disabled: %s\n", err);
     pthread_mutex_destroy(&ctl->lock);
+    pthread_mutex_destroy(&ctl->camera_lock);
     free(ctl);
     return NULL;
   }
@@ -785,5 +1026,6 @@ void control_stop(Control *c) {
     pthread_join(c->peer_thread, NULL);
   http_stop(c->http);
   pthread_mutex_destroy(&c->lock);
+  pthread_mutex_destroy(&c->camera_lock);
   free(c);
 }

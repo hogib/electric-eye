@@ -1,12 +1,186 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "camera_ctrl.h"
+#include "json_cursor.h"
 #include "v4l2_ioctl.h"
 #include <errno.h>
+#include <stddef.h>
 #include <linux/videodev2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+bool camera_ctrl_parse(Cursor *c, CameraControls *out, char *err,
+                       size_t err_cap) {
+  if (!cur_expect(c, '{')) {
+    snprintf(err, err_cap, "expected '{' for \"camera\"");
+    return false;
+  }
+  skip_ws(c);
+
+  char ch;
+  if (cur_peek(c, &ch) && ch == '}') {
+    c->pos++;
+    return true; // an empty object is valid: it changes nothing
+  }
+
+  for (;;) {
+    char key[32];
+    skip_ws(c);
+    if (!parse_string(c, key, sizeof key)) {
+      snprintf(err, err_cap, "expected a quoted key in \"camera\"");
+      return false;
+    }
+    skip_ws(c);
+    if (!cur_expect(c, ':')) {
+      snprintf(err, err_cap, "expected ':' after \"%s\" in \"camera\"", key);
+      return false;
+    }
+    skip_ws(c);
+
+    bool ok;
+    int32_t lo = 0, hi = 0;
+    int32_t *target = NULL;
+    if (strcmp(key, "auto_exposure") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->auto_exposure = b ? 1 : 0;
+    } else if (strcmp(key, "auto_white_balance") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->auto_white_balance = b ? 1 : 0;
+    } else if (strcmp(key, "keep_framerate") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->keep_framerate = b ? 1 : 0;
+    } else if (strcmp(key, "exposure") == 0) {
+      target = &out->exposure;
+      lo = 1;
+      hi = 10000000; // 10s; past any sane video exposure
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "gain") == 0) {
+      target = &out->gain;
+      lo = 0;
+      hi = 100;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "white_balance") == 0) {
+      target = &out->white_balance;
+      lo = 1000;
+      hi = 15000; // Kelvin, generously past any camera's range
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "brightness") == 0) {
+      target = &out->brightness;
+      lo = -100;
+      hi = 100;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "contrast") == 0) {
+      target = &out->contrast;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "saturation") == 0) {
+      target = &out->saturation;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else if (strcmp(key, "sharpness") == 0) {
+      target = &out->sharpness;
+      lo = 0;
+      hi = 200;
+      ok = parse_i32(c, target);
+    } else {
+      snprintf(err, err_cap, "unknown key \"%s\" in \"camera\"", key);
+      return false;
+    }
+
+    if (!ok) {
+      snprintf(err, err_cap, "invalid value for \"%s\" in \"camera\"", key);
+      return false;
+    }
+    if (target && (*target < lo || *target > hi)) {
+      snprintf(err, err_cap, "\"%s\" must be between %d and %d (got %d)", key, lo,
+             hi, *target);
+      return false;
+    }
+
+    skip_ws(c);
+    if (!cur_peek(c, &ch)) {
+      snprintf(err, err_cap, "unterminated \"camera\" object");
+      return false;
+    }
+    if (ch == ',') {
+      c->pos++;
+      continue;
+    }
+    if (ch == '}') {
+      c->pos++;
+      return true;
+    }
+    snprintf(err, err_cap, "expected ',' or '}' after \"%s\" in \"camera\"", key);
+    return false;
+  }
+}
+
+bool camera_ctrl_parse_json(const char *json, size_t len, CameraControls *out,
+                            char *err, size_t err_cap) {
+  Cursor c = {.s = json, .len = len, .pos = 0};
+  skip_ws(&c);
+  if (!camera_ctrl_parse(&c, out, err, err_cap))
+    return false;
+  skip_ws(&c);
+  if (c.pos != c.len) {
+    snprintf(err, err_cap, "unexpected text after the \"camera\" object");
+    return false;
+  }
+  return true;
+}
+
+int camera_ctrl_to_json(const CameraControls *c, char *out, size_t cap) {
+  static const struct {
+    const char *name;
+    size_t offset;
+    bool is_bool;
+  } fields[] = {
+      {"auto_exposure", offsetof(CameraControls, auto_exposure), true},
+      {"auto_white_balance", offsetof(CameraControls, auto_white_balance), true},
+      {"keep_framerate", offsetof(CameraControls, keep_framerate), true},
+      {"exposure", offsetof(CameraControls, exposure), false},
+      {"gain", offsetof(CameraControls, gain), false},
+      {"white_balance", offsetof(CameraControls, white_balance), false},
+      {"brightness", offsetof(CameraControls, brightness), false},
+      {"contrast", offsetof(CameraControls, contrast), false},
+      {"saturation", offsetof(CameraControls, saturation), false},
+      {"sharpness", offsetof(CameraControls, sharpness), false},
+  };
+  size_t n = 0;
+  int w = snprintf(out, cap, "{");
+  if (w < 0 || (size_t)w >= cap)
+    return -1;
+  n = (size_t)w;
+  bool first = true;
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+    int32_t v = *(const int32_t *)((const char *)c + fields[i].offset);
+    if (v == camera_ctrl_unset)
+      continue;
+    if (fields[i].is_bool)
+      w = snprintf(out + n, cap - n, "%s\"%s\":%s", first ? "" : ",",
+                   fields[i].name, v ? "true" : "false");
+    else
+      w = snprintf(out + n, cap - n, "%s\"%s\":%d", first ? "" : ",",
+                   fields[i].name, (int)v);
+    if (w < 0 || (size_t)w >= cap - n)
+      return -1;
+    n += (size_t)w;
+    first = false;
+  }
+  w = snprintf(out + n, cap - n, "}");
+  if (w < 0 || (size_t)w >= cap - n)
+    return -1;
+  return (int)(n + (size_t)w);
+}
 
 void camera_ctrl_init(CameraControls *c) {
   c->auto_exposure = camera_ctrl_unset;

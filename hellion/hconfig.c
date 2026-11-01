@@ -390,6 +390,8 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
            "/var/lib/hellion/snapshots");
   snprintf(cfg.record_dir, sizeof cfg.record_dir,
            "/var/lib/hellion/recordings");
+  snprintf(cfg.camera_file, sizeof cfg.camera_file,
+           "/var/lib/hellion/camera.json");
 
   Cursor c = {.s = buf, .len = len, .pos = 0};
   skip_ws(&c);
@@ -468,6 +470,19 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
           printf("hellion config: \"record_from\" must be a pipeline name\n");
           return false;
         }
+      } else if (strcmp(key, "camera_controls") == 0) {
+        if (!parse_string(&c, cfg.camera_controls, sizeof cfg.camera_controls) ||
+            (cfg.camera_controls[0] && strcmp(cfg.camera_controls, "peer") != 0)) {
+          printf("hellion config: \"camera_controls\" must be \"peer\" (the "
+                 "camera is on the other end of the tether) or \"\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "camera_file") == 0) {
+        if (!parse_string(&c, cfg.camera_file, sizeof cfg.camera_file) ||
+            cfg.camera_file[0] != '/') {
+          printf("hellion config: \"camera_file\" must be an absolute path\n");
+          return false;
+        }
       } else if (strcmp(key, "eeye_config") == 0) {
         if (!parse_string(&c, cfg.eeye_config, sizeof cfg.eeye_config)) {
           printf("hellion config: bad \"eeye_config\"\n");
@@ -524,6 +539,12 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
              cfg.record_from);
       return false;
     }
+  }
+
+  if (strcmp(cfg.camera_controls, "peer") == 0 && !cfg.peer[0]) {
+    printf("hellion config: \"camera_controls\": \"peer\" needs \"peer\" "
+           "set\n");
+    return false;
   }
 
   *out = cfg;

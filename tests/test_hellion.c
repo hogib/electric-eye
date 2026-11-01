@@ -340,6 +340,31 @@ static void test_example_configs_load(void) {
 
 // ---- RTP config -------------------------------------------------------------
 
+// Placement A's camera controls: forwarded to the peer, so a peer is
+// required; kept in camera_file, which must be absolute.
+static void test_config_camera(void) {
+  HellionConfig c;
+  const char *pipe = "\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+                     "\"sinks\":[\"bus:b\"]}]";
+  char json[512];
+  snprintf(json, sizeof json, "{%s}", pipe);
+  CHECK(parse(json, &c));
+  CHECK(c.camera_controls[0] == '\0');
+  CHECK(strcmp(c.camera_file, "/var/lib/hellion/camera.json") == 0);
+  snprintf(json, sizeof json,
+           "{\"peer\":\"192.168.2.2:8091\",\"camera_controls\":\"peer\","
+           "\"camera_file\":\"/tmp/c.json\",%s}", pipe);
+  CHECK(parse(json, &c));
+  CHECK(strcmp(c.camera_controls, "peer") == 0);
+  CHECK(strcmp(c.camera_file, "/tmp/c.json") == 0);
+  snprintf(json, sizeof json, "{\"camera_controls\":\"peer\",%s}", pipe);
+  CHECK(!parse(json, &c)); // no peer to send them to
+  snprintf(json, sizeof json, "{\"camera_controls\":\"here\",%s}", pipe);
+  CHECK(!parse(json, &c));
+  snprintf(json, sizeof json, "{\"camera_file\":\"camera.json\",%s}", pipe);
+  CHECK(!parse(json, &c));
+}
+
 static void test_config_rtp(void) {
   HellionConfig c;
   CHECK(parse("{\"pipelines\":[{\"name\":\"down\",\"source\":\"rtp:5610\","
@@ -795,6 +820,7 @@ int main(void) {
   RUN_TEST(test_failing_sink_does_not_starve_others);
   RUN_TEST(test_pipeline_waits_for_missing_source);
   RUN_TEST(test_config_rtp);
+  RUN_TEST(test_config_camera);
   RUN_TEST(test_example_configs_load);
   RUN_TEST(test_udp_relay);
   RUN_TEST(test_rtp_round_trip);

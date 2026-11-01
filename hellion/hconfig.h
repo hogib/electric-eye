@@ -114,6 +114,15 @@ typedef struct {
   // MP4 ("" = the first pipeline with an rtp source), and where.
   char record_from[hcfg_max_name];
   char record_dir[256];
+  // Camera controls. "peer" (topside, placement A): the camera is on the
+  // ROV, under that hellion, so the "camera" object of every config the
+  // page writes is also sent to the peer's /camera. "" (default): they are
+  // eeye's, in its config, nothing more to do.
+  char camera_controls[8];
+  // Where a hellion with a camera source keeps the last controls it was
+  // sent, so a restart puts them back (default
+  // /var/lib/hellion/camera.json).
+  char camera_file[256];
   size_t pipeline_count;
   PipelineConfig pipelines[hcfg_max_pipelines];
 } HellionConfig;

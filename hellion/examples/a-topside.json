@@ -3,6 +3,7 @@
   "role": "topside",
   "control": "8080",
   "peer": "192.168.2.2:8091",
+  "camera_controls": "peer",
   "preview": "pilot",
   "eeye_config": "/var/lib/eeye/effects.json",
   "pipelines": [

@@ -87,6 +87,16 @@ struct Pipeline {
   uint64_t damage_window;      // since damage_window_ns
   uint64_t damage_last_window; // the previous full window, for status
   uint64_t damage_window_ns;
+
+  // Camera controls (camera sources only), under lock: set by
+  // pipeline_set_camera, which bumps cam_gen; the source thread applies a
+  // new generation and records it in cam_done_gen, with how many controls
+  // the camera took. cam_gen 0 means none were ever given.
+  CameraControls cam;
+  uint64_t cam_gen;
+  uint64_t cam_done_gen;
+  int cam_done_n;
+  bool cam_restarting; // rpicam-vid is being restarted to apply them
 };
 
 // How often the decoder's damage count is summarised in the log.
@@ -309,6 +319,7 @@ typedef struct {
   char dec_line[256]; // the decoder's stderr line being assembled
   size_t dec_line_len;
   uint32_t width, height;
+  uint64_t cam_gen; // camera controls generation this open has applied
 } Source;
 
 // One complete line of the decoder's stderr. libavcodec's H.264 decoder
@@ -424,6 +435,41 @@ static bool device_exists(const char *path) {
   return stat(path, &st) == 0;
 }
 
+static void take_camera(Pipeline *p, CameraControls *out, uint64_t *gen) {
+  pthread_mutex_lock(&p->lock);
+  *out = p->cam;
+  *gen = p->cam_gen;
+  pthread_mutex_unlock(&p->lock);
+}
+
+static void camera_done(Pipeline *p, Source *src, uint64_t gen, int n) {
+  src->cam_gen = gen;
+  pthread_mutex_lock(&p->lock);
+  p->cam_done_gen = gen;
+  p->cam_done_n = n;
+  p->cam_restarting = false;
+  pthread_mutex_unlock(&p->lock);
+}
+
+// The latest controls onto an open V4L2 camera.
+static void apply_v4l2_camera(Pipeline *p, Source *src) {
+  CameraControls cc;
+  uint64_t gen;
+  take_camera(p, &cc, &gen);
+  int n = 0;
+  if (gen && camera_ctrl_any_set(&cc))
+    n = camera_ctrl_apply(v4l2_in_fd(src->v4l2), &cc);
+  camera_done(p, src, gen, n);
+}
+
+static int controls_set(const CameraControls *c) {
+  const int32_t *f = (const int32_t *)c;
+  int n = 0;
+  for (size_t i = 0; i < sizeof *c / sizeof *f; i++)
+    n += f[i] != camera_ctrl_unset;
+  return n;
+}
+
 // Opens the pipeline's source. On failure sets the source status and
 // returns false; the caller waits and retries.
 static bool source_open(Pipeline *p, Source *src) {
@@ -448,14 +494,24 @@ static bool source_open(Pipeline *p, Source *src) {
       set_source(p, "waiting", "camera would not open (see log)");
       return false;
     }
+    // Every open, not only when they change: a replugged camera comes back
+    // at its factory defaults.
+    apply_v4l2_camera(p, src);
     break;
-  case SRC_RPICAM:
-    src->rpicam = rpicam_in_open(w, h, c->framerate, 1, NULL, c->format);
+  case SRC_RPICAM: {
+    CameraControls cc;
+    uint64_t gen;
+    take_camera(p, &cc, &gen);
+    bool any = gen && camera_ctrl_any_set(&cc);
+    src->rpicam = rpicam_in_open(w, h, c->framerate, 1, any ? &cc : NULL,
+                                 c->format);
     if (!src->rpicam) {
       set_source(p, "waiting", "rpicam-vid would not start (see log)");
       return false;
     }
+    camera_done(p, src, gen, any ? controls_set(&cc) : 0);
     break;
+  }
   case SRC_BUS: {
     FbusOpenResult why;
     src->bus = fbus_reader_open(c->source_arg, &why);
@@ -625,6 +681,7 @@ static void *source_loop(void *arg) {
 
     uint8_t *const planes[3] = {vf->raw_planes[0], vf->raw_planes[1],
                                 vf->raw_planes[2]};
+    bool camera_restart = false;
     while (!stopping(p)) {
       CaptureResult r = source_capture(p, &src, vf, &frame_no);
       if (r == CAP_IDLE) {
@@ -646,15 +703,34 @@ static void *source_loop(void *arg) {
       size_t n = p->sink_count;
       Sink *sinks[hcfg_max_sinks];
       memcpy(sinks, p->sinks, n * sizeof sinks[0]);
+      bool new_camera = p->cam_gen != src.cam_gen;
       pthread_mutex_unlock(&p->lock);
 
       // Only this thread replaces the sinks, so the copies stay valid.
       for (size_t i = 0; i < n; i++)
         sink_offer(sinks[i], planes, frame_no, vf->capture_ns);
+
+      if (new_camera && src.v4l2) {
+        apply_v4l2_camera(p, &src);
+      } else if (new_camera && src.rpicam) {
+        // rpicam-vid takes controls on its command line only. Announced:
+        // it is a visible gap, and whoever moved a slider should know why
+        // the picture blinked.
+        printf("hellion: pipeline \"%s\": camera controls changed; "
+               "restarting rpicam-vid to apply them\n",
+               p->cfg.name);
+        camera_restart = true;
+        pthread_mutex_lock(&p->lock);
+        p->cam_restarting = true;
+        pthread_mutex_unlock(&p->lock);
+        break;
+      }
     }
 
     source_close(&src);
-    if (!stopping(p) && was_running) {
+    if (camera_restart) {
+      set_source(p, "waiting", "restarting the camera for new controls");
+    } else if (!stopping(p) && was_running) {
       printf("hellion: pipeline \"%s\": lost %s; reconnecting\n", p->cfg.name,
              p->cfg.source_spec);
       set_source(p, "waiting", "lost; reconnecting");
@@ -668,11 +744,56 @@ static void *source_loop(void *arg) {
 
 // ---- Public -------------------------------------------------------------
 
+bool pipeline_has_camera(const Pipeline *p) {
+  return p->cfg.source == SRC_V4L2 || p->cfg.source == SRC_RPICAM;
+}
+
+void pipeline_set_camera(Pipeline *p, const CameraControls *c) {
+  pthread_mutex_lock(&p->lock);
+  if (p->cam_gen == 0 || !camera_ctrl_equal(&p->cam, c)) {
+    p->cam = *c;
+    p->cam_gen++;
+  }
+  pthread_mutex_unlock(&p->lock);
+}
+
+int pipeline_camera_wait(Pipeline *p, int timeout_ms, int *applied) {
+  for (int waited = 0;; waited += 20) {
+    pthread_mutex_lock(&p->lock);
+    bool done = p->cam_done_gen == p->cam_gen;
+    int n = p->cam_done_n;
+    // "idle" is open but silent: the controls still go on.
+    bool open = strcmp(p->src_state, "running") == 0 ||
+                strcmp(p->src_state, "idle") == 0 || p->cam_restarting;
+    pthread_mutex_unlock(&p->lock);
+    if (done) {
+      *applied = n;
+      return 1;
+    }
+    if (!open)
+      return 0;
+    if (waited >= timeout_ms)
+      return -1;
+    struct timespec ts = {0, 20 * 1000000L};
+    nanosleep(&ts, NULL);
+  }
+}
+
 Pipeline *pipeline_start(const PipelineConfig *cfg) {
+  return pipeline_start_with_camera(cfg, NULL);
+}
+
+Pipeline *pipeline_start_with_camera(const PipelineConfig *cfg,
+                                     const CameraControls *camera) {
   Pipeline *p = (Pipeline *)calloc(1, sizeof *p);
   if (!p)
     return NULL;
   p->cfg = *cfg;
+  camera_ctrl_init(&p->cam);
+  if (camera) {
+    p->cam = *camera;
+    p->cam_gen = 1;
+  }
   pthread_mutex_init(&p->lock, NULL);
   snprintf(p->src_state, sizeof p->src_state, "starting");
   if (pthread_create(&p->thread, NULL, source_loop, p) != 0) {

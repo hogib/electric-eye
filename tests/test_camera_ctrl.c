@@ -279,6 +279,50 @@ static void test_insufficient_buffers_fail_rather_than_truncate(void) {
                -1);
 }
 
+// The "camera" object as JSON: what hellion carries to the ROV in placement
+// A. Reading back what was written gives the same controls, unset fields
+// stay unset (absent means "leave the camera alone"), and every refusal
+// says why.
+static void test_json_round_trip(void) {
+  CameraControls a, b;
+  camera_ctrl_init(&a);
+  char json[512], err[160];
+  CHECK_EQ_INT(camera_ctrl_to_json(&a, json, sizeof json), 2);
+  CHECK(strcmp(json, "{}") == 0);
+
+  a.auto_exposure = 0;
+  a.exposure = 20000;
+  a.gain = 0;
+  a.keep_framerate = 1;
+  a.brightness = -40;
+  int n = camera_ctrl_to_json(&a, json, sizeof json);
+  CHECK(n > 0 && (size_t)n == strlen(json));
+  camera_ctrl_init(&b);
+  CHECK(camera_ctrl_parse_json(json, strlen(json), &b, err, sizeof err));
+  CHECK(camera_ctrl_equal(&a, &b));
+  CHECK(b.white_balance == camera_ctrl_unset);
+
+  // Too small a buffer fails rather than truncating.
+  CHECK_EQ_INT(camera_ctrl_to_json(&a, json, 10), -1);
+
+  static const struct { const char *json, *says; } bad[] = {
+      {"{\"gain\":101}", "between 0 and 100"},
+      {"{\"gian\":1}", "unknown key \"gian\""},
+      {"{\"auto_exposure\":1}", "invalid value for \"auto_exposure\""},
+      {"{\"gain\":1} x", "unexpected text"},
+      {"[1]", "expected '{'"},
+  };
+  for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    camera_ctrl_init(&b);
+    err[0] = '\0';
+    CHECK(!camera_ctrl_parse_json(bad[i].json, strlen(bad[i].json), &b, err,
+                                  sizeof err));
+    if (!strstr(err, bad[i].says))
+      printf("    %s -> \"%s\"\n", bad[i].json, err);
+    CHECK(strstr(err, bad[i].says) != NULL);
+  }
+}
+
 int main(void) {
   printf("test_camera_ctrl:\n");
   RUN_TEST(test_init_leaves_everything_unset);
@@ -295,6 +339,7 @@ int main(void) {
   RUN_TEST(test_auto_white_balance_wins_over_temperature);
   RUN_TEST(test_gain_maps_to_a_multiplier);
   RUN_TEST(test_arguments_are_well_formed_pairs);
+  RUN_TEST(test_json_round_trip);
   RUN_TEST(test_insufficient_buffers_fail_rather_than_truncate);
   TEST_MAIN_END();
 }

@@ -62,11 +62,30 @@ static int run(const char *config_path) {
 
   HsWriter *status = hs_writer_open(cfg.name);
 
-  Pipeline *pipes[hcfg_max_pipelines] = {0};
+  // Camera controls for camera sources: what POST /camera last kept, so a
+  // restart (or a crash) puts the camera back as it was. Only read when
+  // there is a camera here.
+  CameraControls camera;
+  bool have_camera = false;
   for (size_t i = 0; i < cfg.pipeline_count; i++)
-    pipes[i] = pipeline_start(&cfg.pipelines[i]);
+    have_camera |= cfg.pipelines[i].source == SRC_V4L2 ||
+                   cfg.pipelines[i].source == SRC_RPICAM;
+  if (have_camera) {
+    char err[200];
+    if (!control_load_camera(cfg.camera_file, &camera, err, sizeof err))
+      printf("hellion: camera controls in %s ignored (%s); using defaults\n",
+             cfg.camera_file, err);
+  }
+
+  Pipeline *pipes[hcfg_max_pipelines] = {0};
+  for (size_t i = 0; i < cfg.pipeline_count; i++) {
+    bool cam = cfg.pipelines[i].source == SRC_V4L2 ||
+               cfg.pipelines[i].source == SRC_RPICAM;
+    pipes[i] = pipeline_start_with_camera(&cfg.pipelines[i],
+                                          cam ? &camera : NULL);
+  }
   HRec *rec = hrec_create(&cfg, pipes, cfg.pipeline_count);
-  Control *control = control_start(&cfg, rec);
+  Control *control = control_start(&cfg, rec, pipes, cfg.pipeline_count);
 
   // The status snapshot is big (the log alone is 10KB): static, and only
   // this thread touches it.
