@@ -329,7 +329,9 @@ static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur) {
       // need an explicit copy (when cur isn't already work).
       const uint8_t *src_planes[3];
       chain_buf_planes_const(frame, cur, src_planes);
-      if (cur != CHAIN_WORK) {
+      // Not even that when a later stage replaces chroma anyway (see
+      // compute_chroma_liveness).
+      if (cur != CHAIN_WORK && chroma_live[i]) {
         memcpy(frame->planes[1], src_planes[1], frame->plane_sizes[1]);
         memcpy(frame->planes[2], src_planes[2], frame->plane_sizes[2]);
       }
@@ -347,6 +349,11 @@ static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur) {
     bool touched_y, touched_u, touched_v;
     fuse_point_op_run(cfg, &i, lut_y, lut_u, lut_v, &touched_y, &touched_u,
                       &touched_v);
+    // The run's chroma is what its last stage leaves; when a later stage
+    // replaces chroma anyway (tint -> sobel, say), neither the tables nor
+    // a copy are worth a pass over two planes. Whatever work then holds
+    // there is never read.
+    const bool chroma_out = chroma_live[i - 1];
 
     // Touched planes go straight from cur's buffer to their LUT'd result in
     // work -- no separate copy-then-overwrite first. Only an untouched
@@ -361,13 +368,17 @@ static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur) {
     } else if (cur != CHAIN_WORK) {
       memcpy(frame->planes[0], src_planes[0], frame->plane_sizes[0]);
     }
-    if (touched_u) {
+    if (!chroma_out) {
+      // dead: see above
+    } else if (touched_u) {
       apply_lut_plane(src_planes[1], frame->planes[1], frame->plane_sizes[1],
                       lut_u);
     } else if (cur != CHAIN_WORK) {
       memcpy(frame->planes[1], src_planes[1], frame->plane_sizes[1]);
     }
-    if (touched_v) {
+    if (!chroma_out) {
+      // dead
+    } else if (touched_v) {
       apply_lut_plane(src_planes[2], frame->planes[2], frame->plane_sizes[2],
                       lut_v);
     } else if (cur != CHAIN_WORK) {

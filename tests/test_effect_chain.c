@@ -409,6 +409,49 @@ static void test_empty_chain_aliasing_is_undone_next_frame(void) {
   vf_free(frame); // must free each allocation exactly once
 }
 
+// Chroma that a later stage replaces is not computed (or copied) at all --
+// which must never show: a chain with a chroma-only stage before sobel
+// gives exactly what it gives without it, every byte, even on frames
+// whose buffers still hold the previous frame's chroma.
+static void same_output(const EffectStage *with, size_t nw,
+                        const EffectStage *without, size_t nwo) {
+  Config a = {0}, b = {0};
+  a.stage_count = nw;
+  b.stage_count = nwo;
+  for (size_t i = 0; i < nw; i++)
+    a.stages[i] = with[i];
+  for (size_t i = 0; i < nwo; i++)
+    b.stages[i] = without[i];
+  VideoFrame *fa = make_frame(64, 32, 11), *fb = make_frame(64, 32, 11);
+  for (unsigned round = 0; round < 3; round++) {
+    // New content in the same frames: the buffers keep last round's data.
+    VideoFrame *fresh = make_frame(64, 32, 100 + round);
+    size_t all = fresh->plane_sizes[0] + 2 * fresh->plane_sizes[1];
+    memcpy(fa->raw_data, fresh->raw_data, all);
+    memcpy(fb->raw_data, fresh->raw_data, all);
+    vf_free(fresh);
+    apply_effect_chain(fa, &a);
+    apply_effect_chain(fb, &b);
+    CHECK_MEM_EQ(fa->planes[0], fb->planes[0], fa->plane_sizes[0]);
+    CHECK_MEM_EQ(fa->planes[1], fb->planes[1], fa->plane_sizes[1]);
+    CHECK_MEM_EQ(fa->planes[2], fb->planes[2], fa->plane_sizes[2]);
+  }
+  vf_free(fa);
+  vf_free(fb);
+}
+
+static void test_dead_chroma_is_skipped_invisibly(void) {
+  EffectStage tint = {.effect = EFFECT_TINT, .tint_u = 90, .tint_v = 150,
+                      .tint_strength = 180};
+  EffectStage inv = {.effect = EFFECT_INVERT};
+  EffectStage con = {.effect = EFFECT_CONTRAST};
+  EffectStage sob = {.effect = EFFECT_SOBEL, .sobel_threshold = 20};
+  EffectStage a1[] = {tint, inv, sob}, b1[] = {inv, sob};
+  same_output(a1, 3, b1, 2);
+  EffectStage a2[] = {con, tint, sob}, b2[] = {con, sob};
+  same_output(a2, 3, b2, 2);
+}
+
 // Auto visibility runs ahead of the chain, reading raw and writing work;
 // the chain then continues from its output -- a point op and a
 // neighborhood op alike -- and raw is left exactly as captured.
@@ -499,5 +542,6 @@ int main(void) {
   RUN_TEST(test_result_in_spare_is_swapped_not_copied);
   RUN_TEST(test_empty_chain_aliasing_is_undone_next_frame);
   RUN_TEST(test_auto_visibility_runs_first);
+  RUN_TEST(test_dead_chroma_is_skipped_invisibly);
   TEST_MAIN_END();
 }
