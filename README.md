@@ -19,45 +19,44 @@ Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (fo
   [In the field](#in-the-field) · [Troubleshooting](#troubleshooting) ·
   [Config reference](#config-reference)
 
-> The old Python tools (`topside/web_ui.py`, `pi/config_agent.py`, `tools/eeye-net`,
-> `tools/eeye-record`) are replaced by `hellion` and will be removed. `install.sh`
-> does not set `hellion` up yet; until it does, start it by hand as below.
-
 ## Quick start
 
-On the ROV's Pi **and** on the topside machine:
+Pick a [placement](#where-eeye-runs) — **b** runs the effects on the ROV, **a** runs them
+topside — and install both ends of the tether with it. On the ROV's Pi:
 
 ```sh
-git clone <this repo>
-cd electric-eye
-sudo apt install ffmpeg      # hellion's H.264 and RTP
-sudo ./install.sh            # deps, build, v4l2loopback on boot, eeye's systemd unit
+git clone <this repo> && cd electric-eye
+sudo ./install.sh --role rov --placement b
 ```
 
-`install.sh` is idempotent — re-run it after `git pull` to update. It also configures
-the wired interface so a direct tether works with no DHCP server (`--no-network` skips
-that; it never restarts an interface you may be connected through). If you weren't in
-the `video` group before, log out and back in.
-
-Then set up `hellion` for the machine's role, from the examples (see
-[Where eeye runs](#where-eeye-runs) for which):
+and on the topside machine (`--tether` names the interface the tether is plugged into,
+and gives it the BlueROV topside address, 192.168.2.1/24; leave it out to configure the
+network yourself):
 
 ```sh
-sudo mkdir -p /etc/hellion /var/lib/hellion && sudo chown $USER /var/lib/hellion
-sudo cp hellion/examples/b-rov.json /etc/hellion/hellion.json        # on the ROV
-sudo cp hellion/examples/b-topside.json /etc/hellion/hellion.json    # topside
-builddir/hellion                                                      # on both
+git clone <this repo> && cd electric-eye
+sudo ./install.sh --role topside --placement b --tether eth0
 ```
+
+That installs the packages (including `ffmpeg`), builds, puts `eeye` and `hellion` in
+`/usr/local/bin`, writes `/etc/hellion/hellion.json` for the role (and `eeye`'s effects
+config, `/var/lib/eeye/effects.json`, on the machine that runs it), loads v4l2loopback
+topside, and starts the systemd services. To update: `git pull && sudo ./install.sh` —
+it remembers the role and placement, keeps your configs, and restarts the services on
+the new binaries. `sudo ./install.sh --help` has the rest. The ROV's network is never
+touched: on a BlueROV it belongs to BlueOS.
 
 Then open **`http://<topside>:8080/`** for the live picture and the controls, and point
 QGroundControl at UDP 5600 as usual.
 
 ```sh
-builddir/hellion top              # live dashboard (q quits); works over SSH
-builddir/hellion check            # pre-dive: exit 0 healthy, 1 degraded, 2 down
-journalctl -u eeye -f             # eeye's log
-ffplay /dev/video10               # the pilot's picture as a webcam, on eeye's machine
+hellion top                       # live dashboard (q quits); works over SSH
+hellion check                     # pre-dive: exit 0 healthy, 1 degraded, 2 down
+journalctl -u hellion -u eeye -f  # the logs
+ffplay /dev/video10               # the pilot's picture as a webcam, topside
 ```
+
+If you were not in the `video` group before, log out and back in for `hellion top`.
 
 ### Manual build
 
@@ -72,11 +71,12 @@ has it. A distro too old to package libturbojpeg 1.4 can point the build at one 
 from source; see the top of the `Makefile`.
 
 Neither program needs root. Both need the `video` group (cameras, v4l2loopback, and the
-frame bus's shared memory). `eeye` does not load v4l2loopback itself: `install.sh` sets
-it to load at boot. Elsewhere:
+frame bus's shared memory); the services run as a system user, `eeye`, in that group.
+Nothing loads v4l2loopback on demand: `install.sh` sets it to load at boot topside.
+Elsewhere:
 
 ```sh
-sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1
+sudo modprobe v4l2loopback video_nr=10 card_label=hellion exclusive_caps=1
 ```
 
 The v4l2loopback webcam is optional: if it is missing, `eeye` says why and carries on.
@@ -86,7 +86,7 @@ The v4l2loopback webcam is optional: if it is missing, `eeye` says why and carri
 `eeye` can run on either side of the tether; `hellion` runs on both. Pick one —
 **B is the one to use** unless the ROV's Pi cannot afford the effects.
 
-**B — `eeye` on the ROV** (`b-rov.json`, `b-topside.json`)
+**B — `eeye` on the ROV** (`--placement b`; configs from `hellion/examples/b-rov.json`, `b-topside.json`)
 
 ```
 ROV:      camera → eeye → frame bus "pilot" → hellion → H.264/RTP ─┐
@@ -100,7 +100,7 @@ One encode, on the ROV; QGroundControl gets the ROV's packets unchanged, so the 
 pays no extra latency. Autonomy code running on the ROV reads the camera from the frame
 bus next to `eeye`.
 
-**A — `eeye` topside** (`a-rov.json`, `a-topside.json`)
+**A — `eeye` topside** (`--placement a`; `a-rov.json`, `a-topside.json`)
 
 ```
 ROV:      camera → hellion → H.264/RTP → tether UDP 5610
@@ -124,7 +124,7 @@ Use QGroundControl, the page, or the webcam device.
 **Before the dive**, on the topside machine:
 
 ```sh
-builddir/hellion check
+hellion check
 ```
 
 ```
@@ -156,7 +156,7 @@ answering), `2` down (no video). Every line names what is wrong.
 **Over SSH**, on either machine:
 
 ```sh
-builddir/hellion top
+hellion top
 ```
 
 Every pipeline with its fps, drops, and — for the tether — bitrate and **packet loss**;
@@ -166,18 +166,18 @@ receives.
 
 ## Troubleshooting
 
-Start with `builddir/hellion check` and `builddir/hellion top`; then the logs:
-`journalctl -u eeye -f`, and `hellion`'s output (the last lines are in `top` too).
+Start with `hellion check` and `hellion top`; then the logs:
+`journalctl -u hellion -u eeye -f` (the last lines of `hellion`'s are in `top` too).
 
 ### No video anywhere
 
 | What you see | Cause | Fix |
 |---|---|---|
 | `Camera unavailable (attempt N)` in `eeye`'s log | Camera not detected. `eeye` retries forever; it does **not** need a restart. | Check the cable. `v4l2-ctl --list-devices`; set `capture_device` |
-| `Permission denied opening /dev/video0` | Not in the `video` group. | `sudo usermod -aG video $USER`, then log out and back in |
+| `Permission denied opening /dev/video0` | The user running it is not in the `video` group (the installed services are). | `sudo usermod -aG video $USER`, then log out and back in |
 | `top`: topside `link in` says `no packets` | Nothing arriving on the tether port. | Is `hellion` running on the ROV (`top` there)? Does its `rtp:` sink point at the topside's address and port? |
 | `top`: ROV source `waiting … no such stream "pilot"` (placement B) | `eeye` is not running on the ROV, or publishes under another name. | `systemctl status eeye`; `bus_pilot` in its config |
-| `Virtual camera: /dev/video10 does not exist because v4l2loopback is not loaded` | The module isn't loaded. Only the webcam device is missing; everything else runs. | `sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1`, or re-run `install.sh` |
+| `Virtual camera: /dev/video10 does not exist because v4l2loopback is not loaded` | The module isn't loaded. Only the webcam device is missing; everything else runs. | `sudo modprobe v4l2loopback video_nr=10 card_label=hellion exclusive_caps=1`, or re-run `install.sh` |
 | `modprobe: ... Operation not permitted` **and** Secure Boot is on | The module's signing key was never enrolled — the kernel says "not permitted" either way. | Reboot and enroll the key at the blue MOK screen; `mokutil --list-new` shows it pending |
 | `neither MJPEG nor YUYV is available at exactly WxH` | Camera doesn't offer that mode. | `v4l2-ctl --list-formats-ext -d /dev/video0`, then set `capture_width`/`capture_height` to a listed mode |
 
@@ -251,7 +251,8 @@ trigger this — that is retried internally.
 
 ## Config reference
 
-`eeye`'s config (`eeye_config.json`; under `install.sh`, the path in `eeye.service`). `hellion`'s own config is in [docs/hellion.md](docs/hellion.md#config).
+`eeye`'s config: `/var/lib/eeye/effects.json` when installed (`eeye_config.json` in the
+checkout is a starting point for running it by hand). `hellion`'s own config is in [docs/hellion.md](docs/hellion.md#config).
 
 Every key is optional. Defaults shown:
 
@@ -532,8 +533,9 @@ All startup-only. The frame bus is how other programs on the machine get `eeye`'
 video — autonomy code included — with capture timestamps on every frame; its layout and
 how to read it from C or Python are in [docs/bus.md](docs/bus.md).
 
-`stream_frame_interval`, `stream_quality` and `stream_raw` fed the old preview tap that
-`hellion` replaces; they still work for now and will go away.
+`stream_frame_interval`, `stream_quality` and `stream_raw` fed `eeye`'s old preview
+server, which `hellion` replaced. A config that still has them loads; they are ignored,
+with one line in the log.
 
 ## How it works
 
@@ -571,8 +573,9 @@ a shared network.
 
 ## Known limitations
 
-- **`install.sh` does not set up `hellion` yet**, and the old Python tools are still in
-  the tree. Both change in the next update.
+- **In placement A, camera controls do nothing.** The page writes them to the topside
+  `eeye`, which reads the frame bus and has no camera; the ROV's `hellion` holds the
+  camera and does not apply controls yet. Placement B is unaffected.
 - **Latency through the tether is about two frame periods inside ffmpeg** — 70 ms at
   30fps, 37 ms at 60fps, measured bus to bus on one machine — before camera, tether and
   display. Which ffmpeg stages hold the frames is not yet established.
@@ -584,9 +587,10 @@ a shared network.
 - **Camera controls on the Pi camera backend need a restart to apply** — a ~1s gap,
   announced in the log. The V4L2 backend applies them instantly. The Pi-side mapping is
   unverified on real CSI hardware.
-- **Not yet run on the vehicle.** Everything above is tested on one x86 machine with
-  test patterns, loopback devices and a simulated lossy link; the Pi, a real camera and
-  the Fathom-X tether are next.
+- **Not yet run on the vehicle.** Everything above is tested on x86 machines: test
+  patterns, loopback devices and a simulated lossy link on one, and placement B end to end
+  with a USB webcam across a LAN (cable pulls included). The Pi, its camera and the
+  Fathom-X tether are next.
 
 ## Development
 

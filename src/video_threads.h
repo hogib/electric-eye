@@ -73,14 +73,13 @@ typedef struct {
   bool *is_running;
   FrameRingBuffer *ring_buffer_out;
   FrameRingBuffer *ring_buffer_free;
-  const ConfigWatcher *config; // for the recording/stream taps' config
+  const ConfigWatcher *config; // for the recording tap's config
   // The same path eeye was started with -- consumer_loop writes
   // "<config_path>.health" beside it (see health.h), so topside can see
   // recording state rather than assuming it.
   const char *config_path;
   uint32_t frame_width;
   uint32_t frame_height;
-  uint16_t stream_port; // see stream_server.h; the live-preview tap's port
   // Frame bus streams (fbus.h) for the processed and the untouched frame;
   // "" publishes nothing.
   const char *bus_pilot;

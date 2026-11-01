@@ -4,31 +4,30 @@ Threads, frames, and how a frame gets from the sensor to the loopback device.
 
 ## Threads
 
-Seven, plus one heartbeat per frame bus stream. Four are created in `main()`; the
-config watcher, recorder, stream and heartbeat threads are started by the modules that
+Six, plus one heartbeat per frame bus stream. Four are created in `main()`; the
+config watcher, recorder and heartbeat threads are started by the modules that
 own them.
 
 | Thread | Entry point | Job |
 |---|---|---|
 | producer | `producer_loop` | Owns the camera. Captures into a frame, pushes it downstream. |
 | effects | `effects_loop` | Runs the effect chain on each frame. |
-| consumer | `consumer_loop` | Writes to the virtual camera, then hands the frame to the recording and preview taps. |
+| consumer | `consumer_loop` | Writes to the virtual camera, publishes to the frame bus, then hands the frame to the recording tap. |
 | recorder | `writer_loop` in `recorder.c` | Owns the recording file. Writes frames the consumer hands it, returns them to the pool. |
-| stream | `stream_loop` in `stream_server.c` | JPEG-encodes and sends the preview to the connected viewer. |
 | stats | `stats_loop` | Logs ring occupancy and effects time every 5s. Purely diagnostic. |
 | config watcher | inside `config.c` | Watches the config file with inotify, republishes on change. |
 | bus heartbeat | `heartbeat_loop` in `fbus.c` | One per published stream. Stamps the stream every 500ms so readers can tell a running writer from a dead one. |
 
-The stats, recorder and stream threads are optional: if one fails to start, that
+The stats and recorder threads are optional: if one fails to start, that
 feature is disabled with a log line and the pipeline carries on. The producer, effects
 and consumer threads are fatal to start.
 
-**Nothing slow runs on the consumer thread.** It feeds the virtual camera, which is
-what the pilot is looking at, so the two taps only take a copy (preview) or ownership
-(recording) of the frame and return. Publishing to the frame bus is a copy into shared
+**Nothing slow runs on the consumer thread.** It feeds the frame bus and the virtual
+camera, which is what the pilot is looking at, so the recording tap only takes
+ownership of the frame and returns. Publishing to the frame bus is a copy into shared
 memory that never waits for a reader: about 25µs per 640×480 frame on an x86 dev
-machine (from the `fbus` stress test). Not yet measured on a Pi. A full disk or a bad tether can cost recorded or
-previewed frames, never the live feed. See [output.md](output.md).
+machine (from the `fbus` stress test). Not yet measured on a Pi. A full disk can cost recorded frames, never the
+live feed; and the tether is `hellion`'s, behind the bus. See [output.md](output.md).
 
 Only the producer thread ever touches the camera device, and only the consumer thread
 ever touches the loopback device. That is what makes the reconnect logic tractable —
@@ -62,7 +61,7 @@ A frame's round trip:
 3. Effects pops from **in**, runs the chain (writing `planes`), pushes to **out**.
 4. Consumer pops from **out**, writes to the loopback device, publishes the frame to the
    frame bus (`pilot` from `planes`, `raw` from `raw_planes`; see [bus.md](bus.md)),
-   offers the preview a copy, then either hands the frame to the recorder (which
+   then either hands the frame to the recorder (which
    pushes it back to **free** once written) or pushes it back to **free** itself.
 
 The pool is allocated once, up front, and never grows: `frame_pool_size` frames, 8.
@@ -210,7 +209,7 @@ Every loop polls `is_running` on a bounded interval, so all three drain and join
 effects and consumer loops additionally keep running while their input ring is
 non-empty, so in-flight frames are finished rather than dropped. On its way out the
 consumer stops the recorder, which writes whatever it still has queued, closes the file
-and returns its frames to the pool, then stops the stream thread. Then: join, final
+and returns its frames to the pool. Then: join, final
 stats snapshot, free the pool.
 
 ## Camera reconnection
@@ -260,11 +259,9 @@ All in `video_threads.c` unless noted:
 | `STATS_LOG_INTERVAL_MS` | 5000 | |
 | `HEALTH_PUBLISH_INTERVAL_MS` | 1000 | |
 | `ring_buffer_size` | 32 | `frame_ring_buffer.h`; power of two enforced |
-| `send_timeout_ms` | 200 | `stream_server.c`; a viewer that can't take a whole frame in this long is dropped |
 | `frame_pool_size` | 8 | `eeye.c`; frames in circulation, and the worst-case output lag |
 | `recorder_max_queued` | 3 | `recorder.h`; frames the recording thread may hold before it drops |
 | `retry_missing_ms` / `retry_max_ms` | 2000 / 30000 | `virtual_cam.c`; checks for a missing output device, and the open back-off cap |
-| `stream_server_port` | 9000 | `eeye.c` |
 
 Framerate is a compile-time constant. Resolution and both device paths are not — they
 come from config (`capture_device`, `output_device`).

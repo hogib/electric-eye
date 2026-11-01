@@ -4,7 +4,6 @@
 #include "frame_ring_buffer.h"
 #include "health.h"
 #include "recorder.h"
-#include "stream_server.h"
 #include "bus_in.h"
 #include "fbus.h"
 #include "rpicam_in.h"
@@ -330,16 +329,6 @@ void *consumer_loop(void *arg) {
   if (args->bus_raw && args->bus_raw[0] && !bus_raw)
     printf("Warning: not publishing \"%s\" (see above).\n", args->bus_raw);
 
-  // Live-preview stream tap (see stream_server.h): unlike the virtual-cam
-  // write above, this is genuinely optional -- a topside viewer over the
-  // tether is a convenience, not something the local pipeline depends on.
-  // A failure here (e.g. the port's already in use) only disables the
-  // tap, logged, rather than tearing down the whole process.
-  StreamServer *stream = stream_server_open(args->stream_port);
-  if (!stream) {
-    printf("Warning: live-preview stream disabled (see error above).\n");
-  }
-
   // Recording tap, on its own thread (see recorder.h): this loop only
   // offers it finished frames, so a slow disk costs recorded frames, never
   // the virtual camera's.
@@ -398,32 +387,6 @@ void *consumer_loop(void *arg) {
       recorder_set_target(recorder, record_path, record_format);
     }
 
-    // Live-preview stream tap: throttled by pts rather than a separate
-    // counter, since pts already increments by exactly 1 per frame (see
-    // producer_loop) -- nothing extra to keep in sync across reloads.
-    // stream_server_offer_frame() returns at once when no viewer is
-    // connected, and otherwise only copies the frame: encoding and sending
-    // happen on the stream server's own thread.
-    if (stream && cfg->stream_frame_interval > 0 &&
-        frame->pts % cfg->stream_frame_interval == 0) {
-      if (cfg->stream_raw) {
-        // Preview the untouched camera frame instead of the processed
-        // one, so an operator can tell a real object from a filter
-        // artifact without dismantling their chain. Swapped by pointer
-        // rather than by copying: raw_data and pixel_data share this
-        // frame's layout exactly (see video_frame.h), so a shallow view
-        // with the raw planes is all stream_server needs.
-        VideoFrame raw_view = *frame;
-        raw_view.pixel_data = frame->raw_data;
-        raw_view.planes[0] = frame->raw_planes[0];
-        raw_view.planes[1] = frame->raw_planes[1];
-        raw_view.planes[2] = frame->raw_planes[2];
-        stream_server_offer_frame(stream, &raw_view, cfg->stream_quality);
-      } else {
-        stream_server_offer_frame(stream, frame, cfg->stream_quality);
-      }
-    }
-
     // Health snapshot, on a timer. pts increments once per frame (see
     // producer_loop), so it doubles as the clock here rather than needing
     // a separate one that could drift from the frame rate. Taken before
@@ -460,7 +423,6 @@ void *consumer_loop(void *arg) {
 
   // Drains and closes the recording, returning any frames it still holds.
   recorder_destroy(recorder);
-  stream_server_close(stream);
   virtual_cam_destroy(vcam);
   fbus_writer_close(bus_pilot);
   fbus_writer_close(bus_raw);

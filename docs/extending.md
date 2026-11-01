@@ -61,7 +61,7 @@ For a point op, add it to `is_point_op()` **and** compose it into the LUTs in
 `fuse_point_op_run()`. If it cannot be expressed as a per-byte function, it is not a
 point op — give it its own branch like `contrast`.
 
-**5. Expose it in the UI** — `topside/web_ui.py`, `EFFECT_FIELDS`. This table must
+**5. Expose it in the UI** — `hellion/web/index.html`, `EFFECT_FIELDS`. This table must
 match `params_for_effect()` exactly, since the parser rejects a parameter on the wrong
 effect. The JS sends only the keys listed for the selected effect.
 
@@ -74,7 +74,7 @@ rejected on other effects and vice versa.
 
 ## Add a config key
 
-**Hot-reloadable** (like `stream_quality`): add the field to `Config`, a default in
+**Hot-reloadable** (like `record_path`): add the field to `Config`, a default in
 `config_defaults`, and a branch in `parse_config`. Readers pick it up automatically
 through `config_current()`.
 
@@ -83,8 +83,9 @@ through `config_current()`.
 - add it to the change-detection warning in `config_publish()`, so a live change is
   logged rather than silently ignored
 - thread it from `startup_config` in `main()` into whatever arg struct needs it
-- **add it to `carriedGeometry` in `topside/web_ui.py`** — the UI rewrites the whole
-  config file, so a key it does not echo back is deleted on the next Apply
+- **add it to `carriedGeometry` in `hellion/web/index.html`** — the page rewrites the
+  whole config file, so a key it does not echo back is deleted on the next Apply (camera
+  keys without a control are carried by `carriedCamera`)
 
 Add tests for the default, a round trip, out-of-range rejection, and a typo'd variant.
 
@@ -177,8 +178,8 @@ Worth knowing before you propose them, along with why:
 | Fuse Canny's gradient + NMS | Measured **slower**: 0.94 ms vs 0.68 ms, recomputing each gradient 3× |
 | Parallel (bounded-sweep) hysteresis | 2× slower on realistic content, and only approximates connectivity |
 | NEON for `apply_lut_plane` | A cache-friendly table lookup beats a NEON gather |
-| `TJFLAG_FASTDCT` on JPEG decode | Measured on x86 with libjpeg-turbo's SIMD: between 1% slower and 13% faster across runs, and it changes decoded pixels (~60 dB PSNR against the accurate IDCT). libjpeg-turbo itself says the accurate IDCT is about as fast once SIMD is in play. The stream *encoder* does use it, since the preview is throwaway |
-| Skip health-file writes when nothing changed | `config_agent.py` uses the file's age as eeye's heartbeat, and `frames` changes every second anyway |
+| `TJFLAG_FASTDCT` on JPEG decode | Measured on x86 with libjpeg-turbo's SIMD: between 1% slower and 13% faster across runs, and it changes decoded pixels (~60 dB PSNR against the accurate IDCT). libjpeg-turbo itself says the accurate IDCT is about as fast once SIMD is in play. `hellion`'s preview *encoder* (`hellion/jpeg.c`) does use it, since the preview is throwaway |
+| Skip health-file writes when nothing changed | `hellion` reports the file's age as `eeye`'s heartbeat, and `frames` changes every second anyway |
 | `GOMP_SPINCOUNT` instead of `OMP_WAIT_POLICY=passive` | Measured worse on x86 at 10,000: 55% CPU and 2.0–2.3ms effects time per frame, against 27% and 1.3ms. Spinning workers take cores the capture and output threads need. Either variable set in the environment is respected, so it is easy to re-test on a Pi |
 | Build flags (`-O3`, `-mcpu`, LTO) | Unmeasured. `-mcpu=native` would also tie a build directory to one board. Worth timing on a Pi with the stats log's effects line |
 | MMAP for `v4l2_out` | v4l2loopback shares one buffer with `write()`; saves no copy |

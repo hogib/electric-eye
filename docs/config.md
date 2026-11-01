@@ -1,13 +1,19 @@
 # Configuration
 
-One JSON file, hand-written or written over the network, hot-reloaded via inotify.
+One JSON file, hand-written or written by `hellion` for the page, hot-reloaded via
+inotify. Installed, it is `/var/lib/eeye/effects.json`; `eeye_config.json` in the checkout
+is a starting point for running `eeye` by hand.
 
 ## The two classes of key
 
 This is the distinction to internalize before changing anything:
 
 **Hot-reloadable** — picked up within ~200ms, no restart. `chain`, `record_path`,
-`record_format` (read when a recording starts), `stream_frame_interval`, `stream_quality`, `stream_raw`, and everything under `camera`.
+`record_format` (read when a recording starts), and everything under `camera`.
+
+**Ignored** — `stream_frame_interval`, `stream_quality`, `stream_raw`: they fed `eeye`'s
+old JPEG preview server, which `hellion` replaced. Still type-checked, so an old config
+keeps loading and a mangled value is still caught; the first one seen is logged once.
 
 **Startup-only** — read once by `config_load_once()` before any thread exists.
 `capture_width`, `capture_height`, `downscale`, `capture_source`, `capture_format`,
@@ -42,9 +48,6 @@ has to understand them anyway or every reload of a geometry-carrying file would 
   "chain": [{"effect": "sobel"}],
   "record_path": "",
   "record_format": "raw",
-  "stream_frame_interval": 0,
-  "stream_quality": 60,
-  "stream_raw": false,
   "capture_width": 1280,
   "capture_height": 720,
   "downscale": 1,
@@ -91,7 +94,7 @@ produces an empty edge map). All three are seeded in `parse_effect_stage`.
 **A parameter on the wrong effect is a hard error.** `{"effect":"blur","tint_u":90}` is
 rejected. A correctly-spelled key attached to the wrong stage is exactly as much of a
 typo as a misspelled one, and just as silent otherwise. `params_for_effect()` holds the
-table; `topside/web_ui.py`'s `EFFECT_FIELDS` must stay in sync with it.
+table; `EFFECT_FIELDS` in `hellion/web/index.html` must stay in sync with it.
 
 ### Geometry
 
@@ -149,14 +152,7 @@ Refused at parse time: invalid names (letters, digits, `-`, `_`, under 32
 characters), `bus_pilot` equal to `bus_raw`, and reading a stream `eeye` itself
 publishes.
 
-### Streaming and recording
-
-`stream_frame_interval` — send every Nth post-effects frame. **0 disables the tap
-entirely** and no JPEG work happens at all. `stream_quality` is JPEG quality 1–100
-(values above 100 are clamped by turbojpeg itself, so this field does not separately
-range-check).
-
-`stream_raw` sends the untouched camera frame to the preview only.
+### Recording
 
 `record_path` — empty means off. See [output.md](output.md) for the size warning and
 the `~` trap.
@@ -194,8 +190,8 @@ happens in `camera_ctrl_apply`, the only place that knows what a given camera ac
 
 Hand-written recursive descent in `config.c`. No dependency, ~300 lines.
 
-**Strict JSON only.** No comments, no trailing commas. Validate with
-`python3 -m json.tool eeye_config.json`.
+**Strict JSON only.** No comments, no trailing commas. A config `eeye` rejects says why
+in its log, and `<config>.status` turns `{"ok":false}`.
 
 Parser helpers, by value type: `parse_string`, `parse_u8`, `parse_u16` (capture
 dimensions, the only values that do not fit a byte), `parse_i32` (signed and wider —
@@ -225,7 +221,8 @@ plain in-place overwrite can be observed mid-write and read as a truncated, inva
 file; rename is atomic from a reader's point of view. `eeye` watches for both, but only
 rename is safe.
 
-`pi/config_agent.py` implements this in `write_config_atomic()`.
+`hellion` implements this in `replace_file()` (`hellion/control.c`), and puts the
+previous file back if `eeye` rejects the new one.
 
 ### Reload feedback
 

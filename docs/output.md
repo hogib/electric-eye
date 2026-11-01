@@ -1,8 +1,11 @@
 # Output
 
-Four things happen to a finished frame, all in `consumer_loop`: it goes to the virtual
-camera, and optionally to the recording tap, the preview stream, and the health
-snapshot.
+Four things happen to a finished frame, all in `consumer_loop`: it is published on the
+frame bus (`pilot`, and the untouched frame as `raw`; see [bus.md](bus.md)), and
+optionally goes to the virtual camera and the recording tap, and is counted in the
+health snapshot. Everything that leaves the machine — the preview, H.264 to the other
+end of the tether, the MP4 recording — is `hellion`'s, reading the bus
+([hellion.md](hellion.md)).
 
 ## Virtual camera (`v4l2_out.c`, `virtual_cam.c`)
 
@@ -59,74 +62,15 @@ Distinguishing them would ideally mean reading dmesg for the lockdown message, b
 process. So `eeye` runs `mokutil`, which reads EFI variables and needs no special
 capability, and mentions MOK enrollment when one is pending.
 
-## Preview stream (`stream_server.c`)
+## The preview, and seeing the raw frame
 
-A deliberately dumb live-preview tap: JPEG-encodes frames and writes each one,
-length-prefixed, to whichever single client is connected over plain TCP.
-
-**Wire format**, repeated per frame: a 4-byte **big-endian** length, then that many
-bytes of one complete JPEG (SOI…EOI). No HTTP, no framing beyond that header — serving
-it to a browser is the other end's problem.
-
-### Things that will catch you
-
-**Single viewer, last connection wins.** A new connection *replaces* the existing
-client. If two things connect (say, the web UI and a diagnostic script), they will kick
-each other off in a reconnect loop that looks exactly like a flaky link. This is a real
-trap — it caused an hour of misdiagnosis once.
-
-**It runs on its own thread.** `consumer_loop`, which feeds the virtual camera, only
-calls `stream_server_offer_frame()`: that copies the frame into a one-slot mailbox and
-returns. The stream thread encodes and sends. If it is still busy with the previous
-frame, the newer one replaces whatever is waiting, since a live preview wants the
-latest frame, not every frame. So a viewer on a bad tether can only make the preview
-stale; it cannot stall the pilot's local feed. The encode moved off the consumer thread
-with it.
-
-**It costs nothing when nobody is watching.** `stream_server_offer_frame()` checks an
-atomic "viewer connected" flag before copying anything, so an unwatched stream is one
-idle listening socket and a sleeping thread. That is why `stream_frame_interval: 0` is
-a safe default.
-
-**A slow viewer gets dropped when one frame takes more than 200ms** (`send_timeout_ms`)
-to send. The deadline covers the whole frame: the client socket is non-blocking and
-every `sendmsg()` waits only for whatever is left of it. The earlier `SO_SNDTIMEO`
-bounded each `send()` call instead, and restarted on every partial send, so a viewer
-draining slowly could hold the consumer thread far past 200ms. In the test suite a
-viewer that never reads is dropped after ~270ms, while each offer returns in under a
-millisecond.
-
-That deadline interacts with frame size in a way worth doing the arithmetic on. At
-100 Mbit/s:
-
-| `stream_quality` | Frame size | Push time | Margin vs 200ms |
-|---|---|---|---|
-| 100 | 391 KB | 32 ms | 6× |
-| 60 | 38 KB | 3.1 ms | 64× |
-
-Quality 100 is the pathological end of JPEG — size explodes for no visible gain over
-~85. Measured on real hardware: dropping 100 → 60 cut bandwidth 10× and took delivered
-rate from unmeasurable to exactly 10.0 fps.
-
-**Dual-stack.** The listening socket is `AF_INET6` with `IPV6_V6ONLY` off, so one fd
-serves both families. This is not cosmetic: on a direct tether the only zero-config
-addressing is IPv6 link-local, and an IPv4-only listener is simply unreachable that
-way. `SO_REUSEADDR` is set so a restart does not fail to rebind during `TIME_WAIT`.
-
-Each frame goes out as one `sendmsg()` of the length prefix and the JPEG together.
-Nagle is disabled as well, so the tail of a frame is not held back waiting for an ACK.
-
-### The raw bypass
-
-`stream_raw: true` sends the **untouched** camera frame to the preview instead of the
-processed one, leaving the virtual camera and recording tap on the full chain.
-
-It answers a question you cannot otherwise answer from topside — "is that thing in the
-water real, or is it my filter?" — without dismantling the chain and putting it back.
-
-Implemented by pointer: `raw_data` shares the frame's layout exactly, so a shallow
-`VideoFrame` view with the raw planes is what gets offered, and the mailbox copies from
-those planes instead of the processed ones.
+`eeye` used to serve its own JPEG preview over TCP; `hellion` serves the page's preview
+now, from any frame bus stream on the topside machine. Choosing the frame before
+effects — `camera` in placement A — answers the question nothing else can from topside:
+"is that thing in the water real, or is it my filter?", without dismantling the chain.
+In placement B only `pilot` crosses the tether, so that view is not available topside;
+`raw` is published on the ROV (one copy per frame of planes `eeye` already has) for
+anything running there, autonomy included.
 
 ## Recording tap
 
@@ -187,8 +131,9 @@ ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE
 **`~` is not expanded.** The path goes to `fopen()` with no shell involved, so
 `~/out.raw` tries to create a directory literally named `~`. Use absolute paths.
 
-For anything longer than a short clip, `tools/eeye-record` topside writes H.264 at
-~1.2 GB/hour instead — see [topside.md](topside.md).
+For anything longer than a short clip, `hellion` records topside: the H.264 stream as
+it crosses the tether, ~1.8 GB/hour at 4 Mbit/s — see
+[hellion.md](hellion.md#recording).
 
 ### Failure handling
 
@@ -229,7 +174,7 @@ unescaped byte would make the whole file unparseable to the reader that needs it
 Best-effort throughout: a failure to write is silent and never fatal. Health reporting
 must not be able to take down the pipeline it reports on.
 
-**`config_agent.py` attaches the file's age** when relaying it, because a health file
+**`hellion` attaches the file's age** when serving it (`/api/drone`, `/health`), because a health file
 that stopped being updated means `eeye` is wedged or gone — which looks perfectly
 healthy if you only read the contents. Confirmed in testing: after killing `eeye` the
 relayed snapshot still said camera connected, frames frozen.

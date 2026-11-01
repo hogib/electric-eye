@@ -6,11 +6,13 @@ built and what will bite you when you modify it.
 
 ## What it is
 
-A realtime camera effects pipeline in C99 (GNU dialect, GCC 4.7+ or clang). It captures frames, runs them through a
-configurable chain of image operators, and publishes the result as a
-[v4l2loopback](https://github.com/umlaeute/v4l2loopback) virtual camera. It targets a
-Raspberry Pi in a submersible ROV, controlled from a topside laptop over a direct
-Ethernet tether.
+A realtime camera effects pipeline in C99 (GNU dialect, GCC 4.7+ or clang), in two
+programs. `eeye` captures frames, runs them through a configurable chain of image
+operators, and publishes the result on the **frame bus** (shared memory) for anything
+else on the machine. `hellion` moves video across the tether as H.264 over RTP, feeds
+QGroundControl, records, and serves the browser page. It targets a Raspberry Pi in a
+submersible ROV (a BlueROV), controlled from a topside laptop over a direct Ethernet
+tether.
 
 Two things shape almost every design decision in the codebase:
 
@@ -27,11 +29,10 @@ Two things shape almost every design decision in the codebase:
 | [architecture.md](architecture.md) | Threads, frame lifecycle, ring buffers, startup and shutdown |
 | [capture.md](capture.md) | Both capture backends, pixel formats, resolution negotiation, camera controls |
 | [effects.md](effects.md) | The effect chain, every operator, LUT fusion, the buffer ping-pong |
-| [output.md](output.md) | Virtual camera, preview stream, recording, health reporting |
+| [output.md](output.md) | `eeye`'s outputs: the virtual camera, its raw recording, health reporting |
 | [bus.md](bus.md) | The frame bus: streams between programs, its byte layout, reading it from C or Python |
-| [hellion.md](hellion.md) | The tether relay: pipelines, RTP over the tether and to QGC, the two placements, the browser page and its API, `hellion top`, `hellion check` |
+| [hellion.md](hellion.md) | The tether relay: installing, the tether's network, pipelines, RTP over the tether and to QGC, the two placements, the browser page and its API, `hellion top`, `hellion check` |
 | [config.md](config.md) | Every config key, the hot-reload contract, the parser |
-| [topside.md](topside.md) | Web UI, config agent, network tooling, tether addressing |
 | [testing.md](testing.md) | Test suites, and the bit-exactness harness for SIMD work |
 | [extending.md](extending.md) | Recipes: add an operator, a config key, a capture backend |
 
@@ -40,34 +41,31 @@ fastest route — it lists every file a given kind of change touches.
 
 ## The shape of the system
 
+Placement B, the usual one (A moves `eeye` topside; see [hellion.md](hellion.md)):
+
 ```
-        DRONE (Raspberry Pi)                          TOPSIDE (laptop)
-┌──────────────────────────────────┐          ┌───────────────────────────┐
-│  camera                          │          │                           │
-│    │                             │          │  browser                  │
-│    ▼                             │          │    ▲                      │
-│  eeye  ──────► /dev/video10      │          │    │ HTTP :8080           │
-│    │           (v4l2loopback)    │          │  web_ui.py                │
-│    │                             │          │    │      ▲               │
-│    ├──JPEG──► stream_server :9000├──────────┼────┘      │               │
-│    │                             │  tether  │           │               │
-│    └──raw/mjpeg─► record_path    │          │  eeye-record ──► .mp4     │
-│                                  │          │                           │
-│  config_agent.py :9001 ◄─────────┼──────────┼──── config writes         │
-│    │ writes eeye_config.json     │          │                           │
-│    └─ relays .health / .status   │          │  eeye-net (diagnostics)   │
-└──────────────────────────────────┘          └───────────────────────────┘
+          ROV (Raspberry Pi)                         TOPSIDE (laptop)
+┌─────────────────────────────────────┐     ┌─────────────────────────────────────┐
+│ camera ─► eeye ─► frame bus "pilot" │     │ hellion :5610 ─► QGroundControl     │
+│            ▲      (and "raw")       │     │    ▲     │       :5600 (unchanged)  │
+│            │          │             │     │    │     ├─► recording .mp4         │
+│  effects.json         ▼             │     │    │     └─► decode ─► bus "pilot"  │
+│            ▲       hellion ─H.264/RTP─────────►┘              ├─► /dev/video10  │
+│            └────── :8091 ◄────────────config, status──┐       └─► page preview  │
+│                                     │     │  hellion :8080 ◄── browser          │
+└─────────────────────────────────────┘     └─────────────────────────────────────┘
 ```
 
-`eeye` itself never touches the network. It reads a local JSON file and writes local
-status files; everything network-facing lives in the Python tools. That split is
-deliberate — see [topside.md](topside.md).
+`eeye` itself never touches the network. It reads a local JSON file, writes local
+status files, and publishes frames on the bus; everything network-facing is `hellion`.
+That split keeps the vision layer — the part autonomy code will sit next to — free of
+sockets, ports and the tether's failure modes.
 
 ## Source layout
 
-`src/` is a flat set of translation units, no subdirectories. At 17 files and ~8,500
+`src/` is a flat set of translation units, no subdirectories. At 19 files and ~10,000
 lines that is easier to navigate than a hierarchy would be. Most modules use a prefix
-matching their filename (`v4l2_in_*`, `camera_ctrl_*`, `stream_server_*`), which is the
+matching their filename (`v4l2_in_*`, `camera_ctrl_*`, `fbus_*`), which is the
 namespacing C gives you.
 
 | File | Role |
@@ -89,15 +87,14 @@ namespacing C gives you.
 | `child_proc.c` | Runs helper programs (rpicam-vid, mokutil, ffmpeg) safely |
 | `fbus.c` | The frame bus: shared-memory streams between programs |
 | `bus_in.c` | Capture backend that reads a frame bus stream |
-| `stream_server.c` | JPEG preview tap over TCP, on its own thread |
 | `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |
 
 `hellion/` is the second binary, the tether relay ([hellion.md](hellion.md)); it
 reuses the bus, capture and output modules from `src/`.
 
-Python lives outside the C build: `pi/` (drone side), `topside/`, `tools/`. It is
-being replaced by `hellion` and goes once `hellion` covers it.
+There is no Python in the tree. `install.sh` installs both programs as systemd services
+(`eeye.service`, `hellion/hellion.service`).
 
 ## Conventions worth knowing before you edit
 
@@ -110,7 +107,7 @@ document decisions that were made by measurement and would otherwise look arbitr
 than a silent no-op. This applies inside nested objects too.
 
 **Failures degrade rather than abort, except at startup.** A missing camera retries
-forever; a failed preview stream disables only itself. But a config that cannot be
+forever; a missing loopback device disables only the webcam output. But a config that cannot be
 parsed at startup refuses to run, because there is no previous good state to fall back
 to.
 

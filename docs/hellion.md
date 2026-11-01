@@ -13,23 +13,80 @@ hellion check [-n name]                  # health check: exit 0 ok, 1 degraded, 
 **Status:** pipelines with camera, frame bus and RTP sources; frame bus, v4l2loopback
 and RTP sinks (H.264 to the other end of the tether, or to QGroundControl); the browser
 page with preview, snapshots, recording and `eeye`'s config (here or across the
-tether); the ROV↔topside status exchange; `top` and `check`. `install.sh` does not set
-`hellion` up yet — see [Running it by hand](#running-it-by-hand).
+tether); the ROV↔topside status exchange; `top` and `check`; installed as a systemd
+service by `install.sh`.
 
-## Running it by hand
+## Installing
 
-Until `install.sh` installs it (next on the list), on each machine:
+```sh
+sudo ./install.sh --role rov|topside --placement a|b [--tether IFACE] [--reset-config]
+```
+
+Both ends get the same placement. What it sets up:
+
+| | ROV | topside |
+|---|---|---|
+| **placement a** | `hellion` (camera → RTP) | `hellion` (RTP → bus `camera`; bus `pilot` → QGC, `/dev/video10`), `eeye` (`camera` → `pilot`) |
+| **placement b** | `eeye` (camera → `pilot`), `hellion` (`pilot` → RTP) | `hellion` (RTP → QGC unchanged, bus `pilot`, `/dev/video10`) |
+
+- **Binaries** are copied to `/usr/local/bin`, not run from the checkout: home
+  directories are often 0700, which the service user cannot enter.
+- **One service user, `eeye`, in group `video`**, runs both services. `hellion` writes
+  `eeye`'s config and reads the `.status`/`.health` files beside it, and the two share
+  the frame bus; the bus and status files are mode 0660, so anyone in `video` can run
+  `hellion top`. The installing user is added to `video`.
+- **Configs:** `/etc/hellion/hellion.json` from `hellion/examples/<placement>-<role>.json`;
+  on the machine running `eeye`, `/var/lib/eeye/effects.json` with the source for the
+  placement (`capture_source: "bus"` topside in A) and `output_device: ""` (the
+  loopback device is `hellion`'s). Existing configs are kept unless `--reset-config`,
+  which keeps the old ones as `.bak`.
+- **Units:** `eeye.service` and `hellion/hellion.service`, as installed. A placement in
+  which `eeye` does not run on this machine *removes* an `eeye.service` left by an
+  earlier install: on the ROV in placement A it would hold the camera `hellion` needs.
+  Both units use `KillMode=mixed`, so a stop signals the main process alone and
+  `hellion` can finish a recording properly instead of having its ffmpeg killed with it.
+- **v4l2loopback** (`/dev/video10`) is loaded at boot topside only.
+- **Packages** (`apt-get`): a compiler, `pkg-config`, `libturbojpeg0-dev`, `ffmpeg`, and
+  `v4l2loopback-dkms` topside. Without `apt-get` it lists what to install and you
+  re-run with `--no-packages`.
+- **Re-running** is the update path. The role and placement are remembered in
+  `/etc/hellion/install.conf`, and the services are restarted on the new binaries.
+
+The installer was tested in a sandbox (a user namespace with the system directories
+replaced and the system commands stubbed) for every role and placement, a re-run, and
+a switch of placement; not yet on a real Debian or Raspberry Pi OS machine.
+
+### The tether's network
+
+BlueROV addressing is fixed: topside **192.168.2.1**, ROV **192.168.2.2**, both /24, and
+the examples use it. The ROV's network belongs to BlueOS, and `install.sh` never touches
+it. Topside, `--tether IFACE` creates a NetworkManager profile, `hellion-tether`, giving
+`IFACE` 192.168.2.1/24 — and an IPv6 link-local address, which is not decoration:
+
+**NetworkManager needs at least one address family to succeed**, or it tears the
+connection down — removing the address — and retries. On a bare cable nothing answers
+DHCP or sends router advertisements, so a profile whose families all wait for one cycles
+through 75-second outages while the link itself never drops (`carrier_changes` in
+`/sys/class/net/<iface>/` does not increment, and `ip link` says `UP` throughout: check
+for an *address*, not for "up"). A manual IPv4 address avoids that on its own; link-local
+IPv6 keeps the profile up even if someone later switches IPv4 back to DHCP.
+
+`install.sh` does not activate the profile if the interface is connected right now: the
+script is often run over SSH, quite possibly through that interface. It applies on the
+next replug or reboot, or at once with `nmcli connection up hellion-tether`.
+
+### Running it by hand
+
+For development, from the checkout:
 
 ```sh
 make                                              # builddir/eeye and builddir/hellion
-sudo mkdir -p /etc/hellion /var/lib/hellion
-sudo cp hellion/examples/b-topside.json /etc/hellion/hellion.json   # or a-/b-, rov/topside
-sudo chown -R $USER /var/lib/hellion
-builddir/hellion                                  # reads /etc/hellion/hellion.json
+builddir/hellion -c hellion/examples/b-topside.json
 ```
 
-`hellion` needs `ffmpeg` (`apt install ffmpeg`) for anything RTP, and the `video`
-group for cameras and v4l2loopback. It needs no root.
+`record_dir` and `snapshot_dir` default to `/var/lib/hellion/...`; set them in the config
+when running as yourself. `EEYE_BUS_DIR` moves the frame bus out of `/dev/shm`, so a test
+setup does not meet the installed services' streams.
 
 ## Config
 

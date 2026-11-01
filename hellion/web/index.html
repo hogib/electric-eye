@@ -455,9 +455,8 @@ async function refreshFromDrone() {
   }
 }
 
-// web_ui.py's own proxy already gives up on the drone's config_agent after
-// 5s, and config_agent gives up on eeye's own confirmation after 2s -- so
-// a healthy round trip never takes long. But this request crosses a real
+// hellion gives up on the ROV's hellion after 3s, and on eeye's own
+// confirmation after 3s -- so a healthy round trip never takes long. But this request crosses a real
 // network hop over the tether, which can just drop packets with no RST/FIN
 // to ever wake up fetch()'s promise, especially before this ever runs over
 // the actual fiber run rather than localhost. Without a hard client-side

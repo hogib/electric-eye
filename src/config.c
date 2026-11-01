@@ -46,9 +46,6 @@ static const Config config_defaults = {
     .stage_count = 1,
     .record_path = "",
     .record_format = RECORD_RAW,
-    .stream_frame_interval = 0, // off by default -- no JPEG work, no socket traffic
-    .stream_quality = 60,
-    .stream_raw = false,
     .capture_width = 1280,
     .capture_height = 720,
     .downscale = 1, // full resolution: what this ran at before the field existed
@@ -540,6 +537,9 @@ static bool parse_camera(Cursor *c, CameraControls *out) {
   }
 }
 
+// Logged once per process, not on every reload of the same file.
+static bool warned_stream_keys = false;
+
 static bool parse_config(const char *buf, size_t len, Config *out) {
   Cursor c = {.s = buf, .len = len, .pos = 0};
   Config parsed = config_defaults;
@@ -577,24 +577,31 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"record_path\"\n");
           return false;
         }
-      } else if (strcmp(key, "stream_frame_interval") == 0) {
-        if (!parse_u8(&c, &parsed.stream_frame_interval)) {
-          printf("Config: invalid value for \"stream_frame_interval\"\n");
-          return false;
-        }
       } else if (strcmp(key, "camera") == 0) {
         if (!parse_camera(&c, &parsed.camera))
           return false; // parse_camera already explained why
-      } else if (strcmp(key, "stream_raw") == 0) {
-        if (!parse_bool(&c, &parsed.stream_raw)) {
-          printf("Config: invalid value for \"stream_raw\" (expected true "
-                 "or false)\n");
+      } else if (strcmp(key, "stream_frame_interval") == 0 ||
+                 strcmp(key, "stream_quality") == 0 ||
+                 strcmp(key, "stream_raw") == 0) {
+        // eeye's own JPEG preview server is gone (hellion serves the
+        // preview now), but configs written before that still carry these
+        // keys. Still type-checked, so a typo'd value is not silently
+        // accepted; then ignored.
+        uint8_t ignored_u8;
+        bool ignored_bool;
+        bool ok = strcmp(key, "stream_raw") == 0
+                      ? parse_bool(&c, &ignored_bool)
+                      : parse_u8(&c, &ignored_u8);
+        if (!ok) {
+          printf("Config: invalid value for \"%s\"\n", key);
           return false;
         }
-      } else if (strcmp(key, "stream_quality") == 0) {
-        if (!parse_u8(&c, &parsed.stream_quality)) {
-          printf("Config: invalid value for \"stream_quality\"\n");
-          return false;
+        if (!warned_stream_keys) {
+          warned_stream_keys = true;
+          printf("Config: \"%s\" is ignored: the preview is served by "
+                 "hellion now (see docs/hellion.md). Remove the stream_* "
+                 "keys to silence this.\n",
+                 key);
         }
       } else if (strcmp(key, "capture_width") == 0) {
         if (!parse_u16(&c, &parsed.capture_width)) {
@@ -932,7 +939,7 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
 // after every load/reload attempt -- config_try_load() (called just before
 // this, both here and in config_watch_start()) already printed the full
 // reason on failure, so this file only needs to carry the yes/no a remote
-// writer (e.g. pi/config_agent.py) can't otherwise get: whether the config
+// writer (hellion, for the page) can't otherwise get: whether the config
 // it just wrote actually took effect, as opposed to being silently
 // rejected in favor of whatever was running before. Same writer contract
 // as the config file itself (temp file in the same directory, then

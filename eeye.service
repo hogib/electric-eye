@@ -1,70 +1,64 @@
-# Electric Eye systemd service.
+# eeye: the camera, the effect chain, and the frame bus (docs/bus.md).
 #
-# Install:
+# Installed by install.sh, which runs it only on the machine where eeye
+# belongs: the ROV in placement B, topside in placement A. By hand:
+#   sudo install -m 0755 builddir/eeye /usr/local/bin/
+#   sudo useradd --system --gid video --no-create-home --shell /usr/sbin/nologin eeye
 #   sudo cp eeye.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now eeye
-#
-# Adjust WorkingDirectory/ExecStart below to your install path, and
-# User/Group to a user in the 'video' group (needed for both the camera
-# device and the v4l2loopback output device):
-#   sudo usermod -aG video <user>
+#   sudo systemctl daemon-reload && sudo systemctl enable --now eeye
 #
 # Logs:   journalctl -u eeye -f
-# Status: systemctl status eeye
+# Config: /var/lib/eeye/effects.json -- edited live by hellion's page, or by
+#         hand; changes apply within a moment, no restart.
 
 [Unit]
-Description=Electric Eye - realtime webcam effects pipeline
-After=network.target systemd-udevd.service
+Description=eeye - camera effects and the frame bus (electric-eye)
+After=systemd-udevd.service
 
 # Give up escalating restarts, rather than retrying forever, after 5
-# failures within 60 seconds. A persistent problem (e.g. v4l2loopback
-# genuinely not loaded) should surface as a failed service an admin
-# notices via `systemctl status eeye`, not an infinite silent restart loop.
+# failures within 60 seconds: a persistent problem should surface as a
+# failed service in `systemctl status eeye`, not a silent restart loop.
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
-User=pi
+# The same user as hellion.service: hellion writes this config file and
+# reads its .status and .health beside it, and both read and write each
+# other's frame bus files in /dev/shm. Group video for the camera, the
+# loopback device, and so that people in 'video' can run `hellion top`.
+User=eeye
 Group=video
 
-# No capabilities at all. eeye no longer loads v4l2loopback itself:
-# install.sh loads it at boot (/etc/modules-load.d), and the 'video' group
-# is all the camera and the loopback device need. Nor can anything eeye
-# runs (rpicam-vid, mokutil) gain privileges.
+# /var/lib/eeye, created and owned by the service user: the effects config,
+# its .status/.health, and eeye's own raw recordings if record_path is set.
+StateDirectory=eeye
+StateDirectoryMode=0775
+WorkingDirectory=/var/lib/eeye
+ExecStart=/usr/local/bin/eeye /var/lib/eeye/effects.json
+
+# No capabilities at all, and nothing eeye runs (rpicam-vid) can gain any.
 CapabilityBoundingSet=
 NoNewPrivileges=yes
+ProtectSystem=full
 
-WorkingDirectory=/opt/electric-eye
-ExecStart=/opt/electric-eye/builddir/eeye /opt/electric-eye/eeye_config.json
-
-# libgomp's default OMP_WAIT_POLICY is "active": each OpenMP worker thread
-# busy-spins waiting for the next #pragma omp parallel for region instead of
-# sleeping between them. That trade only pays off when parallel regions run
-# back-to-back with negligible gaps -- here they run once per video frame
-# (~33ms apart), so every worker spends most of the frame interval spinning.
-# Measured impact on a 12-core host: ~178% CPU idling down to ~15-19% from
-# this one setting. A bounded GOMP_SPINCOUNT=10000 was also measured and
-# lost on both CPU and effects time (see eeye.c main()). On the Pi's 4
-# cores this matters more, not less: it is a larger fraction of a fixed
-# thermal/power budget. eeye re-execs itself with this if neither variable
-# is set, so this line documents the setting rather than being required.
+# libgomp's default OMP_WAIT_POLICY is "active": every OpenMP worker
+# busy-spins between the once-per-frame parallel regions. Measured on a
+# 12-core host: ~178% CPU idling down to ~15-19% with this one setting. eeye
+# re-execs itself with it if unset, so this line documents the setting
+# rather than being required.
 Environment=OMP_WAIT_POLICY=passive
 
-# Restart on anything other than an intentional `systemctl stop` (which
-# sends SIGTERM through the same graceful-shutdown path eeye.c already
-# handles for Ctrl+C; systemd does not restart after an administrative stop
-# regardless of this setting). This is specifically the recovery layer for
-# setup-class failures -- e.g. v4l2loopback not loaded -- that no amount of
-# retrying open() in-process can fix on its own. A genuinely missing
-# *camera* is already handled without needing a restart at all:
-# producer_loop retries that internally (see video_threads.c).
+# SIGTERM to eeye alone, which stops its rpicam-vid child in order; anything
+# still running after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=15
+
+# A missing camera is retried inside eeye without a restart (see
+# video_threads.c). This is for what retrying cannot fix: a bus stream that
+# changed size, a loopback device that went away.
 Restart=always
 RestartSec=5
-
-# journald captures stdout/stderr automatically -- no separate log
-# configuration needed.
 
 [Install]
 WantedBy=multi-user.target

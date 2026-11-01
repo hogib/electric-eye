@@ -20,8 +20,6 @@ static void test_defaults_match_documentation(void) {
   CHECK_EQ_INT(c.capture_width, 1280);
   CHECK_EQ_INT(c.capture_height, 720);
   CHECK_EQ_INT(c.downscale, 1);
-  CHECK_EQ_INT(c.stream_frame_interval, 0);
-  CHECK_EQ_INT(c.stream_quality, 60);
   CHECK_EQ_INT(c.capture_source, CAPTURE_AUTO);
   CHECK_EQ_INT(c.record_path[0], '\0');
   CHECK(strcmp(c.capture_device, "/dev/video0") == 0);
@@ -205,29 +203,19 @@ static void test_camera_boundaries_accepted(void) {
   CHECK(parse("{\"camera\":{\"contrast\":200}}", &c));
 }
 
-// stream_raw is the first bool-valued key. A bool parser that accepted
-// numbers, or silently defaulted a malformed value to false, would turn a
-// typo into "the raw toggle just doesn't work".
-static void test_stream_raw_bool_parsing(void) {
+// The preview moved to hellion, but configs written before that carry
+// stream_raw / stream_frame_interval / stream_quality and must still load:
+// an eeye that refused its own old config would come up with no video.
+// Still type-checked, so a mangled value is caught rather than ignored.
+static void test_old_preview_keys_still_load(void) {
   Config c;
-  CHECK(parse("{}", &c));
-  CHECK(c.stream_raw == false); // default
-  CHECK(parse("{\"stream_raw\":true}", &c));
-  CHECK(c.stream_raw == true);
-  CHECK(parse("{\"stream_raw\":false}", &c));
-  CHECK(c.stream_raw == false);
-  // Anything that isn't a JSON bool must be rejected, not coerced.
-  CHECK(!parse("{\"stream_raw\":1}", &c));
-  CHECK(!parse("{\"stream_raw\":0}", &c));
-  CHECK(!parse("{\"stream_raw\":\"true\"}", &c));
-  CHECK(!parse("{\"stream_raw\":TRUE}", &c));
-  CHECK(!parse("{\"stream_raw\":truthy}", &c));
-  // It is hot-reloadable, so it must coexist with the rest of a config.
-  CHECK(parse("{\"chain\":[{\"effect\":\"sobel\"}],\"stream_raw\":true,"
-              "\"stream_frame_interval\":3}",
+  CHECK(parse("{\"chain\":[{\"effect\":\"blur\"}],\"stream_raw\":true,"
+              "\"stream_frame_interval\":3,\"stream_quality\":60}",
               &c));
-  CHECK(c.stream_raw == true);
-  CHECK_EQ_INT(c.stages[0].effect, EFFECT_SOBEL);
+  CHECK_EQ_INT(c.stages[0].effect, EFFECT_BLUR);
+  CHECK(!parse("{\"stream_raw\":1}", &c));
+  CHECK(!parse("{\"stream_raw\":\"true\"}", &c));
+  CHECK(!parse("{\"stream_frame_interval\":\"3\"}", &c));
 }
 
 // canny's thresholds are seeded to usable defaults rather than 0, which
@@ -581,7 +569,7 @@ int main(void) {
   RUN_TEST(test_effect_parameters_round_trip);
   RUN_TEST(test_log_parameter_validation);
   RUN_TEST(test_canny_threshold_defaults);
-  RUN_TEST(test_stream_raw_bool_parsing);
+  RUN_TEST(test_old_preview_keys_still_load);
   RUN_TEST(test_camera_controls_default_to_unset);
   RUN_TEST(test_camera_controls_round_trip);
   RUN_TEST(test_camera_explicit_zero_is_kept);

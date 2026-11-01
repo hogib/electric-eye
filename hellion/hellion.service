@@ -1,0 +1,50 @@
+# hellion: everything on the tether (docs/hellion.md). Runs on both sides.
+#
+# Installed by install.sh. By hand:
+#   sudo install -m 0755 builddir/hellion /usr/local/bin/
+#   sudo useradd --system --gid video --no-create-home --shell /usr/sbin/nologin eeye
+#   sudo install -D -m 0644 hellion/examples/b-rov.json /etc/hellion/hellion.json
+#   sudo cp hellion/hellion.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hellion
+#
+# Logs:      journalctl -u hellion -f
+# Dashboard: hellion top        (any user in the 'video' group)
+# Pre-dive:  hellion check
+
+[Unit]
+Description=hellion - video across the tether (electric-eye)
+After=network-online.target systemd-udevd.service
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The same user as eeye.service, so hellion can write eeye's config and
+# both can share the frame bus. See eeye.service.
+User=eeye
+Group=video
+
+# /var/lib/hellion: recordings and snapshots (record_dir, snapshot_dir).
+StateDirectory=hellion
+StateDirectoryMode=0775
+WorkingDirectory=/var/lib/hellion
+ExecStart=/usr/local/bin/hellion -c /etc/hellion/hellion.json
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=full
+
+# SIGTERM to hellion alone: it stops its ffmpeg children itself, the
+# recorder with SIGINT first so the MP4 is finalized (up to ~10s while
+# video still flows). The default, signalling the whole cgroup at once,
+# would cut the recorder off mid-write. Anything left after the timeout
+# is killed.
+KillMode=mixed
+TimeoutStopSec=20
+
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

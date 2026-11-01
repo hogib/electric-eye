@@ -11,7 +11,7 @@
 # here needs make 4.x: no !=, no .ONESHELL, no $(file).
 #
 # Everything is overridable from the command line or environment: CC,
-# HOSTCC, CFLAGS, CPPFLAGS, LDFLAGS, LDLIBS, BUILDDIR, PKG_CONFIG, PYTHON, and
+# HOSTCC, CFLAGS, CPPFLAGS, LDFLAGS, LDLIBS, BUILDDIR, PKG_CONFIG, and
 #   OPENMP=0|1                   default: on if $(CC) can build with it
 #   TURBOJPEG_CFLAGS/_LIBS       default: pkg-config, else -lturbojpeg
 # e.g. a libjpeg-turbo built from source into /opt/ljt:
@@ -21,7 +21,6 @@
 BUILDDIR ?= builddir
 BUILD ?= debugoptimized
 PKG_CONFIG ?= pkg-config
-PYTHON ?= python3
 # Builds tools that run during the build (the page embedder); differs from
 # CC only when cross-compiling.
 HOSTCC ?= cc
@@ -106,7 +105,6 @@ SRC := \
 	src/point_opps.c \
 	src/recorder.c \
 	src/rpicam_in.c \
-	src/stream_server.c \
 	src/v4l2_in.c \
 	src/v4l2_out.c \
 	src/video_threads.c \
@@ -177,7 +175,7 @@ $(OBJDIR)/%.o: %.c
 # parser, the JPEG frame splitter, the negotiation ranker -- are reachable
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
-	canny health camera_ctrl recorder stream_server effect_chain child_proc \
+	canny health camera_ctrl recorder effect_chain child_proc \
 	virtual_cam fbus hellion http
 
 # Extra translation units each test needs beyond the one it includes:
@@ -194,7 +192,6 @@ test_canny_SRC := src/conv.c src/video_frame.c
 test_health_SRC :=
 test_camera_ctrl_SRC :=
 test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
-test_stream_server_SRC := src/video_frame.c
 test_child_proc_SRC :=
 test_fbus_SRC :=
 test_http_SRC :=
@@ -235,20 +232,6 @@ CHECKS := $(addprefix check-,$(TESTS))
 .PHONY: $(CHECKS)
 $(CHECKS): check-%: $(TESTDIR)/test_%
 	$(call run_suite,$*,60,$<)
-
-# Topside/drone Python: link staleness, the health relay, and the encoder.
-# Standard library only; skipped where there's no $(PYTHON).
-HAVE_PYTHON := $(shell command -v $(PYTHON) >/dev/null 2>&1 && echo 1)
-ifeq ($(HAVE_PYTHON),1)
-CHECKS += check-topside check-record
-.PHONY: check-topside check-record
-check-topside:
-	@mkdir -p $(TESTDIR)
-	$(call run_suite,topside,120,$(PYTHON) tests/test_topside.py)
-check-record:
-	@mkdir -p $(TESTDIR)
-	$(call run_suite,record,60,$(PYTHON) tests/test_record.py)
-endif
 
 check: $(CHECKS)
 

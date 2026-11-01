@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
 #
-# Electric Eye installer.
+# electric-eye installer: eeye and hellion as systemd services.
 #
 # Usage:
-#   git clone <this repo>
-#   cd electric-eye
-#   sudo ./install.sh
+#   sudo ./install.sh --role rov|topside --placement a|b [options]
 #
-# Installs build/runtime dependencies, builds the project in place (this
-# checkout is the install -- there is no separate copy-to-/opt step, so
-# `git pull && sudo ./install.sh` is also the update path), configures
-# v4l2loopback to load automatically on every boot with the right options,
-# adds the invoking user to the 'video' group, configures the wired
-# interface so a direct tether works, and installs + enables the systemd
-# service.
+#   --role rov|topside   which end of the tether this machine is
+#   --placement a|b      where eeye (the effects) runs:
+#                          a = topside: the ROV sends its camera up, effects
+#                              are applied topside
+#                          b = on the ROV: the ROV sends the pilot's picture
+#                              up (where autonomy will run)
+#                        Both ends must be installed with the same placement.
+#   --tether IFACE       topside only: give IFACE the BlueROV topside address,
+#                        192.168.2.1/24, with NetworkManager. Without it the
+#                        network is left alone.
+#   --reset-config       replace /etc/hellion/hellion.json (and eeye's
+#                        effects config) with fresh ones; the old files are
+#                        kept as *.bak
+#   --no-packages        skip installing packages
 #
-# Pass --no-network to skip the networking step.
+# Re-running is the update path: `git pull && sudo ./install.sh`. The role
+# and placement are remembered, existing configs are kept, and the services
+# are restarted on the new binaries.
 #
-# Safe to re-run: every step here is idempotent (apt install of an
-# installed package, usermod -aG on an existing membership, systemctl
-# enable on an already-enabled unit are all no-ops).
+# What runs where:
+#                 ROV                         topside
+#   placement a   hellion (camera -> RTP)     hellion (RTP -> bus "camera",
+#                                               bus "pilot" -> QGC, loopback),
+#                                               eeye (bus "camera" -> "pilot")
+#   placement b   eeye (camera -> "pilot"),   hellion (RTP -> QGC, bus
+#                 hellion ("pilot" -> RTP)      "pilot", loopback)
 
 set -euo pipefail
 
@@ -29,228 +40,308 @@ die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
 
 trap 'die "Install failed at line $LINENO. Nothing after that point ran; it is safe to fix the issue and re-run this script."' ERR
 
-SETUP_NETWORK=1
-for arg in "$@"; do
-  case "$arg" in
-    --no-network) SETUP_NETWORK=0 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-    *) die "Unknown option: $arg (try --help)" ;;
+ORIG_ARGS="$*"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_FILE=/etc/hellion/install.conf
+
+ROLE=""
+PLACEMENT=""
+TETHER_IF=""
+RESET_CONFIG=0
+INSTALL_PACKAGES=1
+# The value after an option, or a clear error when there is none.
+need_value() { [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a value (try --help)"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role) need_value "$@"; ROLE="$2"; shift 2 ;;
+    --role=*) ROLE="${1#*=}"; shift ;;
+    --placement) need_value "$@"; PLACEMENT="$2"; shift 2 ;;
+    --placement=*) PLACEMENT="${1#*=}"; shift ;;
+    --tether) need_value "$@"; TETHER_IF="$2"; shift 2 ;;
+    --tether=*) TETHER_IF="${1#*=}"; shift ;;
+    --reset-config) RESET_CONFIG=1; shift ;;
+    --no-packages) INSTALL_PACKAGES=0; shift ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
 
+# A re-run without flags reuses the last install's choices.
+if [ -z "$ROLE$PLACEMENT" ] && [ -r "$STATE_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+  log "Using the previous install's choices: --role $ROLE --placement $PLACEMENT"
+fi
+case "$ROLE" in rov|topside) ;; *) die "--role must be rov or topside (try --help)" ;; esac
+case "$PLACEMENT" in a|b) ;; *) die "--placement must be a or b (try --help)" ;; esac
+if [ -n "$TETHER_IF" ] && [ "$ROLE" != topside ]; then
+  die "--tether is for the topside machine. On a BlueROV the ROV's network belongs to BlueOS; leave it alone."
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
-  die "This needs root, for package installs, /etc/modules-load.d, /etc/modprobe.d, and the systemd unit. Run: sudo $0"
+  die "This needs root (packages, a system user, /etc, systemd units). Run: sudo $0 $ORIG_ARGS"
 fi
 
-# The user to add to the 'video' group and to report status back to.
-# $SUDO_USER is unset if this was run as root directly (su, or already root)
-# rather than via sudo -- in that case there is no clear "which user" to
-# pick, so that step is skipped further down with a warning instead of
-# guessing.
+# eeye runs on the ROV in placement b and topside in placement a.
+RUN_EEYE=0
+{ [ "$ROLE" = rov ] && [ "$PLACEMENT" = b ]; } && RUN_EEYE=1
+{ [ "$ROLE" = topside ] && [ "$PLACEMENT" = a ]; } && RUN_EEYE=1
+# The loopback device (/dev/video10, for OBS, a browser, anything that
+# takes a webcam) is written by hellion topside, in both placements.
+NEED_LOOPBACK=0
+[ "$ROLE" = topside ] && NEED_LOOPBACK=1
+
+# The person who ran sudo: added to 'video' (for `hellion top`), and the
+# build runs as them so their checkout does not fill with root-owned files.
 TARGET_USER="${SUDO_USER:-}"
+[ "$TARGET_USER" = root ] && TARGET_USER=""
 
-command -v apt-get >/dev/null 2>&1 || die "apt-get not found. This installer targets Raspberry Pi OS / Debian / Ubuntu; on anything else, follow the manual steps in eeye.c's setup comment and eeye.service instead."
+# --- Packages ------------------------------------------------------------
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/builddir"
+PKGS="build-essential pkg-config libturbojpeg0-dev ffmpeg"
+[ "$NEED_LOOPBACK" -eq 1 ] && PKGS="$PKGS v4l2loopback-dkms"
 
-if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
-  warn "Secure Boot is on. Installing v4l2loopback-dkms below may pop up a \
-one-time MOK enrollment password prompt -- don't skip it. Afterward you \
-MUST reboot: a blue 'MOK Manager' screen will appear during boot asking \
-for that same password to actually enroll the signing key. Skip either \
-step and the module builds fine but the kernel refuses to load it, which \
-looks exactly like a permissions error later ('modprobe: could not \
-insert ... Operation not permitted') rather than what it actually is. If \
-you miss the prompt, check 'sudo mokutil --list-new' -- non-empty output \
-means enrollment is still pending, and rebooting will show the MOK \
-Manager screen again."
+if [ "$INSTALL_PACKAGES" -eq 1 ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    if [ "$NEED_LOOPBACK" -eq 1 ] && command -v mokutil >/dev/null 2>&1 &&
+       mokutil --sb-state 2>/dev/null | grep -q "SecureBoot enabled"; then
+      warn "Secure Boot is on. Installing v4l2loopback-dkms may ask for a \
+one-time MOK enrollment password -- don't skip it -- and then you MUST \
+reboot and enter the same password on the blue 'MOK Manager' screen. Skip \
+either step and the module builds but the kernel refuses to load it \
+('modprobe: ... Operation not permitted'). 'sudo mokutil --list-new' \
+non-empty means enrollment is still pending."
+    fi
+    log "Installing packages: $PKGS"
+    apt-get update
+    # shellcheck disable=SC2086
+    if ! apt-get install -y $PKGS; then
+      die "Package install failed. If v4l2loopback-dkms failed to build, the \
+kernel headers for $(uname -r) are probably missing: \
+'sudo apt install raspberrypi-kernel-headers' on a Pi, otherwise \
+'sudo apt install linux-headers-\$(uname -r)'. Then re-run."
+    fi
+  else
+    warn "No apt-get here, so packages were not installed. This needs a C \
+compiler, make, pkg-config, libjpeg-turbo (turbojpeg) headers and ffmpeg\
+$([ "$NEED_LOOPBACK" -eq 1 ] && echo ", plus the v4l2loopback kernel module"). \
+Install them with your package manager, then re-run with --no-packages."
+    INSTALL_PACKAGES=0
+  fi
 fi
+command -v ffmpeg >/dev/null 2>&1 ||
+  die "ffmpeg is not installed; hellion needs it for H.264 and RTP."
 
-log "Installing build and runtime dependencies"
-apt-get update
-if ! apt-get install -y build-essential pkg-config \
-    libturbojpeg0-dev v4l2loopback-dkms; then
-  die "Package install failed. If it was specifically v4l2loopback-dkms \
-that failed to build, you're most likely missing kernel headers for your \
-running kernel ($(uname -r)) -- try:
-  sudo apt install raspberrypi-kernel-headers
-(or, on a non-RPi-branded kernel: sudo apt install linux-headers-\$(uname -r))
-then re-run this script."
-fi
+# --- Build ---------------------------------------------------------------
 
-log "Building electric_eye in $SCRIPT_DIR"
-make -C "$SCRIPT_DIR" BUILDDIR="$BUILD_DIR" -j"$(nproc)"
-
-EXE_PATH="$BUILD_DIR/eeye"
-[ -x "$EXE_PATH" ] || die "Build succeeded but $EXE_PATH is missing -- unexpected, please report this."
-
-log "Configuring v4l2loopback to load automatically on boot"
-cat > /etc/modules-load.d/v4l2loopback.conf <<'EOF'
-v4l2loopback
-EOF
-cat > /etc/modprobe.d/v4l2loopback.conf <<'EOF'
-options v4l2loopback video_nr=10 card_label="VirtualCam" exclusive_caps=1
-EOF
-
-if lsmod | grep -q '^v4l2loopback'; then
-  warn "v4l2loopback is already loaded. modprobe cannot change a loaded \
-module's parameters -- if it was loaded with different options before \
-this install (a different video_nr, for instance), reboot or manually \
-'rmmod v4l2loopback' and 'modprobe v4l2loopback' to pick up the new ones."
-else
-  modprobe v4l2loopback video_nr=10 card_label="VirtualCam" exclusive_caps=1
-fi
-
+log "Building in $SCRIPT_DIR"
 if [ -n "$TARGET_USER" ]; then
-  log "Adding $TARGET_USER to the 'video' group"
+  sudo -u "$TARGET_USER" make -C "$SCRIPT_DIR" -j"$(nproc)" all
+else
+  make -C "$SCRIPT_DIR" -j"$(nproc)" all
+fi
+for exe in eeye hellion; do
+  [ -x "$SCRIPT_DIR/builddir/$exe" ] ||
+    die "The build finished but builddir/$exe is missing -- please report this."
+done
+
+# --- The service user ------------------------------------------------------
+#
+# One system user for both services: hellion writes eeye's config and reads
+# its status beside it, and the two share the frame bus in /dev/shm. Its
+# group is 'video' for the camera and the loopback device, and so that the
+# bus and status files (mode 0660) are readable by people in 'video'.
+
+log "Setting up the 'eeye' service user"
+getent group video >/dev/null || groupadd --system video
+if ! getent passwd eeye >/dev/null; then
+  useradd --system --gid video --home-dir /var/lib/eeye --no-create-home \
+          --shell "$(command -v nologin || echo /bin/false)" \
+          --comment "electric-eye services" eeye
+fi
+WAS_IN_VIDEO=1
+if [ -n "$TARGET_USER" ]; then
+  id -nG "$TARGET_USER" | grep -qw video || WAS_IN_VIDEO=0
   usermod -aG video "$TARGET_USER"
 else
-  warn "Could not determine which user to add to the 'video' group (not \
-run via sudo?). Do it manually: sudo usermod -aG video <your-user>"
+  warn "Not run via sudo, so no login user was added to 'video'. Do it by \
+hand for whoever will run 'hellion top': sudo usermod -aG video <user>"
 fi
 
-# --- Wired networking for the tether ---------------------------------
-#
-# The drone and the topside machine are joined by a direct Ethernet cable:
-# no router, no DHCP server, no DNS. NetworkManager's default wired profile
-# is ipv4=auto/ipv6=auto, and on such a cable BOTH fail -- DHCP has nothing
-# to answer it, and IPv6 "auto" waits for a router advertisement that never
-# arrives. NetworkManager needs at least one address family to succeed, so
-# it tears the connection down, removing the address, and retries. The
-# result is the interface flapping in and out of "connected" with outages
-# of a minute or more, while the physical link never drops at all.
-#
-# The fix is one setting: ipv6.method=link-local. A link-local address
-# needs no server, so that family always succeeds, the connection stays
-# activated, and the address persists. IPv4 is deliberately left on DHCP --
-# it keeps working normally on a bench LAN, and is simply allowed to fail
-# on a bare cable (ipv4.may-fail defaults to yes).
-#
-# That link-local address is exactly what tools/eeye-net discovers over.
-setup_network() {
-  if ! command -v nmcli >/dev/null 2>&1; then
-    warn "NetworkManager not found, so the wired interface was left alone. \
-On Raspberry Pi OS Bullseye and older this machine probably uses dhcpcd \
-instead. The tether needs the wired interface to keep an IPv6 link-local \
-address when no DHCP server answers; configure that by hand, or re-run \
-with --no-network to silence this."
+# Installed copies rather than paths into this checkout: a home directory is
+# often 0700, which the service user cannot enter.
+log "Installing eeye and hellion to /usr/local/bin"
+install -m 0755 "$SCRIPT_DIR/builddir/eeye" "$SCRIPT_DIR/builddir/hellion" /usr/local/bin/
+
+# --- v4l2loopback (topside) --------------------------------------------------
+
+if [ "$NEED_LOOPBACK" -eq 1 ]; then
+  log "Loading v4l2loopback (/dev/video10) now and on every boot"
+  echo v4l2loopback > /etc/modules-load.d/v4l2loopback.conf
+  echo 'options v4l2loopback video_nr=10 card_label="hellion" exclusive_caps=1' \
+    > /etc/modprobe.d/v4l2loopback.conf
+  if lsmod | grep -q '^v4l2loopback'; then
+    [ -e /dev/video10 ] || warn "v4l2loopback is loaded, but with different \
+options (there is no /dev/video10). Reboot, or 'sudo rmmod v4l2loopback && \
+sudo modprobe v4l2loopback', to pick up the new ones."
+  elif ! modprobe v4l2loopback; then
+    warn "v4l2loopback would not load. hellion runs without it (its loopback \
+sink retries); fix it to get /dev/video10. See the Secure Boot note above."
+  fi
+fi
+
+# --- Configs -------------------------------------------------------------------
+
+# Writes $2 to $1 unless $1 exists (kept) or --reset-config (backed up).
+put_config() {
+  local dest="$1" content="$2" owner="$3" mode="$4"
+  if [ -e "$dest" ] && [ "$RESET_CONFIG" -eq 0 ]; then
+    log "Keeping $dest (--reset-config replaces it)"
     return 0
   fi
-  if ! nmcli -t general status >/dev/null 2>&1; then
-    warn "NetworkManager is installed but not responding, so the wired \
-interface was left alone. Start it (systemctl enable --now NetworkManager) \
-and re-run this script."
-    return 0
+  if [ -e "$dest" ]; then
+    cp -p "$dest" "$dest.bak"
+    log "Replacing $dest (the old one is $dest.bak)"
+  else
+    log "Writing $dest"
   fi
-
-  # Work on connection PROFILES, not devices. A device reports only the
-  # connection currently active on it, so keying off that would create a
-  # duplicate profile every time this ran with the cable unplugged -- and
-  # NetworkManager happily allows duplicate names.
-  local profiles
-  profiles=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
-             | awk -F: '$2 == "802-3-ethernet" { print $1 }')
-
-  if [ -z "$profiles" ]; then
-    # No wired profile at all (a Pi that has never had a cable plugged in).
-    # Deliberately not pinned to an interface name: a profile bound to one
-    # silently stops applying the day a USB adapter is used instead.
-    log "No wired profile exists; creating 'eeye-tether'"
-    if nmcli connection add type ethernet con-name eeye-tether \
-         ipv4.method auto ipv6.method link-local \
-         connection.autoconnect yes connection.autoconnect-priority 50 \
-         >/dev/null 2>&1; then
-      profiles="eeye-tether"
-    else
-      warn "Could not create a wired profile. Set one up by hand: \
-nmcli connection add type ethernet con-name eeye-tether ifname '*' \
-ipv4.method auto ipv6.method link-local"
-      return 0
-    fi
-  fi
-
-  # Fix every wired profile, so whichever one activates on the tether
-  # behaves. Modifying is idempotent, which keeps re-running this script
-  # safe.
-  local name
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    if nmcli connection modify "$name" ipv6.method link-local >/dev/null 2>&1; then
-      log "Wired profile '$name': ipv6.method set to link-local"
-    else
-      warn "Could not modify wired profile '$name'. Set it by hand: \
-nmcli connection modify '$name' ipv6.method link-local"
-    fi
-  done <<< "$profiles"
-
-  # Activate only where nothing is already up. Reactivating a live
-  # connection drops it, and this script is very often run over SSH --
-  # quite possibly over the very interface being changed.
-  local dev state
-  while IFS= read -r dev; do
-    [ -n "$dev" ] || continue
-    state=$(nmcli -t -f GENERAL.STATE device show "$dev" 2>/dev/null | cut -d: -f2-)
-    # Matched on NetworkManager's numeric state, not its words: the string
-    # "disconnected" contains "connected", so a glob for the latter also
-    # catches the former and would skip exactly the devices worth bringing
-    # up. 100 = connected, 30 = disconnected, 20 = unavailable (no cable).
-    case "$state" in
-      100*)
-        warn "$dev is already connected, so it was not restarted. The change \
-applies on the next reboot or cable replug. Reactivating it now would drop \
-that connection, which is a bad idea if you are currently on it."
-        ;;
-      20*)
-        log "$dev has no cable; the profile will apply when one is plugged in"
-        ;;
-      *)
-        if nmcli device connect "$dev" >/dev/null 2>&1; then
-          log "$dev activated"
-        else
-          warn "$dev is configured but would not activate. It should come up \
-on its own once a cable is connected."
-        fi
-        ;;
-    esac
-  done <<< "$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null \
-              | awk -F: '$2 == "ethernet" && $3 != "unmanaged" { print $1 }')"
+  printf '%s\n' "$content" > "$dest.new"
+  chown "$owner" "$dest.new"
+  chmod "$mode" "$dest.new"
+  mv -f "$dest.new" "$dest"
 }
 
-if [ "$SETUP_NETWORK" -eq 1 ]; then
-  log "Configuring wired networking for the tether"
-  setup_network
-else
-  log "Skipping tether networking (--no-network)"
+install -d -m 0755 /etc/hellion
+put_config /etc/hellion/hellion.json \
+  "$(cat "$SCRIPT_DIR/hellion/examples/$PLACEMENT-$ROLE.json")" root:root 0644
+if [ -e /etc/hellion/hellion.json ] &&
+   ! grep -q "\"role\": *\"$ROLE\"" /etc/hellion/hellion.json; then
+  warn "/etc/hellion/hellion.json is not a $ROLE config. It was kept; \
+re-run with --reset-config to replace it with hellion/examples/$PLACEMENT-$ROLE.json."
 fi
 
-log "Installing the systemd service"
-sed \
-  -e "s#/opt/electric-eye/builddir/eeye#$EXE_PATH#" \
-  -e "s#/opt/electric-eye/eeye_config.json#$SCRIPT_DIR/eeye_config.json#" \
-  -e "s#WorkingDirectory=/opt/electric-eye#WorkingDirectory=$SCRIPT_DIR#" \
-  -e "s/^User=pi/User=${TARGET_USER:-root}/" \
-  "$SCRIPT_DIR/eeye.service" > /etc/systemd/system/eeye.service
+if [ "$RUN_EEYE" -eq 1 ]; then
+  install -d -m 0775 -o eeye -g video /var/lib/eeye
+  # Where the frames come from differs by placement; the loopback device is
+  # hellion's (topside), so eeye writes none.
+  if [ "$PLACEMENT" = a ]; then
+    source_keys='  "capture_source": "bus",
+  "capture_stream": "camera",'
+  else
+    source_keys='  "capture_device": "/dev/video0",'
+  fi
+  put_config /var/lib/eeye/effects.json "{
+  \"chain\": [
+    {\"effect\": \"blur\"},
+    {\"effect\": \"sobel\"}
+  ],
+  \"record_path\": \"\",
+$source_keys
+  \"output_device\": \"\"
+}" eeye:video 0664
+fi
 
+# --- systemd units ---------------------------------------------------------------
+
+log "Installing the systemd units"
+install -m 0644 "$SCRIPT_DIR/hellion/hellion.service" /etc/systemd/system/hellion.service
+if [ "$RUN_EEYE" -eq 1 ]; then
+  install -m 0644 "$SCRIPT_DIR/eeye.service" /etc/systemd/system/eeye.service
+elif [ -e /etc/systemd/system/eeye.service ]; then
+  # An earlier install ran eeye here. In this placement it must not: on the
+  # ROV in placement a it would hold the camera hellion needs.
+  log "Removing eeye.service: in placement $PLACEMENT eeye does not run on the $ROLE"
+  systemctl disable --now eeye >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/eeye.service
+fi
 systemctl daemon-reload
-systemctl enable --now eeye
 
-log "Done"
+printf 'ROLE=%s\nPLACEMENT=%s\n' "$ROLE" "$PLACEMENT" > "$STATE_FILE"
+
+# --- Tether network (topside, only when asked) -----------------------------------
+#
+# BlueROV addressing: topside 192.168.2.1, ROV 192.168.2.2, both /24, set by
+# hand (there is no DHCP server on a tether). ipv6 link-local as well, which
+# needs no server either: with every address family satisfied,
+# NetworkManager keeps the connection up instead of tearing it down to
+# retry a DHCP that will never answer.
+setup_tether() {
+  local ifname="$1"
+  if ! command -v nmcli >/dev/null 2>&1 || ! nmcli -t general status >/dev/null 2>&1; then
+    warn "NetworkManager is not available, so $ifname was left alone. Give \
+it 192.168.2.1/24 by hand (with your distro's network config, so it survives \
+a reboot)."
+    return 0
+  fi
+  if nmcli -t -f NAME connection show | grep -qx hellion-tether; then
+    nmcli connection modify hellion-tether connection.interface-name "$ifname" \
+      ipv4.method manual ipv4.addresses 192.168.2.1/24 ipv6.method link-local
+  else
+    nmcli connection add type ethernet con-name hellion-tether ifname "$ifname" \
+      ipv4.method manual ipv4.addresses 192.168.2.1/24 ipv6.method link-local \
+      connection.autoconnect yes connection.autoconnect-priority 50 >/dev/null
+  fi
+  log "NetworkManager profile 'hellion-tether': $ifname = 192.168.2.1/24"
+  # Activating drops whatever is up on that interface now, which may be
+  # the very connection this script is running over.
+  local state
+  state=$(nmcli -t -f GENERAL.STATE device show "$ifname" 2>/dev/null | cut -d: -f2-)
+  case "$state" in
+    100*) warn "$ifname is connected now, so the new profile was not \
+activated (that could cut off this session). It applies on the next replug \
+or reboot, or now with: nmcli connection up hellion-tether" ;;
+    *) nmcli connection up hellion-tether >/dev/null 2>&1 ||
+         log "$ifname is not up yet; the profile applies when the tether is plugged in" ;;
+  esac
+}
+[ -n "$TETHER_IF" ] && setup_tether "$TETHER_IF"
+
+# --- Start ---------------------------------------------------------------------
+
+log "Starting the services"
+units="hellion"
+[ "$RUN_EEYE" -eq 1 ] && units="eeye hellion"
+# shellcheck disable=SC2086
+systemctl enable $units >/dev/null 2>&1
+# restart, not start: on a re-run they are already running the old binaries.
+# shellcheck disable=SC2086
+systemctl restart $units
+sleep 3
+for u in $units; do
+  if systemctl is-active --quiet "$u"; then
+    log "$u is running"
+  else
+    warn "$u is not running: see journalctl -u $u"
+  fi
+done
+
+if [ "$ROLE" = topside ]; then
+  where="Page:      http://localhost:8080 (or this machine's address, port 8080)
+  QGC:       video arrives on UDP 5600 (QGC's default)"
+  [ "$NEED_LOOPBACK" -eq 1 ] && where="$where
+  Webcam:    /dev/video10, for OBS or a browser"
+  addr="If the ROV is not at 192.168.2.2, change \"peer\" in /etc/hellion/hellion.json."
+else
+  where="Control:   port 8091 (the topside page reaches this ROV through it)"
+  addr="If topside is not at 192.168.2.1, change the rtp: sink in /etc/hellion/hellion.json."
+fi
+eeye_lines=""
+[ "$RUN_EEYE" -eq 1 ] && eeye_lines="
+  Effects:   /var/lib/eeye/effects.json (live; the topside page edits it)
+  eeye logs: journalctl -u eeye -f"
+
 cat <<EOF
 
-Electric Eye is installed and running as a systemd service.
+Installed: $ROLE, placement $PLACEMENT.
 
-  Status:  systemctl status eeye
-  Logs:    journalctl -u eeye -f
-  Config:  edit $SCRIPT_DIR/eeye_config.json -- changes apply live, no restart needed
-  Camera:  point another app at /dev/video10 to view the effects feed
-  Tether:  the wired interface now keeps an IPv6 link-local address even
-           with no DHCP server, which is what topside discovery uses.
-           Run the same setup on the TOPSIDE machine -- 'tools/eeye-net fix'
-           prints the command for it.
+  Dashboard: hellion top        Pre-dive: hellion check
+  Logs:      journalctl -u hellion -f
+  Config:    /etc/hellion/hellion.json (restart hellion after editing)$eeye_lines
+  $where
 
-If you weren't already in the 'video' group before this install, log out
-and back in (or reboot) before running 'eeye' by hand from a terminal --
-the systemd service itself doesn't need that, since it picks up group
-membership fresh on every start.
+$addr
+Install the other end of the tether with: --role $([ "$ROLE" = rov ] && echo topside || echo rov) --placement $PLACEMENT
 EOF
+if [ "$WAS_IN_VIDEO" -eq 0 ]; then
+  echo "$TARGET_USER was just added to 'video': log out and back in before running 'hellion top'."
+fi

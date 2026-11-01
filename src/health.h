@@ -5,8 +5,8 @@
 
 /*
  * Runtime health, written periodically to "<config_path>.health" for a
- * remote operator to read (pi/config_agent.py relays it; see its /health
- * endpoint).
+ * remote operator to read (hellion serves it, with its age, as /api/drone
+ * and in /health).
  *
  * This exists because the drone knows things topside cannot infer. Chief
  * among them: whether recording is actually still running. When a disk

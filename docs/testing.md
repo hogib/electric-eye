@@ -15,7 +15,6 @@
 | `canny` | Canny behavior |
 | `effect_chain` | LUT fusion against an independent reference; chroma skipping, role swaps |
 | `recorder` | Recording thread: file contents, ordering, a stalled disk (FIFO) never blocking |
-| `stream_server` | Preview thread: complete JPEGs, a viewer that never reads gets dropped, offers never block |
 | `camera_ctrl` | Range scaling, unit conversion, rpicam argv |
 | `health` | Health file contents and escaping |
 | `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group, stderr on its own pipe |
@@ -23,8 +22,6 @@
 | `http` | HTTP request/response parsing case by case (every refusal: bare LF, folding, Transfer-Encoding, conflicting lengths, oversize, control bytes); server and client over a socket, with 400/413/431 and truncation |
 | `hellion` | Config parsing and errors, and the shipped example configs; pipelines driven end to end over the bus (byte-exact forwarding, size changes, a failing sink not starving its neighbour, a missing source); the UDP relay (forwarding, loss, late packets, SSRC change, wrap-around); an RTP round trip checking colour range (skipped without ffmpeg); the status file; log capture |
 | `fbus` | Frame bus across real processes: whole frames under a writer lapping the ring (and a deterministic lap), several readers, futex wake-up, writer restart, a killed writer detected by its heartbeat, bad files |
-| `topside` | Python: link staleness, health relay, recorder |
-| `record` | Python: duration parsing, ffmpeg command construction |
 
 ## Fuzzing
 
@@ -175,7 +172,8 @@ setting values through `eeye` and reading them back with `v4l2-ctl` — brightne
    any extra `.c` files it needs.
 3. `make check` (or `make check-<name>` for just that suite).
 
-Python suites are registered separately near the bottom of the `Makefile` as
-`check-topside` / `check-record`, and run with `$(PYTHON)` (default `python3`); they
-are skipped where it isn't installed. They fall back to IPv4 loopback where IPv6 loopback is
-unavailable, so they run in containers rather than being silently skipped.
+`install.sh` has no suite. It was checked by running it in a user namespace
+(`unshare --user --map-root-user --mount`) with owned copies of `/etc`, `/var/lib` and
+`/usr/local/bin` bind-mounted over the real ones and `systemctl`, `apt-get`, `useradd`,
+`nmcli` and friends replaced by stubs that log their arguments, then reading the files
+it wrote; `systemd-analyze verify` on the installed units.

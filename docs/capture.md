@@ -183,8 +183,8 @@ rpicam_in: capturing raw yuv420 at 1280x720 (1382400 bytes per frame; no JPEG en
 ```
 
 `rpicam_jpeg_quality` is a compile-time constant (93) in `rpicam_in.c`. It is the
-*capture* quality feeding the whole pipeline in MJPEG mode — distinct from
-`stream_quality`, which only affects the preview.
+*capture* quality feeding the whole pipeline in MJPEG mode, so it is set well above
+what a preview would use: compression damage here is in every output.
 
 ### Frame framing
 

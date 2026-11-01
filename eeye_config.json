@@ -3,7 +3,5 @@
     {"effect": "blur"},
     {"effect": "sobel"}
   ],
-  "record_path": "",
-  "stream_frame_interval": 3,
-  "stream_quality": 60
+  "record_path": ""
 }

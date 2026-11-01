@@ -165,30 +165,6 @@ typedef struct {
   // alone; see camera_ctrl.h for why that is a sentinel rather than 0.
   CameraControls camera;
 
-  // Bypass the effect chain for the *preview stream only*: send the
-  // untouched camera frame instead of the processed one. The virtual
-  // camera and the recording tap are unaffected.
-  //
-  // This answers the question an operator cannot otherwise answer from
-  // topside -- "is that thing in the water real, or is it my filter?" --
-  // without having to edit and re-apply the whole chain to find out, and
-  // then edit it back. Hot-reloadable like everything else here, so it is
-  // a toggle rather than a reconfiguration.
-  bool stream_raw;
-
-  // Live-preview stream tap (see stream_server.h): every Nth post-effects
-  // frame is JPEG-encoded and sent to whichever viewer is currently
-  // connected. 0 means the tap is off -- no JPEG work happens at all, not
-  // even for a connected viewer. This is a lossy, throttled preview only;
-  // record_path above is the untouched, full-quality copy.
-  uint8_t stream_frame_interval;
-
-  // JPEG quality (1-100) for the stream tap above; meaningless when
-  // stream_frame_interval is 0. Parsed as a plain 0-255 byte like every
-  // other u8 config field, but values above 100 are clamped by turbojpeg
-  // itself, so this field doesn't separately validate that range.
-  uint8_t stream_quality;
-
   // --- Geometry: the one group of fields here that is NOT hot-reloadable ---
   //
   // Read once, at startup, by config_load_once(); the running pipeline
@@ -273,10 +249,7 @@ typedef struct {
  *       {"effect": "tint", "tint_u": 90, "tint_v": 150, "tint_strength": 180}
  *     ],
  *     "record_path": "/opt/electric-eye/recordings/session.raw",
- *     "stream_frame_interval": 3,
- *     "stream_raw": false,
  *     "camera": {"auto_exposure": false, "exposure": 25000},
- *     "stream_quality": 60,
  *     "capture_width": 1280,
  *     "capture_height": 720,
  *     "downscale": 2,
@@ -312,13 +285,9 @@ typedef struct {
  * out leaves that control as the camera had it. These are hot-reloadable.
  * See camera_ctrl.h for the units and ranges, which are deliberately
  * device-independent so one config works on both capture backends.
- * "stream_raw" is optional (default false); true sends the untouched
- * camera frame to the preview stream instead of the processed one, leaving
- * the virtual camera and recording untouched.
- * "stream_frame_interval" is optional (default 0, meaning the live-preview
- * stream tap -- see stream_server.h -- is off); N sends every Nth
- * post-effects frame to whoever is currently connected. "stream_quality" is
- * optional (default 60), the JPEG quality (1-100) used for that tap.
+ * The old preview keys "stream_raw", "stream_frame_interval" and
+ * "stream_quality" are accepted and ignored (logged once): the preview is
+ * hellion's now, and a config written before that must still load.
  * "capture_width"/"capture_height" (default 1280x720) and "downscale"
  * (default 1; must be 1, 2, 4, or 8) are the geometry fields -- unlike
  * everything above, they only take effect at startup, and a reload that
@@ -348,8 +317,8 @@ typedef struct {
  * sibling file "<path>.status" is written (same atomic rename contract as
  * above) containing a single line: {"ok":true} if that attempt's config
  * is now what's running, {"ok":false} if it was rejected and the previous
- * config is still active. This exists for a remote writer (e.g.
- * pi/config_agent.py) that has no other way to know whether what it just
+ * config is still active. This exists for a remote writer (hellion, for
+ * the page) that has no other way to know whether what it just
  * wrote actually took effect -- the detailed reason for a rejection is
  * only ever on this process's own stdout/journalctl, not in the status
  * file, to avoid needing a second place that must agree with parse_config()

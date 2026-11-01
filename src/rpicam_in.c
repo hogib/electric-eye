@@ -14,11 +14,10 @@
 #include <sys/wait.h>
 
 // JPEG quality handed to rpicam-vid. This is the *capture* quality, well
-// above the preview tap's default (stream_quality, 60) because everything
-// downstream -- the effect chain, the recording tap, the virtual camera --
+// above what a preview would use, because everything downstream -- the
+// effect chain, the recording tap, the virtual camera, the frame bus --
 // sees only what arrives here. Compression artifacts introduced at this
-// point are permanent; the preview can afford them because it is a
-// throwaway copy, this cannot.
+// point are permanent.
 static const unsigned rpicam_jpeg_quality = 93;
 
 // Upper bound on one buffered JPEG. A 4:2:0 frame at quality 93 runs a few

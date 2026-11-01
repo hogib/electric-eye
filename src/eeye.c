@@ -46,12 +46,6 @@ static char bus_raw[max_stream_name_len];
 // (see ProducerArgs.restart_needed); main() then exits non-zero.
 static bool restart_needed = false; // atomic (see compat.h)
 
-// Live-preview stream tap (see stream_server.h). Off by default (Config's
-// stream_frame_interval starts at 0); this is only the port it listens on
-// once a config turns it on. An enum, not a const variable, because
-// cons_args' static initializer below needs a constant expression.
-enum { stream_server_port = 9000 };
-
 // Frames in circulation. Not the ring capacity (31): every frame in the
 // pool can be queued in front of the virtual camera at once, so this is
 // also the worst-case backlog between the camera and what the pilot sees --
@@ -119,7 +113,6 @@ ConsumerArgs cons_args = {
     .is_running = &is_running,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
-    .stream_port = stream_server_port,
 };
 
 StatsArgs stats_args = {
@@ -394,9 +387,13 @@ int main(int argc, char **argv) {
            "disabled.\n");
   }
 
-  printf("Pipeline running. Capturing from camera -> virtual cam...\n");
-  printf("Point another app (browser, Zoom, etc.) at the virtual camera "
-         "device to view the live feed.\n");
+  // Says what this run actually does: the virtual camera is off in every
+  // installed setup (hellion writes the loopback device topside).
+  bool from_bus = startup_config.capture_source == CAPTURE_BUS;
+  printf("Pipeline running: %s %s -> effects -> bus \"%s\" (raw: \"%s\"), "
+         "virtual camera %s\n",
+         from_bus ? "bus" : "camera", from_bus ? capture_stream : capture_device,
+         bus_pilot, bus_raw, output_device[0] ? output_device : "off");
 
   pthread_join(producer, NULL);
   pthread_join(worker, NULL);
