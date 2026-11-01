@@ -1,8 +1,9 @@
 {
   "name": "topside",
   "role": "topside",
+  "placement": "a",
   "control": "8080",
-  "peer": "192.168.2.2:8091",
+  "peer": "auto",
   "camera_controls": "peer",
   "preview": "pilot",
   "eeye_config": "/var/lib/eeye/effects.json",

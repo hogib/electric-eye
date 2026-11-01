@@ -13,14 +13,20 @@
 #                              up (where autonomy will run)
 #                        Both ends must be installed with the same placement.
 #   --tether IFACE       topside only: give IFACE the BlueROV topside address,
-#                        192.168.2.1/24, with NetworkManager. Without it the
-#                        network is left alone.
-#   --topside-ip IP      the topside machine's address (default 192.168.2.1,
-#   --rov-ip IP          the ROV's (default 192.168.2.2) -- the BlueROV's own.
-#                        Give both on both machines when they are anything
-#                        else (two machines on a LAN, say): they are written
-#                        into /etc/hellion/hellion.json (the old one is kept as
-#                        .bak) and remembered for later runs.
+#                        192.168.2.1/24 (or --topside-ip's), with
+#                        NetworkManager. Without it the network is left alone.
+#
+#   The two ends find each other on the network by themselves (hellion's
+#   discovery: see docs/hellion.md), so no addresses are needed. To pin
+#   them instead -- discovery cannot reach across a router, say:
+#   --topside-ip IP      the topside machine's address, which the ROV sends to
+#   --rov-ip IP          the ROV's, which the topside talks to
+#                        Written into /etc/hellion/hellion.json (the old one
+#                        kept as .bak) and remembered for later runs.
+#   --pair NAME          only pair with a hellion installed with the same NAME
+#                        (default "default"). Give each vehicle its own when
+#                        several share a network. Not a password: anyone on
+#                        the network can use any name.
 #   --reset-config       replace /etc/hellion/hellion.json (and eeye's
 #                        effects config) with fresh ones; the old files are
 #                        kept as *.bak
@@ -55,6 +61,7 @@ PLACEMENT=""
 TETHER_IF=""
 TOPSIDE_IP=""
 ROV_IP=""
+PAIR=""
 RESET_CONFIG=0
 INSTALL_PACKAGES=1
 # The value after an option, or a clear error when there is none.
@@ -71,17 +78,20 @@ while [ $# -gt 0 ]; do
     --topside-ip=*) TOPSIDE_IP="${1#*=}"; shift ;;
     --rov-ip) need_value "$@"; ROV_IP="$2"; shift 2 ;;
     --rov-ip=*) ROV_IP="${1#*=}"; shift ;;
+    --pair) need_value "$@"; PAIR="$2"; shift 2 ;;
+    --pair=*) PAIR="${1#*=}"; shift ;;
     --reset-config) RESET_CONFIG=1; shift ;;
     --no-packages) INSTALL_PACKAGES=0; shift ;;
-    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
 
 # A re-run reuses the last install's choices for whatever it is not given.
 # Read as data, not sourced: it is only ever KEY=value lines.
+# Addresses or a pair given now rewrite hellion.json (see put_config).
 ADDRS_GIVEN=0
-[ -n "$TOPSIDE_IP$ROV_IP" ] && ADDRS_GIVEN=1
+[ -n "$TOPSIDE_IP$ROV_IP$PAIR" ] && ADDRS_GIVEN=1
 if [ -r "$STATE_FILE" ]; then
   prev() { sed -n "s/^$1=//p" "$STATE_FILE" | head -1; }
   if [ -z "$ROLE$PLACEMENT" ]; then
@@ -91,15 +101,20 @@ if [ -r "$STATE_FILE" ]; then
   fi
   [ -n "$TOPSIDE_IP" ] || TOPSIDE_IP=$(prev TOPSIDE_IP)
   [ -n "$ROV_IP" ] || ROV_IP=$(prev ROV_IP)
+  [ -n "$PAIR" ] || PAIR=$(prev PAIR)
 fi
-TOPSIDE_IP=${TOPSIDE_IP:-192.168.2.1}
-ROV_IP=${ROV_IP:-192.168.2.2}
+# No addresses: the ends find each other (discovery). Given, they pin it.
 for ip in "$TOPSIDE_IP" "$ROV_IP"; do
+  [ -z "$ip" ] && continue
   echo "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' ||
     die "\"$ip\" is not an IPv4 address like 192.168.2.1 (hostnames do not \
 work here: the release binaries are static and cannot look them up)"
 done
-[ "$TOPSIDE_IP" != "$ROV_IP" ] || die "--topside-ip and --rov-ip are the same address"
+[ -z "$TOPSIDE_IP" ] || [ "$TOPSIDE_IP" != "$ROV_IP" ] ||
+  die "--topside-ip and --rov-ip are the same address"
+PAIR=${PAIR:-default}
+echo "$PAIR" | grep -Eq '^[A-Za-z0-9_-]{1,31}$' ||
+  die "--pair must be a name: letters, digits, '-' and '_', up to 31"
 
 case "$ROLE" in rov|topside) ;; *) die "--role must be rov or topside (try --help)" ;; esac
 case "$PLACEMENT" in a|b) ;; *) die "--placement must be a or b (try --help)" ;; esac
@@ -254,10 +269,18 @@ put_config() {
 }
 
 install -d -m 0755 /etc/hellion
-# The examples use the BlueROV's addresses; the ones given replace them.
-put_config /etc/hellion/hellion.json \
-  "$(sed -e "s/192\.168\.2\.1:/$TOPSIDE_IP:/g" -e "s/192\.168\.2\.2:/$ROV_IP:/g" \
-     "$SCRIPT_DIR/hellion/examples/$PLACEMENT-$ROLE.json")" root:root 0644 "$ADDRS_GIVEN"
+# The examples find the other end by discovery ("auto"); a pinned address
+# replaces that, and a pair other than the default is added.
+hellion_json() {
+  local sedargs=()
+  [ -n "$ROV_IP" ] && sedargs+=(-e "s/\"peer\": \"auto\"/\"peer\": \"$ROV_IP:8091\"/")
+  [ -n "$TOPSIDE_IP" ] && sedargs+=(-e "s/rtp:auto:/rtp:$TOPSIDE_IP:/g")
+  [ "$PAIR" != default ] &&
+    sedargs+=(-e "s/^\(  \"role\": \"[a-z]*\",\)\$/\1\n  \"pair\": \"$PAIR\",/")
+  sedargs+=(-e "")
+  sed "${sedargs[@]}" "$SCRIPT_DIR/hellion/examples/$PLACEMENT-$ROLE.json"
+}
+put_config /etc/hellion/hellion.json "$(hellion_json)" root:root 0644 "$ADDRS_GIVEN"
 if [ -e /etc/hellion/hellion.json ] &&
    ! grep -q "\"role\": *\"$ROLE\"" /etc/hellion/hellion.json; then
   warn "/etc/hellion/hellion.json is not a $ROLE config. It was kept; \
@@ -300,8 +323,8 @@ elif [ -e /etc/systemd/system/eeye.service ]; then
 fi
 systemctl daemon-reload
 
-printf 'ROLE=%s\nPLACEMENT=%s\nTOPSIDE_IP=%s\nROV_IP=%s\n' "$ROLE" "$PLACEMENT" \
-  "$TOPSIDE_IP" "$ROV_IP" > "$STATE_FILE"
+printf 'ROLE=%s\nPLACEMENT=%s\nTOPSIDE_IP=%s\nROV_IP=%s\nPAIR=%s\n' "$ROLE" \
+  "$PLACEMENT" "$TOPSIDE_IP" "$ROV_IP" "$PAIR" > "$STATE_FILE"
 
 # --- Tether network (topside, only when asked) -----------------------------------
 #
@@ -314,19 +337,19 @@ setup_tether() {
   local ifname="$1"
   if ! command -v nmcli >/dev/null 2>&1 || ! nmcli -t general status >/dev/null 2>&1; then
     warn "NetworkManager is not available, so $ifname was left alone. Give \
-it $TOPSIDE_IP/24 by hand (with your distro's network config, so it survives \
+it ${TOPSIDE_IP:-192.168.2.1}/24 by hand (with your distro's network config, so it survives \
 a reboot)."
     return 0
   fi
   if nmcli -t -f NAME connection show | grep -qx hellion-tether; then
     nmcli connection modify hellion-tether connection.interface-name "$ifname" \
-      ipv4.method manual ipv4.addresses "$TOPSIDE_IP/24" ipv6.method link-local
+      ipv4.method manual ipv4.addresses "${TOPSIDE_IP:-192.168.2.1}/24" ipv6.method link-local
   else
     nmcli connection add type ethernet con-name hellion-tether ifname "$ifname" \
-      ipv4.method manual ipv4.addresses "$TOPSIDE_IP/24" ipv6.method link-local \
+      ipv4.method manual ipv4.addresses "${TOPSIDE_IP:-192.168.2.1}/24" ipv6.method link-local \
       connection.autoconnect yes connection.autoconnect-priority 50 >/dev/null
   fi
-  log "NetworkManager profile 'hellion-tether': $ifname = $TOPSIDE_IP/24"
+  log "NetworkManager profile 'hellion-tether': $ifname = ${TOPSIDE_IP:-192.168.2.1}/24"
   # The profile outranks the interface's other profiles (priority 50), so
   # on the next connect it wins. Right for a port that is the tether; wrong
   # for one that is also the machine's LAN.
@@ -379,11 +402,17 @@ if [ "$ROLE" = topside ]; then
   QGC:       video arrives on UDP 5600 (QGC's default)"
   [ "$NEED_LOOPBACK" -eq 1 ] && where="$where
   Webcam:    /dev/video10, for OBS or a browser"
-  addr="Addresses: this machine $TOPSIDE_IP, the ROV $ROV_IP (--topside-ip/--rov-ip change them)."
+  [ -n "$ROV_IP" ] && addr="The ROV: pinned at $ROV_IP." ||
+    addr="The ROV: found on the network by itself (pair \"$PAIR\"); hellion top shows it."
 else
   where="Control:   port 8091 (the topside page reaches this ROV through it)"
-  addr="Addresses: this machine $ROV_IP, topside $TOPSIDE_IP (--topside-ip/--rov-ip change them)."
+  [ -n "$TOPSIDE_IP" ] && addr="Topside: pinned at $TOPSIDE_IP." ||
+    addr="Topside: found on the network by itself (pair \"$PAIR\"); hellion top shows it."
 fi
+other="--role $([ "$ROLE" = rov ] && echo topside || echo rov) --placement $PLACEMENT"
+[ "$PAIR" != default ] && other="$other --pair $PAIR"
+[ -n "$TOPSIDE_IP" ] && other="$other --topside-ip $TOPSIDE_IP"
+[ -n "$ROV_IP" ] && other="$other --rov-ip $ROV_IP"
 eeye_lines=""
 [ "$RUN_EEYE" -eq 1 ] && eeye_lines="
   Effects:   /var/lib/eeye/effects.json (live; the topside page edits it)
@@ -399,7 +428,7 @@ Installed: $ROLE, placement $PLACEMENT.
   $where
 
 $addr
-Install the other end with: --role $([ "$ROLE" = rov ] && echo topside || echo rov) --placement $PLACEMENT --topside-ip $TOPSIDE_IP --rov-ip $ROV_IP
+Install the other end with: $other
 EOF
 if [ "$WAS_IN_VIDEO" -eq 0 ]; then
   echo "$TARGET_USER was just added to 'video': log out and back in before running 'hellion top'."

@@ -1,8 +1,9 @@
 {
   "name": "topside",
   "role": "topside",
+  "placement": "b",
   "control": "8080",
-  "peer": "192.168.2.2:8091",
+  "peer": "auto",
   "preview": "pilot",
   "pipelines": [
     {"name": "pilot-in", "source": "rtp:5610",
