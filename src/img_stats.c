@@ -11,21 +11,42 @@ void img_stats_compute(const uint8_t *const planes[3], uint32_t width,
   memset(out, 0, sizeof *out);
   int64_t sum_u = 0, sum_v = 0, sum_y = 0;
   uint32_t n_chroma = 0;
+  const uint32_t rows = (height + 1) / 2;
   // I422: chroma is half width, full height, so luma column x pairs with
   // chroma column x/2. Even x only, so every sample has its own chroma.
-  for (uint32_t y = 0; y < height; y += 2) {
-    const uint8_t *yr = planes[0] + (size_t)y * stride[0];
-    const uint8_t *ur = planes[1] + (size_t)y * stride[1];
-    const uint8_t *vr = planes[2] + (size_t)y * stride[2];
-    for (uint32_t x = 0; x < width; x += 2) {
-      uint8_t l = yr[x];
-      out->hist[l]++;
-      if (l >= chroma_min_luma && l <= chroma_max_luma) {
-        sum_u += (int)ur[x / 2] - 128;
-        sum_v += (int)vr[x / 2] - 128;
-        sum_y += l;
-        n_chroma++;
+  // Each thread counts into its own histogram and sums; merged at the end
+  // (integers, so the result does not depend on the split).
+#pragma omp parallel
+  {
+    uint32_t hist[256];
+    int64_t su = 0, sv = 0, sy = 0;
+    uint32_t nc = 0;
+    memset(hist, 0, sizeof hist);
+#pragma omp for schedule(static) nowait
+    for (uint32_t r = 0; r < rows; r++) {
+      uint32_t y = 2 * r;
+      const uint8_t *yr = planes[0] + (size_t)y * stride[0];
+      const uint8_t *ur = planes[1] + (size_t)y * stride[1];
+      const uint8_t *vr = planes[2] + (size_t)y * stride[2];
+      for (uint32_t x = 0, c = 0; x < width; x += 2, c++) {
+        uint32_t l = yr[x];
+        hist[l]++;
+        if (l >= chroma_min_luma && l <= chroma_max_luma) {
+          su += (int)ur[c] - 128;
+          sv += (int)vr[c] - 128;
+          sy += l;
+          nc++;
+        }
       }
+    }
+#pragma omp critical(img_stats_merge)
+    {
+      for (int v = 0; v < 256; v++)
+        out->hist[v] += hist[v];
+      sum_u += su;
+      sum_v += sv;
+      sum_y += sy;
+      n_chroma += nc;
     }
   }
   out->samples = ((height + 1) / 2) * ((width + 1) / 2);

@@ -205,11 +205,18 @@ the health file.
 Per frame: targets from the statistics (stretch percentiles, a gamma for the median,
 the cast to remove beyond a deadband), smoothed toward with a time constant on
 *capture* time, so the response is the same at 15fps as at 60; a gap of over a second
-restarts from the current frame. Then one luma pass applies the global LUT and counts a
-histogram per CLAHE tile (bands of tile rows run in parallel, each owning its tiles'
-counters); tile mappings are built with the clip limit and smoothed too; a second luma
-pass maps each pixel through its four nearest tiles, bilinearly; a chroma pass removes
-the cast in proportion to the luma under each chroma sample and lifts saturation.
+restarts from the current frame. Then: a read-only histogram of the *source* luma per
+CLAHE tile (one tile per parallel iteration, four interleaved counters so flat water
+does not serialise on one bin); each tile's mapping built from that histogram pushed
+through the global LUT — the corrected picture's histogram, without writing the
+corrected picture — clipped, smoothed, and then composed with the global LUT so one
+table does both; one luma pass mapping each source pixel through its two nearest
+tile-rows' tables, blended once per row so a pixel costs two lookups instead of four;
+and a chroma pass that removes the cast in proportion to the luma under each chroma
+sample and lifts saturation. All in one OpenMP parallel region. The output is
+byte-identical to the straightforward version it replaced (same hash over every frame
+of the synthetic sets, on x86 and under qemu for both ARMs), at 2.2× the speed on one
+thread and 2.7× on four: 0.55ms per 720p frame on four x86 cores, down from 1.5ms.
 
 Every tuning constant is at the top of `auto_vis.c` with the reason for its value; the
 values are starting points from synthetic frames and a webcam, to be re-tuned on real

@@ -186,41 +186,56 @@ static Targets targets_for(const ImgStats *s) {
   return t;
 }
 
-// Luma: global stretch + gamma, into dst, counting each tile's histogram of
-// the result on the way.
-static void luma_global(AutoVis *av, const uint8_t *src, uint8_t *dst,
-                        size_t stride, const uint8_t lut[256]) {
-  memset(av->tile_hist, 0, (size_t)av->tx * av->ty * 256 * sizeof *av->tile_hist);
-  // One band of tile rows per iteration: each band owns its tiles'
-  // histograms, so the bands can run in parallel without sharing a counter.
-#pragma omp parallel for schedule(static)
-  for (uint32_t band = 0; band < av->ty; band++) {
-    uint32_t y0 = (uint32_t)((uint64_t)av->h * band / av->ty);
-    uint32_t y1 = (uint32_t)((uint64_t)av->h * (band + 1) / av->ty);
-    uint32_t *hist_row = av->tile_hist + (size_t)band * av->tx * 256;
+// Each tile's histogram of the source luma (read only). The histogram of
+// the globally corrected picture is this one pushed through the global LUT
+// (see build_tile_luts), so nothing has to be written to get it.
+static void luma_global(AutoVis *av, const uint8_t *src, size_t stride) {
+  const uint32_t tx = av->tx, ty = av->ty, w = av->w, h = av->h;
+  uint32_t *const hists = av->tile_hist;
+#pragma omp for schedule(static)
+  for (uint32_t i = 0; i < tx * ty; i++) {
+    uint32_t band = i / tx, t = i % tx;
+    uint32_t y0 = (uint32_t)((uint64_t)h * band / ty);
+    uint32_t y1 = (uint32_t)((uint64_t)h * (band + 1) / ty);
+    uint32_t x0 = (uint32_t)((uint64_t)w * t / tx);
+    uint32_t x1 = (uint32_t)((uint64_t)w * (t + 1) / tx);
+    // Four interleaved counters, so runs of one level (flat water) do not
+    // serialise on one counter's load-increment-store.
+    uint32_t hh[4][256];
+    memset(hh, 0, sizeof hh);
     for (uint32_t y = y0; y < y1; y++) {
       const uint8_t *s = src + (size_t)y * stride;
-      uint8_t *d = dst + (size_t)y * stride;
-      for (uint32_t t = 0; t < av->tx; t++) {
-        uint32_t x0 = (uint32_t)((uint64_t)av->w * t / av->tx);
-        uint32_t x1 = (uint32_t)((uint64_t)av->w * (t + 1) / av->tx);
-        uint32_t *hist = hist_row + (size_t)t * 256;
-        for (uint32_t x = x0; x < x1; x++) {
-          uint8_t v = lut[s[x]];
-          d[x] = v;
-          hist[v]++;
-        }
+      uint32_t x = x0;
+      for (; x + 4 <= x1; x += 4) {
+        hh[0][s[x]]++;
+        hh[1][s[x + 1]]++;
+        hh[2][s[x + 2]]++;
+        hh[3][s[x + 3]]++;
       }
+      for (; x < x1; x++)
+        hh[0][s[x]]++;
     }
+    uint32_t *hist = hists + (size_t)i * 256;
+    for (int v = 0; v < 256; v++)
+      hist[v] = hh[0][v] + hh[1][v] + hh[2][v] + hh[3][v];
   }
 }
 
 // Each tile's clipped-histogram mapping, smoothed over time, blended with
 // the identity by local_strength.
-static void build_tile_luts(AutoVis *av, double alpha) {
-  size_t tiles = (size_t)av->tx * av->ty;
+static void build_tile_luts(AutoVis *av, double alpha, const uint8_t lut[256]) {
+  const size_t tiles = (size_t)av->tx * av->ty;
+  const bool primed = av->tiles_primed;
+#pragma omp for schedule(static)
   for (size_t t = 0; t < tiles; t++) {
-    const uint32_t *hist = av->tile_hist + t * 256;
+    // The corrected picture's histogram: the source's through lut.
+    uint32_t hist[256];
+    {
+      const uint32_t *sh = av->tile_hist + t * 256;
+      memset(hist, 0, sizeof hist);
+      for (int v = 0; v < 256; v++)
+        hist[lut[v]] += sh[v];
+    }
     uint64_t n = 0;
     for (int v = 0; v < 256; v++)
       n += hist[v];
@@ -228,7 +243,7 @@ static void build_tile_luts(AutoVis *av, double alpha) {
     uint8_t *lu = av->tile_lut + t * 256;
     if (n == 0) {
       for (int v = 0; v < 256; v++)
-        lu[v] = (uint8_t)v;
+        lu[v] = lut[v];
       continue;
     }
     // Clip each bin at clip_limit times a flat histogram's height and
@@ -248,78 +263,125 @@ static void build_tile_luts(AutoVis *av, double alpha) {
       double target = (cum + h / 2) * 255.0 / (double)n;
       cum += h;
       double mixed = local_strength * target + (1 - local_strength) * v;
-      lf[v] = av->tiles_primed ? (float)(lf[v] + alpha * (mixed - lf[v]))
-                               : (float)mixed;
-      lu[v] = clamp_u8((int)lround(lf[v]));
+      lf[v] = primed ? (float)(lf[v] + alpha * (mixed - lf[v])) : (float)mixed;
+      // lf >= 0 and a float: + 0.5 is exact in double, so this is lround.
+      lu[v] = clamp_u8((int)((double)lf[v] + 0.5));
     }
-  }
-  av->tiles_primed = true;
-}
-
-// Luma, in place: each pixel through the four nearest tiles' mappings,
-// blended by distance to their centres.
-static void luma_local(AutoVis *av, uint8_t *y_plane, size_t stride) {
-  const uint32_t tx = av->tx;
-#pragma omp parallel for schedule(static)
-  for (uint32_t y = 0; y < av->h; y++) {
-    uint8_t *row = y_plane + (size_t)y * stride;
-    uint32_t t0 = av->row_t[y];
-    uint32_t t1 = t0 + 1 < av->ty ? t0 + 1 : t0;
-    uint32_t wy = av->row_w[y];
-    const uint8_t *top = av->tile_lut + (size_t)t0 * tx * 256;
-    const uint8_t *bot = av->tile_lut + (size_t)t1 * tx * 256;
-    for (uint32_t x = 0; x < av->w; x++) {
-      uint32_t c0 = av->col_t[x];
-      uint32_t c1 = c0 + 1 < tx ? c0 + 1 : c0;
-      uint32_t wx = av->col_w[x];
-      uint8_t v = row[x];
-      uint32_t a = top[c0 * 256 + v], b = top[c1 * 256 + v];
-      uint32_t c = bot[c0 * 256 + v], d = bot[c1 * 256 + v];
-      uint32_t upper = a * (256 - wx) + b * wx;
-      uint32_t lower = c * (256 - wx) + d * wx;
-      row[x] = (uint8_t)((upper * (256 - wy) + lower * wy + 32768) >> 16);
-    }
+    // Fold the global LUT in: local(global(v)).
+    uint8_t tmp[256];
+    for (int v = 0; v < 256; v++)
+      tmp[v] = lu[lut[v]];
+    memcpy(lu, tmp, sizeof tmp);
   }
 }
 
 // Chroma: remove the cast in proportion to brightness, then boost
 // saturation. Brightness is the source luma under each chroma sample (the
 // mean of the two pixels it covers in I422).
-static void chroma(const AutoVis *av, const uint8_t *const src[3],
-                   uint8_t *const dst[3], const size_t stride[3],
-                   double ref_luma) {
-  // Shift per source luma level, in chroma units.
-  int shift_u[256], shift_v[256];
+typedef struct {
+  // off[l]: U offset in the low 16 bits, V in the high, each already
+  // including -128 + span, so sat[s + off] is the output.
+  uint32_t off[256];
+  uint8_t sat[2 * 256 + 1];
+} ChromaTab;
+
+static void chroma_tables(const AutoVis *av, double ref_luma, ChromaTab *ct) {
+  enum { span = 256 };
   for (int l = 0; l < 256; l++) {
     double k = ref_luma > 0 ? clampd(l / ref_luma, 0, 1.5) : 1;
-    shift_u[l] = (int)lround(av->du * k);
-    shift_v[l] = (int)lround(av->dv * k);
+    int su = (int)lround(av->du * k), sv = (int)lround(av->dv * k);
+    su = su < -128 ? -128 : su > 128 ? 128 : su;
+    sv = sv < -128 ? -128 : sv > 128 ? 128 : sv;
+    ct->off[l] = (uint32_t)(su - 128 + span) | (uint32_t)(sv - 128 + span) << 16;
   }
-  // Saturation over every possible offset from neutral after the shift
-  // (|U - 128 + shift| <= 128 + 72).
-  enum { span = 256 };
-  uint8_t sat[2 * span + 1];
   for (int o = -span; o <= span; o++)
-    sat[o + span] = clamp_u8((int)lround(128 + saturation * o));
+    ct->sat[o + span] = clamp_u8((int)lround(128 + saturation * o));
+}
 
-  uint32_t cw = (av->w + 1) / 2;
-#pragma omp parallel for schedule(static)
-  for (uint32_t y = 0; y < av->h; y++) {
-    const uint8_t *ly = src[0] + (size_t)y * stride[0];
-    const uint8_t *su = src[1] + (size_t)y * stride[1];
-    const uint8_t *sv = src[2] + (size_t)y * stride[2];
-    uint8_t *du = dst[1] + (size_t)y * stride[1];
-    uint8_t *dv = dst[2] + (size_t)y * stride[2];
-    for (uint32_t c = 0; c < cw; c++) {
-      uint32_t x = 2 * c;
-      uint32_t l = x + 1 < av->w ? (ly[x] + ly[x + 1] + 1) / 2 : ly[x];
-      int ou = (int)su[c] - 128 + shift_u[l];
-      int ov = (int)sv[c] - 128 + shift_v[l];
-      ou = ou < -span ? -span : ou > span ? span : ou;
-      ov = ov < -span ? -span : ov > span ? span : ov;
-      du[c] = sat[ou + span];
-      dv[c] = sat[ov + span];
+static void chroma_row(const ChromaTab *ct, const uint8_t *ly, const uint8_t *su,
+                       const uint8_t *sv, uint8_t *du, uint8_t *dv, uint32_t w) {
+  const uint32_t pairs = w / 2;
+  const uint8_t *const sat = ct->sat;
+  for (uint32_t c = 0; c < pairs; c++) {
+    uint32_t o = ct->off[(ly[2 * c] + ly[2 * c + 1] + 1) >> 1];
+    du[c] = sat[su[c] + (o & 0xffff)];
+    dv[c] = sat[sv[c] + (o >> 16)];
+  }
+  if (w & 1) {
+    uint32_t o = ct->off[ly[w - 1]];
+    du[pairs] = sat[su[pairs] + (o & 0xffff)];
+    dv[pairs] = sat[sv[pairs] + (o >> 16)];
+  }
+}
+
+// Luma, in place: each pixel through the four nearest tiles' mappings,
+// blended by distance to their centres.
+//
+// Bit-exact with the per-pixel form
+//   ((a*(256-wx) + b*wx)*(256-wy) + (c*(256-wx) + d*wx)*wy + 32768) >> 16
+// which equals, regrouped,
+//   ((a*(256-wy) + c*wy)*(256-wx) + (b*(256-wy) + d*wy)*wx + 32768) >> 16.
+// Columns are walked in segments of constant left tile, so the four LUT
+// pointers are per segment, not per pixel; LOCAL_PREBLEND blends the
+// row's top/bottom LUTs once per row into 16-bit tables (2 gathers/pixel
+// instead of 4).
+static void luma_local(AutoVis *av, const uint8_t *const src[3],
+                       uint8_t *const dst[3], const size_t stride3[3],
+                       const ChromaTab *ct) {
+  const uint8_t *src_plane = src[0];
+  uint8_t *y_plane = dst[0];
+  const size_t stride = stride3[0];
+  const uint32_t tx = av->tx, ty = av->ty, w = av->w, h = av->h;
+  const uint16_t *const col_t = av->col_t, *const col_w = av->col_w;
+  const uint16_t *const row_t = av->row_t, *const row_w = av->row_w;
+  const uint8_t *const luts = av->tile_lut;
+  // seg[k]: first column whose left tile is k (col_t is non-decreasing).
+  uint32_t seg[max_tiles_x + 1];
+  {
+    uint32_t x = 0;
+    for (uint32_t k = 0; k < tx; k++) {
+      seg[k] = x;
+      while (x < w && col_t[x] == k)
+        x++;
     }
+    seg[tx] = w;
+  }
+#pragma omp for schedule(static)
+  for (uint32_t y = 0; y < h; y++) {
+    const uint8_t *in = src_plane + (size_t)y * stride;
+    uint8_t *row = y_plane + (size_t)y * stride;
+    uint32_t t0 = row_t[y];
+    uint32_t t1 = t0 + 1 < ty ? t0 + 1 : t0;
+    uint32_t wy = row_w[y];
+    const uint8_t *top = luts + (size_t)t0 * tx * 256;
+    const uint8_t *bot = luts + (size_t)t1 * tx * 256;
+    uint16_t vb[max_tiles_x * 256];
+    // wy == 0 (and t0 == t1, where wy is 0 too) is the same formula.
+    {
+      const uint16_t iwy = (uint16_t)(256 - wy), wyy = (uint16_t)wy;
+      for (uint32_t k = 0; k < tx; k++) {
+        const uint8_t *tp = top + k * 256, *bp = bot + k * 256;
+        uint16_t *o = vb + k * 256;
+        for (int i = 0; i < 256; i++)
+          o[i] = (uint16_t)(tp[i] * iwy + bp[i] * wyy);
+      }
+    }
+    for (uint32_t k = 0; k < tx; k++) {
+      const uint16_t *p0 = vb + k * 256;
+      uint32_t x = seg[k], xe = seg[k + 1];
+      if (k + 1 < tx) {
+        const uint16_t *p1 = p0 + 256;
+        for (; x < xe; x++) {
+          uint32_t v = in[x], wx = col_w[x];
+          row[x] = (uint8_t)((p0[v] * (256 - wx) + p1[v] * wx + 32768) >> 16);
+        }
+      } else {
+        for (; x < xe; x++)
+          row[x] = (uint8_t)((p0[in[x]] + 128) >> 8);
+      }
+    }
+    chroma_row(ct, in, src[1] + (size_t)y * stride3[1], src[2] + (size_t)y * stride3[2],
+               dst[1] + (size_t)y * stride3[1], dst[2] + (size_t)y * stride3[2], w);
   }
 }
 
@@ -370,9 +432,16 @@ bool auto_vis_apply(AutoVis *av, const ImgStats *stats,
     lut[v] = clamp_u8((int)lround(255.0 * pow(n, av->gamma)));
   }
 
-  luma_global(av, src[0], dst[0], stride[0], lut);
-  build_tile_luts(av, alpha);
-  luma_local(av, dst[0], stride[0]);
-  chroma(av, src, dst, stride, stats->mean_luma);
+  ChromaTab ct;
+  chroma_tables(av, stats->mean_luma, &ct);
+  // One team for the three passes (each is an orphaned omp for): under
+  // OMP_WAIT_POLICY=passive every region start wakes the whole team.
+#pragma omp parallel
+  {
+    luma_global(av, src[0], stride[0]);
+    build_tile_luts(av, alpha, lut);
+    luma_local(av, src, dst, stride, &ct);
+  }
+  av->tiles_primed = true;
   return true;
 }
