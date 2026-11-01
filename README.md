@@ -29,13 +29,14 @@ topside (see [Where eeye runs](#where-eeye-runs)).
 
 `install.sh` installs the packages (`ffmpeg` among them), builds, puts `eeye` and
 `hellion` in `/usr/local/bin`, writes their configs, and starts them as **systemd
-services** that come back on every boot. It needs Debian, Ubuntu or Raspberry Pi OS
+services** that come back on every boot. **No addresses to type:** the two ends find
+each other on the network by themselves (discovery — see
+[docs/hellion.md](docs/hellion.md#discovery)); `hellion top` shows what each found. It needs Debian, Ubuntu or Raspberry Pi OS
 (`apt-get`); elsewhere install the packages it lists and add `--no-packages`.
 
 ### On a BlueROV
 
-The tether uses the BlueROV's fixed addresses — topside 192.168.2.1, ROV 192.168.2.2 —
-which are the defaults, so there is nothing to type but the role. On the ROV:
+On the ROV:
 
 ```sh
 git clone https://github.com/hogib/electric-eye && cd electric-eye
@@ -43,38 +44,48 @@ sudo ./install.sh --role rov --placement b
 ```
 
 Topside, `--tether` names the network port the tether is plugged into and gives it the
-topside address (find the name with `ip link`; it is rarely `eth0` nowadays):
+BlueROV topside address, 192.168.2.1 (find the name with `ip link`; it is rarely `eth0`
+nowadays):
 
 ```sh
 git clone https://github.com/hogib/electric-eye && cd electric-eye
 sudo ./install.sh --role topside --placement b --tether enp5s0
 ```
 
-Leave `--tether` out to set the address yourself. **Never point it at the port your
+Leave `--tether` out to set the address yourself. (Discovery also announces over IPv6
+link-local addresses, which a bare cable has with nothing set up — that path is not
+tested end to end yet.) **Never point it at the port your
 LAN or internet comes in on**: that port becomes the tether from its next reconnect.
 The ROV's network is never touched — on a BlueROV it belongs to BlueOS.
 
 ### Two machines on a LAN (testing on the bench)
 
 Any two Linux machines on the same network work — a laptop with a webcam stands in for
-the ROV. Give both machines' addresses, the **same command on both**:
+the ROV:
 
 ```sh
-# on the "ROV" (the one with the camera), here 192.168.1.105:
-sudo ./install.sh --role rov --placement b --topside-ip 192.168.1.117 --rov-ip 192.168.1.105
-
-# topside, here 192.168.1.117:
-sudo ./install.sh --role topside --placement b --topside-ip 192.168.1.117 --rov-ip 192.168.1.105
+sudo ./install.sh --role rov --placement b        # on the one with the camera
+sudo ./install.sh --role topside --placement b    # on the other
 ```
 
-No `--tether` here: the LAN already connects them. Use IP addresses, not hostnames.
+No `--tether` here: the LAN already connects them. **Several vehicles or test rigs on
+one network:** give each pair its own name on both of its ends, `--pair rig-2` — with
+two candidates for one pair, `hellion` refuses to guess and says so. Discovery cannot
+cross a router; then pin the addresses, on both ends, as IP addresses:
+`--topside-ip 192.168.1.117 --rov-ip 192.168.1.105`.
+
+Discovery trusts the network: anyone on it could announce themselves as your topside.
+There is no authentication anywhere in `hellion` (there never was for the control page
+either), and a pair name is not a password — keep it on the tether or a network you
+trust.
 
 ### Updating, changing, removing
 
 - **Update:** `git pull && sudo ./install.sh`. It remembers the role, placement and
   addresses, keeps your configs, and restarts the services on the new build.
-- **New addresses:** re-run with `--topside-ip`/`--rov-ip`; the config is rewritten and
-  the old one kept as `/etc/hellion/hellion.json.bak`.
+- **Pin or change addresses, or the pair:** re-run with `--topside-ip`/`--rov-ip` or
+  `--pair`; the config is rewritten and the old one kept as
+  `/etc/hellion/hellion.json.bak`.
 - **Start over:** `sudo ./install.sh --reset-config` puts back fresh configs (old ones
   kept as `.bak`). `sudo ./install.sh --help` lists everything.
 - **Remove:** copy any recordings out of `/var/lib/hellion/recordings` first, then:
@@ -128,7 +139,7 @@ sudo systemctl stop hellion eeye       # stop until the next boot or start
 | `hellion`'s config (pipelines, addresses, ports) | `/etc/hellion/hellion.json` — restart `hellion` after editing |
 | The effects and camera settings | `/var/lib/eeye/effects.json` on the machine running `eeye` — edited live by the page; no restart |
 | Recordings, snapshots | `/var/lib/hellion/recordings`, `/var/lib/hellion/snapshots` (topside) |
-| Ports | 8080 the page (topside), 8091 the ROV's control port, UDP 5610 the tether video, UDP 5600 QGroundControl |
+| Ports | 8080 the page (topside), 8091 the ROV's control port, UDP 5610 the tether video, UDP 5600 QGroundControl, UDP 5612 discovery (both machines) |
 
 ## Building by hand
 
@@ -263,6 +274,9 @@ Start with `hellion check` and `hellion top`; then the logs:
 | `systemctl status hellion` says `failed`, `start-limit-hit` | It exits at start, usually a config error; systemd gives up after 5 tries. | `journalctl -u hellion -n 20` names the bad line. Fix it (or re-run `install.sh` with `--topside-ip`/`--rov-ip`), then `sudo systemctl restart hellion` |
 | `Install failed at line N` | One step failed; the message above it says which. | Fix that and run the same command again — every step is safe to repeat |
 | `--tether eth0: no such network interface` | The port has another name. | `ip link` lists them; usually `enp…` or `eno…` |
+| `top`: `discovery no topside heard on the network yet` (or `no rov`) | Nothing announcing on UDP 5612: the other end is off, on another network, or a firewall drops it. | Is `hellion` running there (`hellion top` on it)? Allow UDP 5612 (and the tether port) through any firewall. Across a router, pin the addresses with `--topside-ip`/`--rov-ip` |
+| `top`: `2 topsides answer pair "default": … -- give each vehicle its own --pair` | Two machines of the other role announce the same pair, and `hellion` will not guess which is yours. | Re-run `install.sh --pair <name>` on both ends of each vehicle, with a different name per vehicle |
+| `top`: `… has pair "x"` or `… is placement a, this one b` | The other end was installed with another pair or placement. | Install both ends with the same `--pair` and `--placement` |
 | Topside log: `lost rtp:5610; reconnecting` every 10s | Nothing is arriving from the ROV: normal while the ROV is off. | Check the ROV with `hellion top` there; its `rtp:` sink must name the topside's address |
 
 ### No video anywhere

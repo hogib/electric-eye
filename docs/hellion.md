@@ -19,16 +19,19 @@ service by `install.sh`.
 ## Installing
 
 ```sh
-sudo ./install.sh --role rov|topside --placement a|b [--topside-ip IP --rov-ip IP]
-                  [--tether IFACE] [--reset-config]
+sudo ./install.sh --role rov|topside --placement a|b [--pair NAME]
+                  [--topside-ip IP] [--rov-ip IP] [--tether IFACE] [--reset-config]
 ```
 
-Both ends get the same placement, and the same addresses. The addresses default to the
-BlueROV's (topside 192.168.2.1, ROV 192.168.2.2); given, they replace those in the
-example config as it is written (the previous file kept as `.bak`) — the `peer` topside,
-the `rtp:` sink on the ROV — and are remembered in `/etc/hellion/install.conf`, which is
-read as `KEY=value` data, never sourced. They must be IPv4 addresses: the release
-binaries are static and cannot resolve names. What it sets up:
+Both ends get the same placement and the same `--pair`. No addresses are needed: the
+two ends find each other on the network ([Discovery](#discovery)) — the example
+configs say `"peer": "auto"` and `"rtp:auto:5610"`. `--topside-ip` (where the ROV
+sends) and `--rov-ip` (what the topside talks to) pin them instead, for a network
+discovery cannot cross (a router between the two). Given, they replace the `auto` in the
+config as it is written (the previous file kept as `.bak`) and are remembered with
+`--pair` in `/etc/hellion/install.conf`, which is read as `KEY=value` data, never
+sourced. They must be IPv4 addresses: the release binaries are static and cannot
+resolve names. What it sets up:
 
 | | ROV | topside |
 |---|---|---|
@@ -64,8 +67,9 @@ a switch of placement; not yet on a real Debian or Raspberry Pi OS machine.
 
 ### The tether's network
 
-BlueROV addressing is fixed: topside **192.168.2.1**, ROV **192.168.2.2**, both /24, and
-the examples use it. The ROV's network belongs to BlueOS, and `install.sh` never touches
+BlueROV addressing is fixed: topside **192.168.2.1**, ROV **192.168.2.2**, both /24.
+Nothing in the configs depends on it any more ([Discovery](#discovery) finds the other
+end on any network), but `--tether` gives the topside that address. The ROV's network belongs to BlueOS, and `install.sh` never touches
 it. Topside, `--tether IFACE` creates a NetworkManager profile, `hellion-tether`, giving
 `IFACE` 192.168.2.1/24 — and an IPv6 link-local address, which is not decoration:
 
@@ -118,13 +122,16 @@ unknown key or bad value stops startup with the reason.
 | `role` | `"rov"` | `"rov"` or `"topside"`. Shown by `top` |
 | `eeye_config` | `""` | `eeye`'s config on this machine, if it runs here: the page edits it, and `top` and `check` read its health beside it |
 | `control` | `""` | Where to serve the page and API: a port (`"8080"`, every interface) or `"addr:port"`. `""` serves nothing |
-| `peer` | `""` | The other `hellion`'s `control`, as `"host:port"`. Where `eeye`'s config and health come from when `eeye` is not on this machine |
+| `peer` | `""` | The other `hellion`'s `control`, as `"host:port"`, or `"auto"`: the one discovery finds. Where `eeye`'s config and health come from when `eeye` is not on this machine |
 | `preview` | `"pilot"` | The frame bus stream the page previews by default |
 | `snapshot_dir` | `/var/lib/hellion/snapshots` | Where the page's snapshots are saved |
 | `record_dir` | `/var/lib/hellion/recordings` | Where recordings are saved |
 | `record_from` | first `rtp:` source | The pipeline whose arriving stream is recorded |
 | `camera_controls` | `""` | `"peer"` (topside, placement A): send the page's camera controls on to the peer, which has the camera. Needs `peer` |
 | `camera_file` | `/var/lib/hellion/camera.json` | With a camera source: where the last camera controls are kept, and put back from on start |
+| `discovery` | `true` | Announce this `hellion` on the local network and listen for the others ([Discovery](#discovery)). `"auto"` addresses need it |
+| `pair` | `"default"` | Only a `hellion` with the same pair name is chosen as the other end. A name, not a secret |
+| `placement` | `""` | `"a"` or `"b"`, announced; a peer announcing the other placement is refused. `""` is unknown and refuses nothing |
 | `pipelines` | — | 1 to 8; see below |
 
 A **pipeline** moves frames from one source to up to 8 sinks:
@@ -141,6 +148,7 @@ A **pipeline** moves frames from one source to up to 8 sinks:
 | `bus:<stream>` | Publish to the frame bus ([bus.md](bus.md)) |
 | `v4l2:<device>` | A v4l2loopback device. Optional and retried, like `eeye`'s ([output.md](output.md#optional-and-retried)) |
 | `rtp:<host>:<port>` | Encode to H.264 with ffmpeg and send over RTP |
+| `rtp:auto:<port>` | The same, to the topside discovery finds; follows it if it changes, and sends nothing (and does not encode) while there is none |
 
 | Pipeline key | Default | For |
 |---|---|---|
@@ -153,6 +161,57 @@ A **pipeline** moves frames from one source to up to 8 sinks:
 | `gop` | 30 | RTP sinks: frames between keyframes — how soon a viewer that joins late gets a picture |
 
 A pipeline cannot read the bus stream it publishes.
+
+## Discovery
+
+So the two ends need no addresses. Every `hellion` with `"discovery": true` (the
+default) announces itself once a second on **UDP 5612**, one line of text:
+
+```
+HELLION/1 role=rov name=rov pair=default placement=b control=8091 tether=0 id=1a2b3c4d
+```
+
+to the IPv4 broadcast address of every interface that is up (not loopback), **and** to
+IPv6 `ff02::1` (all nodes) on each — the second needs no address set up at all, so two
+machines on a bare cable find each other with nothing configured. It listens on the same
+port (both families; it joins `ff02::1` on each interface, re-reading the interface list
+every 5s, since a tether is often plugged in after `hellion` starts). `id` is random per
+process, so it ignores its own; unknown keys are ignored, so a later version can add some.
+
+`"peer": "auto"` and `rtp:auto:<port>` sinks use the newest `hellion` of the **opposite
+role and the same `pair`**, heard in the last 5s, at its IPv4 address when that is fresh,
+its IPv6 link-local one (`fe80::…%iface`) otherwise. Then:
+
+- **Two or more candidates: no guess.** Nothing is chosen, and every status says so:
+  `2 topsides answer pair "default": 192.168.1.10, 192.168.1.11 -- give each vehicle
+  its own --pair`. Two vehicles sharing a network need their own pair names.
+- **A different placement is refused**, named in the status
+  (`… is placement a, this one b`), as is a candidate of another pair.
+- **A peer silent for 5s is dropped**, and whoever answers next is adopted. The RTP
+  sink re-targets live; the topside's peer exchange, config proxy, camera forwarding
+  and `eeye` health all use the address of the moment.
+- **Fixed addresses still win**: a `peer` or sink with an address does not use
+  discovery, and is unaffected by it — but `hellion` still announces itself, so the
+  other end can use `auto`.
+
+`hellion top` shows a `discovery` line (green found, amber when an `auto` address has
+nothing, red when it refused to choose); `hellion check` warns in those two cases; the
+page's peer errors name what discovery saw.
+
+**It trusts the network.** There is no authentication — here, or anywhere in
+`hellion`'s API, which never had any. Anyone on the network can announce themselves as
+the topside and receive the ROV's video, or as the ROV and take the page's settings.
+`pair` keeps vehicles that share a network apart; it is not a secret. Run it on the
+tether, or a network you would trust with the control page anyway.
+
+Tested: unit tests for beacon parsing and the choice rules, two processes finding each
+other on loopback (`HELLION_DISCOVERY_PORT` and `HELLION_DISCOVERY_TO` send unicast
+there, since broadcast does not work on `lo` — **test-only**, never set in use), two
+real `hellion`s on loopback streaming through an `rtp:auto` sink, and two machines on a
+LAN: the ROV found the topside by IPv4 broadcast within a second and streamed 30fps with
+no loss, the topside found the ROV, and the ROV's IPv6 beacons arrived from its
+link-local address. Not yet tested: a link with IPv6 only (the bare-cable case) end to
+end, and BlueOS.
 
 ## The two placements
 
@@ -331,6 +390,10 @@ by `hellion/embed.c`), so there is nothing to install beside it.
 | `GET /api/status` | This `hellion`'s pipelines as JSON, for scripts |
 | `POST /camera` | Camera controls (a `"camera"` object, as in `eeye`'s config) for this `hellion`'s camera sources: kept in `camera_file`, applied, answered once the camera has them — `{"applied":true,"controls":N}`, or `applied:false` with why. 409 without a camera source |
 | `GET /camera` | The camera controls kept here |
+
+`/api/status` also carries `"discovery"`: `state` (`off`, `searching`, `found`,
+`ambiguous`), whether this `hellion` `needed` it, the chosen `peer` address and name, and
+the one-line `detail`.
 | `POST /api/peer` | The status exchange between the two ends — see [ROV ↔ topside status](#rov--topside-status) |
 
 **Auto visibility** is the first thing on the page: a full-width button (and the `A`

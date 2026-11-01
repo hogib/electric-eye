@@ -119,7 +119,7 @@ bool disc_beacon_parse(const char *buf, size_t len, Beacon *out) {
     if (token_value(tok, tlen, "role", v, sizeof v)) {
       if (strcmp(v, "rov") != 0 && strcmp(v, "topside") != 0)
         return false;
-      snprintf(out->role, sizeof out->role, "%s", v);
+      snprintf(out->role, sizeof out->role, "%.15s", v); // "topside" at most
       have_role = true;
     } else if (token_value(tok, tlen, "name", v, sizeof v)) {
       if (strcmp(v, "-") != 0) {
