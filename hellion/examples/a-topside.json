@@ -1,6 +1,9 @@
 {
   "name": "topside",
   "role": "topside",
+  "control": "8080",
+  "peer": "192.168.2.2:8091",
+  "preview": "pilot",
   "eeye_config": "/var/lib/eeye/effects.json",
   "pipelines": [
     {"name": "camera-in", "source": "rtp:5610",

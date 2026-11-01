@@ -1,6 +1,7 @@
 {
   "name": "rov",
   "role": "rov",
+  "control": "8091",
   "pipelines": [
     {"name": "camera-up", "source": "v4l2:/dev/video0",
      "width": 1280, "height": 720, "framerate": 30,

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "health.h"
+#include "json_out.h"
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,27 +36,10 @@ uint64_t health_disk_free(const char *path) {
   return 0;
 }
 
-// Escapes a string for embedding in a JSON string literal. Paths and
-// errno strings are the only things written here, but a path may legally
-// contain a quote or a backslash, and one unescaped byte would make the
-// whole file unparseable to the reader that needs it most.
-static void json_escape(const char *in, char *out, size_t out_cap) {
-  size_t o = 0;
-  for (size_t i = 0; in[i] != '\0' && o + 2 < out_cap; i++) {
-    unsigned char c = (unsigned char)in[i];
-    if (c == '"' || c == '\\') {
-      out[o++] = '\\';
-      out[o++] = (char)c;
-    } else if (c < 0x20) {
-      if (o + 6 >= out_cap)
-        break;
-      o += (size_t)snprintf(out + o, out_cap - o, "\\u%04x", c);
-    } else {
-      out[o++] = (char)c;
-    }
-  }
-  out[o] = '\0';
-}
+// Strings are escaped with json_escape (json_out.h): paths and errno
+// strings are the only text written here, but a path may legally contain
+// a quote or a backslash, and one unescaped byte would make the whole file
+// unparseable to the reader that needs it most.
 
 static const char *state_name(RecordingState s) {
   switch (s) {

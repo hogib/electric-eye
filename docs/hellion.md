@@ -11,8 +11,9 @@ hellion check [-n name]                  # health check: exit 0 ok, 1 degraded, 
 ```
 
 **Status:** pipelines with camera, frame bus and RTP sources; frame bus, v4l2loopback
-and RTP sinks (H.264 to the other end of the tether, or to QGroundControl); `top` and
-`check`. Recording, the browser page and config relay come next.
+and RTP sinks (H.264 to the other end of the tether, or to QGroundControl); the browser
+page with preview, snapshots and `eeye`'s config (here or across the tether); `top`
+and `check`. Recording and the ROV↔topside status exchange come next.
 
 ## Config
 
@@ -36,7 +37,11 @@ unknown key or bad value stops startup with the reason.
 |---|---|---|
 | `name` | `"hellion"` | Instance name. Status lives in `<bus dir>/hellion.<name>`; `top -n` picks it |
 | `role` | `"rov"` | `"rov"` or `"topside"`. Shown by `top` |
-| `eeye_config` | `""` | `eeye`'s config on this machine, if it runs here: `top` and `check` read its health beside it |
+| `eeye_config` | `""` | `eeye`'s config on this machine, if it runs here: the page edits it, and `top` and `check` read its health beside it |
+| `control` | `""` | Where to serve the page and API: a port (`"8080"`, every interface) or `"addr:port"`. `""` serves nothing |
+| `peer` | `""` | The other `hellion`'s `control`, as `"host:port"`. Where `eeye`'s config and health come from when `eeye` is not on this machine |
+| `preview` | `"pilot"` | The frame bus stream the page previews by default |
+| `snapshot_dir` | `/var/lib/hellion/snapshots` | Where the page's snapshots are saved |
 | `pipelines` | — | 1 to 8; see below |
 
 A **pipeline** moves frames from one source to up to 8 sinks:
@@ -163,6 +168,47 @@ If the source reopens at a **different size**, the sinks are restarted at the ne
 
 Frames from a bus source keep the publisher's `frame_no` and capture time; a camera
 source numbers its own and uses the driver's timestamp.
+
+## The page and its API
+
+Open `http://<topside>:8080/` (the topside's `control`). One page: the live preview,
+the effect chain and camera controls for `eeye`, snapshot and record buttons, and a
+banner that turns the picture grey and says so when the video stalls or the link drops.
+The page is compiled into the binary (`hellion/web/index.html`, embedded at build time
+by `hellion/embed.c`), so there is nothing to install beside it.
+
+| Request | |
+|---|---|
+| `GET /` | The page |
+| `GET /stream?src=S` | MJPEG of frame bus stream `S` (default `preview`), at most ~15fps, quality 75; at most 4 viewers |
+| `POST /snapshot?src=S` | Saves a JPEG (quality 92) of `S`'s next frame in `snapshot_dir` |
+| `GET /config`, `POST /config` | `eeye`'s config — see below |
+| `GET /health?src=S` | `link` (is `S` alive, how old its newest frame), `drone` (`eeye`'s health file, plus its age), `recorder` |
+| `GET /api/streams` | The frame bus streams on this machine |
+| `GET /api/drone` | `eeye`'s health file here, with `age_s` |
+| `GET /api/status` | This `hellion`'s pipelines as JSON, for scripts |
+
+The preview is **any frame bus stream** on the topside machine, chosen in the page:
+`pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. Each
+viewer reads the bus directly, so viewers cost the pipeline nothing.
+
+**`eeye`'s config.** Where `eeye` runs on this machine (`eeye_config` set), a POST
+writes the file the way `eeye`'s watcher expects (temp file + rename) and waits up to
+3s for `eeye`'s verdict in `<config>.status`, comparing its mtime to the nanosecond.
+The answer is `{"written":true,"eeye_accepted":true|false|null}` (`null`: `eeye` never
+answered — not running, or watching another path). **If `eeye` rejects it, `hellion`
+puts the previous file back** (`"restored":true`): `eeye` keeps running the old config
+either way, but a rejected file left on disk would stop `eeye` starting next time.
+Where `eeye` is not on this machine, `/config` and the `drone` part of `/health` are
+proxied to `peer`, which serves the same paths.
+
+**The HTTP layer** (`hellion/http.c`) is deliberately strict, because it is the one
+part of `hellion` that parses bytes from the network: request head at most 8KB, body
+at most 64KB, Content-Length bodies only (Transfer-Encoding is refused, not
+half-supported), one request per connection, CRLF line endings only, no header
+folding, a deadline on every read and write, at most 32 connections. The parsers are
+pure functions, unit-tested case by case (`tests/test_http.c`) and fuzzed with
+libFuzzer under ASan and UBSan (`make fuzz-http`; 5M inputs in two minutes, clean).
 
 ## `hellion top`
 

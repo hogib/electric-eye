@@ -1,6 +1,6 @@
 # Testing
 
-18 suites, ~235 tests, run with `make check` (`-j` runs them in parallel).
+19 suites, ~250 tests, run with `make check` (`-j` runs them in parallel).
 
 ## The suites
 
@@ -20,10 +20,24 @@
 | `health` | Health file contents and escaping |
 | `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group, stderr on its own pipe |
 | `virtual_cam` | The optional webcam output: quiet checks for a missing device, back-off for one that will not open. `EEYE_TEST_LOOPBACK=/dev/videoN` also writes to a real one |
+| `http` | HTTP request/response parsing case by case (every refusal: bare LF, folding, Transfer-Encoding, conflicting lengths, oversize, control bytes); server and client over a socket, with 400/413/431 and truncation |
 | `hellion` | Config parsing and errors, and the shipped example configs; pipelines driven end to end over the bus (byte-exact forwarding, size changes, a failing sink not starving its neighbour, a missing source); the UDP relay (forwarding, loss, late packets, SSRC change, wrap-around); an RTP round trip checking colour range (skipped without ffmpeg); the status file; log capture |
 | `fbus` | Frame bus across real processes: whole frames under a writer lapping the ring (and a deterministic lap), several readers, futex wake-up, writer restart, a killed writer detected by its heartbeat, bad files |
 | `topside` | Python: link staleness, health relay, recorder |
 | `record` | Python: duration parsing, ffmpeg command construction |
+
+## Fuzzing
+
+`make fuzz-http` builds `tests/fuzz_http.c` with clang and libFuzzer under ASan and
+UBSan, and runs it for `FUZZ_SECONDS` (default 60) over `hellion`'s HTTP request and
+response parsers — the only code in `hellion` that interprets bytes from the network.
+Besides crashes and out-of-bounds access, it checks what a successful parse promises:
+the head ends exactly at a blank line, the path starts with `/` and holds only visible
+ASCII, every string fits its field, and parsing just the head gives the same answer
+(the parser never looked past it). Seeds are in `tests/fuzz_http_seeds/`; inputs it
+finds that reach new code collect in `builddir/fuzz-http-corpus/`.
+
+Run it after any change to `hellion/http.c`.
 
 ## The include-the-TU pattern
 

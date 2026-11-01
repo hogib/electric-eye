@@ -1,0 +1,829 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Electric Eye - Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { height: 100%; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #111;
+         color: #eee; overflow: hidden; }
+
+  /* Two columns: picture left, controls right, each scrolling
+     independently. Reaching a slider must never push the camera
+     off-screen -- adjusting an exposure or a threshold is precisely when
+     you need to see what it did. */
+  #layout { display: flex; height: 100%; align-items: stretch; }
+  #videowrap {
+    position: relative; /* the banner below is positioned against this */
+    flex: 1 1 auto;
+    /* Without min-width:0 a flex item will not shrink below its content's
+       intrinsic size, so a 1280-wide frame shoves the panel off the right
+       edge instead of letterboxing. */
+    min-width: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #000; overflow: hidden;
+  }
+  #video { max-width: 100%; max-height: 100%; width: auto; height: auto;
+           object-fit: contain; background: #000; display: block; }
+  #panel {
+    /* Wide enough for a stage row, capped so the picture keeps most of a
+       large screen. */
+    flex: 0 0 clamp(340px, 28vw, 460px);
+    height: 100%; overflow-y: auto; overscroll-behavior: contain;
+    padding: 12px 16px 32px; box-sizing: border-box;
+    background: #161616; border-left: 1px solid #2b2b2b;
+  }
+  #panel h2:first-child { margin-top: 4px; }
+
+  /* Too narrow for two columns (phone, tablet portrait): stack them, but
+     pin the video to the top so it stays visible while the controls
+     scroll under it -- same goal, reached differently. */
+  @media (max-width: 860px) {
+    body { overflow: auto; }
+    #layout { flex-direction: column; height: auto; }
+    #videowrap { flex: none; position: sticky; top: 0; z-index: 3; }
+    #video { max-height: 45vh; }
+    #panel { flex: none; height: auto; overflow: visible;
+             border-left: none; border-top: 1px solid #2b2b2b; }
+  }
+  h2 { font-size: 15px; margin: 20px 0 8px; color: #9cf; }
+  .stage { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+           background: #1c1c1c; border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+  .stage select { font-size: 14px; }
+  .stage .fields { display: flex; flex-wrap: wrap; align-items: center;
+                   gap: 4px 12px; }
+  .stage label { display: inline-flex; align-items: center; gap: 5px;
+                 white-space: nowrap; font-size: 12px; color: #aaa; }
+  .stage input[type=range] { width: 90px; vertical-align: middle; margin: 0; }
+  .stage .val { display: inline-block; min-width: 26px; text-align: right;
+                font-variant-numeric: tabular-nums; color: #ddd; }
+  .stage .spacer { flex: 1; }
+  .stage .rowbtns { display: inline-flex; gap: 4px; flex: none; }
+  .stage .rowbtns button { min-width: 28px; }
+  .rgb-row { display: inline-flex; align-items: center; gap: 2px; }
+  .rgb-row span.chan { color: #aaa; font-size: 12px; }
+  .rgb-row input[type=range] { width: 70px; }
+  .swatch { display: inline-block; width: 22px; height: 22px; border-radius: 4px;
+            border: 1px solid #555; margin-left: 6px; vertical-align: middle; }
+  button { font-size: 13px; padding: 4px 10px; cursor: pointer; }
+  #apply { font-size: 15px; padding: 8px 20px; margin-top: 16px; }
+  #status { margin-top: 10px; font-size: 13px; white-space: pre-wrap; }
+  .readonly { font-size: 13px; opacity: 0.75; font-family: monospace; }
+  #status.ok { color: #8f8; }
+  #status.err { color: #f88; }
+  label.field { display: block; margin: 6px 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+
+  /* Link/recording state, drawn over the video rather than beside it.
+     A pilot watches the picture, not the sidebar -- a warning they have
+     to look away to notice is a warning they will miss. */
+  #banner {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: 10px 14px; font-weight: bold; font-size: 15px;
+    text-align: center; display: none; z-index: 2;
+  }
+  #banner.stale {
+    display: block; background: rgba(180, 20, 20, 0.92); color: #fff;
+    /* Pulsing, because a frozen picture is otherwise indistinguishable
+       from a still scene -- the motion is the signal. */
+    animation: pulse 1s steps(2, start) infinite;
+  }
+  #banner.warn {
+    display: block; background: rgba(190, 120, 0, 0.92); color: #fff;
+  }
+  @keyframes pulse { 50% { opacity: 0.55; } }
+  /* Desaturate the picture itself while it is stale: whatever the pilot
+     is looking at, it stops looking like live video. */
+  #video.stale { filter: grayscale(1) brightness(0.55); }
+
+  /* Capture controls. Deliberately large and separated from the effect
+     form: these are the two things someone reaches for in a hurry, often
+     one-handed on a boat, and they must not sit among the sliders where a
+     mis-tap changes the image instead. */
+  #capture { display: flex; gap: 8px; margin: 8px 0; }
+  #capture button {
+    flex: 1; padding: 12px 8px; font-size: 15px; font-weight: bold;
+    border: none; border-radius: 4px; cursor: pointer;
+    background: #3a3a3a; color: #eee;
+  }
+  #capture button:hover:enabled { background: #4a4a4a; }
+  #capture button:disabled { opacity: 0.45; cursor: default; }
+  #btn-record.on { background: #b02020; color: #fff; }
+  /* Pulses only while actually recording, so the state is readable from
+     across a deck without reading the label. */
+  #btn-record.on { animation: recpulse 1.4s ease-in-out infinite; }
+  @keyframes recpulse { 50% { background: #7a1616; } }
+  .ico { display: inline-block; vertical-align: middle; margin-right: 8px;
+         flex: none; }
+  .ico.dot { width: 11px; height: 11px; border-radius: 50%; background: #e6444c; }
+  .ico.ring { width: 11px; height: 11px; border-radius: 50%;
+              border: 2px solid #ccd3da; box-sizing: border-box; }
+  .ico.square { width: 10px; height: 10px; border-radius: 2px; background: #fff; }
+  #capturemsg { font-size: 13px; min-height: 18px; margin-bottom: 4px; }
+  #capturemsg.err { color: #f88; }
+  #capturemsg.ok { color: #6f6; }
+
+  /* A manual control greyed out while its auto mode is on, mirroring the
+     hardware's own dependency -- the camera would reject it anyway, so
+     showing it as live would be a lie. */
+  label.field.gated { opacity: 0.4; }
+  label.field .val { float: right; font-family: monospace; opacity: 0.8; }
+
+  #recstate { margin: 4px 0 2px; font-size: 13px; }
+  #recstate.active { color: #6f6; }
+  #recstate.failed { color: #f66; font-weight: bold; }
+  #recstate.off { opacity: 0.6; }
+</style>
+</head>
+<body>
+  <div id="layout">
+  <div id="videowrap">
+    <img id="video" alt="">
+    <div id="banner"></div>
+  </div>
+  <div id="panel">
+    <h2>Effect chain</h2>
+    <div id="stages"></div>
+    <button id="add-stage" type="button">+ Add stage</button>
+
+    <h2>Capture</h2>
+    <div id="capture">
+      <button id="btn-record" type="button"></button>
+      <button id="btn-snap" type="button"></button>
+    </div>
+    <div id="capturemsg"></div>
+    <div class="readonly">Recorded topside: the H.264 stream exactly as it
+      arrives over the tether, copied into an MP4 without re-encoding.
+      Snapshots are a still of the preview below.</div>
+
+    <h2>Camera</h2>
+    <div class="readonly">Sensor settings, applied live. Auto modes must be
+      off before their manual value takes effect — the drone reports it if
+      you forget.</div>
+    <label class="field">
+      <input type="checkbox" id="cam_auto_exposure" checked>
+      Auto exposure
+    </label>
+    <label class="field" id="wrap_exposure">
+      Exposure (µs) <span class="val" id="v_exposure">20000</span>
+      <input type="range" id="cam_exposure" min="200" max="200000" step="200"
+             value="20000">
+    </label>
+    <label class="field">
+      Gain <span class="val" id="v_gain">0</span>
+      <input type="range" id="cam_gain" min="0" max="100" value="0">
+    </label>
+    <label class="field">
+      <input type="checkbox" id="cam_auto_white_balance" checked>
+      Auto white balance
+    </label>
+    <label class="field" id="wrap_white_balance">
+      White balance (K) <span class="val" id="v_white_balance">4600</span>
+      <input type="range" id="cam_white_balance" min="2800" max="6500"
+             step="100" value="4600">
+    </label>
+    <label class="field">
+      Brightness <span class="val" id="v_brightness">0</span>
+      <input type="range" id="cam_brightness" min="-100" max="100" value="0">
+    </label>
+    <label class="field">
+      Contrast <span class="val" id="v_contrast">100</span>
+      <input type="range" id="cam_contrast" min="0" max="200" value="100">
+    </label>
+    <label class="field">
+      Saturation <span class="val" id="v_saturation">100</span>
+      <input type="range" id="cam_saturation" min="0" max="200" value="100">
+    </label>
+    <div id="cam_note" class="readonly"></div>
+
+    <h2>Preview</h2>
+    <label class="field">Stream
+      <select id="preview_src"></select>
+    </label>
+    <div class="readonly">Any frame bus stream on the topside machine:
+      <b>pilot</b> is what the pilot sees, <b>raw</b> or <b>camera</b> the
+      camera before effects (where they exist). Preview and snapshots
+      only — the video to QGC is unaffected.</div>
+
+    <h2>Recording (by eeye, raw, full quality)</h2>
+    <div id="recstate" class="off">recording: unknown</div>
+    <label class="field">Path (blank = off)
+      <input type="text" id="record_path" placeholder="/var/lib/eeye/recordings/session.raw">
+    </label>
+
+    <h2>Geometry</h2>
+    <!-- Read-only on purpose: eeye only reads these at startup, so a
+         control here would look live and quietly not be. Edit the drone's
+         eeye_config.json and restart eeye to change it. -->
+    <div id="geometry" class="readonly">-</div>
+
+    <button id="apply" type="button">Apply</button>
+    <div id="status"></div>
+  </div>
+  </div>
+
+<script>
+const EFFECT_FIELDS = {"none": [], "grayscale": [], "invert": [], "threshold": [["threshold_value", 0, 255, 128]], "tint": [["tint_u", 0, 255, 90], ["tint_v", 0, 255, 150], ["tint_strength", 0, 255, 180]], "sobel": [["sobel_threshold", 0, 255, 0]], "log": [["log_strength", 0, 12, 2], ["log_threshold", 0, 255, 20]], "canny": [["canny_strength", 0, 12, 2], ["canny_low", 0, 255, 40], ["canny_high", 0, 255, 90]], "blur": [["blur_strength", 0, 20, 0]], "contrast": [], "light": [["light_level", 0, 255, 128]]};
+const stagesEl = document.getElementById("stages");
+
+function fieldRowHtml(stage, key, min, max, def) {
+  const val = (stage && stage[key] !== undefined) ? stage[key] : def;
+  return `<label>${key}`
+       + `<input type="range" min="${min}" max="${max}" value="${val}" `
+       + `data-field="${key}" oninput="this.nextElementSibling.textContent=this.value">`
+       + `<span class="val">${val}</span></label>`;
+}
+
+// tint's config fields are chroma (tint_u/tint_v, 128 = neutral, see
+// src/point_opps.c's doc comment) -- not something anyone should have to
+// pick by typing raw YCbCr numbers. These convert an RGB color picked via
+// sliders into that chroma pair (BT.601, Y dropped since the tint effect
+// never touches luma) and back (assuming Y=128, since the real per-pixel Y
+// isn't known client-side -- only used to seed the sliders' starting
+// position from an existing config, never sent anywhere).
+function clampByte(n) { return Math.max(0, Math.min(255, Math.round(n))); }
+function rgbToUV(r, g, b) {
+  return [
+    clampByte(-0.169 * r - 0.331 * g + 0.5 * b + 128),
+    clampByte(0.5 * r - 0.419 * g - 0.081 * b + 128),
+  ];
+}
+function uvToRgb(u, v) {
+  const cb = u - 128, cr = v - 128;
+  return [
+    clampByte(128 + 1.402 * cr),
+    clampByte(128 - 0.344136 * cb - 0.714136 * cr),
+    clampByte(128 + 1.772 * cb),
+  ];
+}
+
+function renderTintFields(fields, stage) {
+  const u0 = (stage && stage.tint_u !== undefined) ? stage.tint_u : 90;
+  const v0 = (stage && stage.tint_v !== undefined) ? stage.tint_v : 150;
+  const strength0 = (stage && stage.tint_strength !== undefined) ? stage.tint_strength : 180;
+  const [r0, g0, b0] = uvToRgb(u0, v0);
+
+  fields.innerHTML =
+    `<span class="rgb-row">`
+    + `<span class="chan">R</span><input type="range" min="0" max="255" value="${r0}" class="rgb-r" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${r0}</span>`
+    + `<span class="chan">G</span><input type="range" min="0" max="255" value="${g0}" class="rgb-g" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${g0}</span>`
+    + `<span class="chan">B</span><input type="range" min="0" max="255" value="${b0}" class="rgb-b" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${b0}</span>`
+    + `<span class="swatch"></span>`
+    + `</span>`
+    + `<label>strength`
+    + `<input type="range" min="0" max="255" value="${strength0}" data-field="tint_strength" `
+    + `oninput="this.nextElementSibling.textContent=this.value"><span class="val">${strength0}</span></label>`
+    + `<input type="hidden" data-field="tint_u" value="${u0}">`
+    + `<input type="hidden" data-field="tint_v" value="${v0}">`;
+
+  const rIn = fields.querySelector(".rgb-r");
+  const gIn = fields.querySelector(".rgb-g");
+  const bIn = fields.querySelector(".rgb-b");
+  const swatch = fields.querySelector(".swatch");
+  const uHidden = fields.querySelector('[data-field="tint_u"]');
+  const vHidden = fields.querySelector('[data-field="tint_v"]');
+
+  function syncFromRgb() {
+    const r = Number(rIn.value), g = Number(gIn.value), b = Number(bIn.value);
+    swatch.style.background = `rgb(${r}, ${g}, ${b})`;
+    const [u, v] = rgbToUV(r, g, b);
+    uHidden.value = u;
+    vHidden.value = v;
+  }
+  for (const el of [rIn, gIn, bIn]) el.addEventListener("input", syncFromRgb);
+  syncFromRgb();
+}
+
+function addStage(stage) {
+  stage = stage || { effect: "none" };
+  const row = document.createElement("div");
+  row.className = "stage";
+
+  const select = document.createElement("select");
+  for (const effect of Object.keys(EFFECT_FIELDS)) {
+    const opt = document.createElement("option");
+    opt.value = effect;
+    opt.textContent = effect;
+    if (effect === stage.effect) opt.selected = true;
+    select.appendChild(opt);
+  }
+
+  const fields = document.createElement("span");
+  fields.className = "fields";
+
+  function renderFields() {
+    fields.innerHTML = "";
+    if (select.value === "tint") {
+      renderTintFields(fields, stage);
+      return;
+    }
+    for (const [key, min, max, def] of EFFECT_FIELDS[select.value]) {
+      fields.insertAdjacentHTML("beforeend", fieldRowHtml(stage, key, min, max, def));
+    }
+  }
+  select.addEventListener("change", renderFields);
+  renderFields();
+
+  const up = document.createElement("button");
+  up.type = "button"; up.textContent = "\u2191";
+  up.onclick = () => { const prev = row.previousElementSibling;
+                       if (prev) stagesEl.insertBefore(row, prev); };
+
+  const down = document.createElement("button");
+  down.type = "button"; down.textContent = "\u2193";
+  down.onclick = () => { const next = row.nextElementSibling;
+                         if (next) stagesEl.insertBefore(next, row); };
+
+  const remove = document.createElement("button");
+  remove.type = "button"; remove.textContent = "\u00d7";
+  remove.title = "Remove this stage";
+  remove.onclick = () => row.remove();
+
+  const spacer = document.createElement("span");
+  spacer.className = "spacer";
+
+  const rowbtns = document.createElement("span");
+  rowbtns.className = "rowbtns";
+  rowbtns.append(up, down, remove);
+
+  row.append(select, fields, spacer, rowbtns);
+  stagesEl.appendChild(row);
+}
+
+document.getElementById("add-stage").addEventListener("click", () => addStage());
+
+// Geometry (capture_width/capture_height/downscale) and capture_source are
+// startup-only on the drone, so this UI deliberately doesn't offer them as
+// controls -- but they must still be carried through untouched.
+// buildConfig() writes the whole config file, so anything not echoed back
+// here is effectively deleted: without this, the first slider tweak would
+// silently drop the operator's downscale (the drone would come back up at
+// full resolution on its next restart, saturating the tether) or their
+// capture_source (a drone pinned to one backend would revert to
+// auto-detect, and pick the wrong camera on a vehicle carrying both).
+let carriedGeometry = {};
+
+function buildConfig() {
+  const chain = [];
+  for (const row of stagesEl.children) {
+    const effect = row.querySelector("select").value;
+    const stage = { effect };
+    for (const input of row.querySelectorAll("input[data-field]")) {
+      stage[input.dataset.field] = Number(input.value);
+    }
+    chain.push(stage);
+  }
+  return {
+    chain,
+    record_path: document.getElementById("record_path").value,
+    ...(Object.keys(buildCameraObject()).length
+        ? {camera: buildCameraObject()} : {}),
+    ...carriedGeometry,
+  };
+}
+
+function loadConfig(cfg) {
+  stagesEl.innerHTML = "";
+  for (const stage of (cfg.chain || [])) addStage(stage);
+  if (stagesEl.children.length === 0) addStage();
+  document.getElementById("record_path").value = cfg.record_path || "";
+
+  // Seed the camera controls from whatever the drone has, and mark those
+  // fields as touched so a later change keeps sending them. Fields the
+  // drone does not mention stay untouched, so this page never starts
+  // pushing values nobody chose.
+  const cam = cfg.camera || {};
+  for (const name of CAM_TOGGLES) {
+    if (cam[name] !== undefined) {
+      camEl(name).checked = !!cam[name];
+      camTouched.add(name);
+    }
+  }
+  for (const name of CAM_SLIDERS) {
+    if (cam[name] !== undefined) {
+      camEl(name).value = cam[name];
+      document.getElementById("v_" + name).textContent = cam[name];
+      camTouched.add(name);
+    }
+  }
+  updateCamGating();
+  document.getElementById("cam_note").textContent =
+    Object.keys(cam).length ? "" : "Camera is using its own defaults.";
+
+  // Only carry keys the drone's config actually had. Writing back defaults
+  // it never set would itself be a geometry change from eeye's point of
+  // view, which is exactly the spurious "restart to apply" warning this is
+  // meant to avoid. Every startup-only key belongs in this list (see
+  // config.c's config_publish for the full set); "record_format" is not
+  // startup-only, but this page has no control for it, so it is carried
+  // too rather than silently reset.
+  carriedGeometry = {};
+  for (const k of ["capture_width", "capture_height", "downscale",
+                   "capture_source", "capture_format", "capture_device",
+                   "output_device", "capture_stream", "bus_pilot",
+                   "bus_raw", "record_format"]) {
+    if (cfg[k] !== undefined) carriedGeometry[k] = cfg[k];
+  }
+
+  const cw = cfg.capture_width || 1280, chh = cfg.capture_height || 720;
+  const ds = cfg.downscale || 1;
+  const src = cfg.capture_source || "auto";
+  const geom = ds > 1
+    ? `${cw}x${chh} capture, ${ds}x downscale -> ${cw / ds}x${chh / ds} pipeline`
+    : `${cw}x${chh}, no downscaling`;
+  document.getElementById("geometry").textContent = `${geom} (source: ${src})`;
+}
+
+async function refreshFromDrone() {
+  const status = document.getElementById("status");
+  try {
+    const res = await fetch("/config");
+    loadConfig(await res.json());
+  } catch (e) {
+    status.textContent = "Could not load current config from drone: " + e;
+    status.className = "err";
+    addStage();
+  }
+}
+
+// web_ui.py's own proxy already gives up on the drone's config_agent after
+// 5s, and config_agent gives up on eeye's own confirmation after 2s -- so
+// a healthy round trip never takes long. But this request crosses a real
+// network hop over the tether, which can just drop packets with no RST/FIN
+// to ever wake up fetch()'s promise, especially before this ever runs over
+// the actual fiber run rather than localhost. Without a hard client-side
+// deadline, that kind of stall leaves the button stuck on "Applying..."
+// forever with no way out except reloading the page -- so this aborts and
+// reports it instead of waiting indefinitely.
+const APPLY_TIMEOUT_MS = 8000;
+
+// Extracted from the Apply button so the camera sliders can push the same
+// way -- a camera change has to reach the drone immediately to be worth
+// having, rather than waiting for someone to also press Apply.
+async function applyConfig() {
+  const status = document.getElementById("status");
+  status.textContent = "Applying...";
+  status.className = "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), APPLY_TIMEOUT_MS);
+  try {
+    const res = await fetch("/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildConfig()),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      status.textContent = "Rejected: " + text;
+      status.className = "err";
+    } else {
+      let data;
+      try { data = JSON.parse(text); } catch { data = {}; }
+      if (data.eeye_accepted === true) {
+        status.textContent = "Applied -- eeye confirmed it took effect.";
+        status.className = "ok";
+      } else if (data.eeye_accepted === false) {
+        status.textContent = "eeye REJECTED it and kept the previous "
+          + "config" + (data.restored ? " (put back on disk too)" : "")
+          + ". Its log (journalctl -u eeye) says why.";
+        status.className = "err";
+      } else {
+        status.textContent = "Written, but got no confirmation from eeye "
+          + "within the timeout -- is it running and watching this exact "
+          + "config path?";
+        status.className = "err";
+      }
+    }
+  } catch (e) {
+    status.textContent = (e.name === "AbortError")
+      ? `Timed out after ${APPLY_TIMEOUT_MS / 1000}s waiting for a response `
+        + "-- check the connection to the topside server and the drone."
+      : "Request failed: " + e;
+    status.className = "err";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+document.getElementById("apply").addEventListener("click", applyConfig);
+
+// --- Camera controls -------------------------------------------------
+//
+// Sent as a "camera" object, and only for fields the operator has
+// actually touched: on the drone, an absent field means "leave this
+// control alone", so writing every slider's current position would
+// overwrite settings nobody asked to change.
+const CAM_SLIDERS = ["exposure", "gain", "white_balance", "brightness",
+                     "contrast", "saturation"];
+const CAM_TOGGLES = ["auto_exposure", "auto_white_balance"];
+// Which fields this session has deliberately set. Starts empty so a page
+// load does not immediately push a full set of defaults at the camera.
+let camTouched = new Set();
+
+function camEl(name) { return document.getElementById("cam_" + name); }
+
+function updateCamGating() {
+  // A manual control is inert while its auto mode is on -- the camera
+  // rejects it outright (with EPERM, which the drone translates into a
+  // readable message). Reflecting that here means the UI never looks like
+  // it is doing something it is not.
+  const pairs = [["auto_exposure", "exposure"],
+                 ["auto_white_balance", "white_balance"]];
+  for (const [auto, manual] of pairs) {
+    const on = camEl(auto).checked;
+    const wrap = document.getElementById("wrap_" + manual);
+    if (wrap) wrap.className = on ? "field gated" : "field";
+    camEl(manual).disabled = on;
+  }
+}
+
+function buildCameraObject() {
+  const cam = {};
+  for (const name of CAM_TOGGLES) {
+    if (camTouched.has(name)) cam[name] = camEl(name).checked;
+  }
+  for (const name of CAM_SLIDERS) {
+    if (camTouched.has(name)) cam[name] = Number(camEl(name).value);
+  }
+  return cam;
+}
+
+for (const name of CAM_SLIDERS) {
+  const el = camEl(name);
+  const out = document.getElementById("v_" + name);
+  el.addEventListener("input", () => { out.textContent = el.value; });
+  el.addEventListener("change", () => {
+    camTouched.add(name);
+    applyConfig();
+  });
+}
+for (const name of CAM_TOGGLES) {
+  camEl(name).addEventListener("change", () => {
+    camTouched.add(name);
+    // Turning auto off is only useful alongside a manual value, and the
+    // drone needs both in the same push -- sending the toggle alone would
+    // leave the camera in manual mode at whatever it happened to hold.
+    if (!camEl(name).checked) {
+      camTouched.add(name === "auto_exposure" ? "exposure" : "white_balance");
+    }
+    updateCamGating();
+    applyConfig();
+  });
+}
+
+// --- Capture controls ------------------------------------------------
+function setButtonLabel(btn, iconClass, text) {
+  btn.textContent = "";
+  const icon = document.createElement("i");
+  icon.className = "ico " + iconClass;
+  btn.appendChild(icon);
+  btn.appendChild(document.createTextNode(text));
+}
+
+// --- Preview stream ----------------------------------------------------
+//
+// The preview is any frame bus stream on this machine. The choice is
+// remembered per browser; storage can be unavailable (private windows),
+// so every access is guarded and the page works without it.
+const previewSel = document.getElementById("preview_src");
+let previewSrc = "pilot";
+try { previewSrc = localStorage.getItem("preview_src") || previewSrc; }
+catch (e) { /* no storage: use the default */ }
+
+function showPreview(name) {
+  previewSrc = name;
+  try { localStorage.setItem("preview_src", name); } catch (e) {}
+  // A fresh URL each time, so the browser drops the old multipart stream.
+  document.getElementById("video").src =
+    "/stream?src=" + encodeURIComponent(name) + "&t=" + Date.now();
+}
+
+let lastStreams = "";
+async function loadStreams() {
+  let names = [];
+  try {
+    const r = await fetch("/api/streams", { cache: "no-store" });
+    names = (await r.json()).streams || [];
+  } catch (e) { /* the health poll reports an unreachable topside */ }
+  // Keep the current choice listed even if it is not up right now, and
+  // leave the menu alone unless the list changed (it may be open).
+  if (!names.includes(previewSrc)) names.unshift(previewSrc);
+  if (names.join("\n") === lastStreams) return;
+  lastStreams = names.join("\n");
+  previewSel.innerHTML = "";
+  for (const n of names) {
+    const o = document.createElement("option");
+    o.value = n;
+    o.textContent = n;
+    if (n === previewSrc) o.selected = true;
+    previewSel.appendChild(o);
+  }
+}
+previewSel.addEventListener("change", () => showPreview(previewSel.value));
+loadStreams();
+setInterval(loadStreams, 5000);
+showPreview(previewSrc);
+
+const btnRecord = document.getElementById("btn-record");
+const btnSnap = document.getElementById("btn-snap");
+const captureMsg = document.getElementById("capturemsg");
+setButtonLabel(document.getElementById("btn-record"), "dot", "Record");
+setButtonLabel(document.getElementById("btn-snap"), "ring", "Snapshot");
+// Tracked so the poll can restyle the button without fighting a click
+// that is still in flight -- the server is the authority on whether a
+// recording is running, but a half-second of lag should not make the
+// button flicker back and forth.
+let recording = false;
+let recordBusy = false;
+
+function setCaptureMsg(text, cls) {
+  captureMsg.textContent = text;
+  captureMsg.className = cls || "";
+}
+
+btnRecord.addEventListener("click", async () => {
+  if (recordBusy) return;
+  recordBusy = true;
+  btnRecord.disabled = true;
+  const action = recording ? "stop" : "start";
+  setCaptureMsg(action === "start" ? "Starting..." : "Finalizing...");
+  try {
+    const r = await fetch("/record", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        action,
+      }),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      setCaptureMsg(action === "start" ? "Recording to " + j.detail
+                                       : "Saved " + j.detail, "ok");
+    } else {
+      setCaptureMsg(j.detail || "failed", "err");
+    }
+  } catch (e) {
+    setCaptureMsg("Request failed: " + e, "err");
+  } finally {
+    recordBusy = false;
+    btnRecord.disabled = false;
+  }
+});
+
+btnSnap.addEventListener("click", async () => {
+  btnSnap.disabled = true;
+  try {
+    const r = await fetch("/snapshot?src=" + encodeURIComponent(previewSrc),
+                          {method: "POST"});
+    const j = await r.json();
+    if (r.ok) {
+      setCaptureMsg(`Saved ${j.file} (${(j.bytes / 1024).toFixed(0)} KB)`,
+                    "ok");
+    } else {
+      setCaptureMsg(j.error || "snapshot failed", "err");
+    }
+  } catch (e) {
+    setCaptureMsg("Request failed: " + e, "err");
+  } finally {
+    btnSnap.disabled = false;
+  }
+});
+
+function renderRecorder(rec) {
+  if (!rec) return;
+  if (!rec.available) {
+    btnRecord.disabled = true;
+    btnRecord.title = rec.why || "recording is not available here";
+    return;
+  }
+  btnRecord.title = "";
+  if (!recordBusy) btnRecord.disabled = false;
+  recording = !!rec.recording;
+  btnRecord.className = recording ? "on" : "";
+  if (recording) {
+    const mins = Math.floor((rec.elapsed_s || 0) / 60);
+    const secs = Math.floor((rec.elapsed_s || 0) % 60);
+    const clock = `${mins}:${String(secs).padStart(2, "0")}`;
+    let label = `Stop  ${clock}`;
+    if (rec.bytes) label += `  ${(rec.bytes / 1e6).toFixed(0)} MB`;
+    setButtonLabel(btnRecord, "square", label);
+  } else {
+    setButtonLabel(btnRecord, "dot", "Record");
+    // A recorder that died on its own has to say so -- otherwise the
+    // button just quietly un-latches and the dive goes unrecorded.
+    if (rec.error && !recordBusy) setCaptureMsg(rec.error, "err");
+  }
+}
+
+// --- Link and recording health ---------------------------------------
+//
+// Polled rather than pushed: the MJPEG stream carries no metadata, and a
+// second socket for a handful of bytes a second would be more moving
+// parts than this is worth.
+//
+// STALE_AFTER_S has to clear the longest normal gap between preview
+// frames -- at 15fps one arrives every 67ms, but a
+// slow link legitimately stretches that. 2.5s is well past any normal
+// gap and still fast enough that a pilot notices before flying far on a
+// frozen picture.
+const STALE_AFTER_S = 2.5;
+const banner = document.getElementById("banner");
+const video = document.getElementById("video");
+const recstate = document.getElementById("recstate");
+
+function renderHealth(h) {
+  const link = h.link || {};
+  const drone = h.drone || {};
+  renderRecorder(h.recorder);
+
+  // Link first: if the picture is not live, nothing else on screen
+  // matters as much.
+  let stale = false;
+  let message = "";
+  if (!link.have_frame) {
+    stale = true;
+    message = link.connected
+      ? "WAITING FOR VIDEO — connected, no frames yet"
+      : "NO VIDEO — not connected to the drone";
+  } else if (!link.connected) {
+    stale = true;
+    const age = link.age_s === null ? "?" : link.age_s.toFixed(1);
+    message = `LINK LOST — showing a frozen frame from ${age}s ago`;
+  } else if (link.age_s !== null && link.age_s > STALE_AFTER_S) {
+    stale = true;
+    message = `VIDEO STALLED — last frame ${link.age_s.toFixed(1)}s ago`;
+  }
+
+  banner.className = stale ? "stale" : "";
+  banner.textContent = message;
+  video.className = stale ? "stale" : "";
+
+  // Recording. The case this exists for: eeye stopped recording (a full
+  // disk, usually) while the operator still has a path typed in and
+  // believes it is running.
+  const rec = (drone.recording) || {};
+  if (drone.error) {
+    recstate.className = "off";
+    recstate.textContent = "recording: unknown (" + drone.error + ")";
+  } else if (rec.state === "active") {
+    const mb = (rec.bytes / (1024 * 1024)).toFixed(0);
+    let text = `recording: ACTIVE — ${mb} MB written`;
+    if (rec.disk_free_bytes) {
+      const freeMb = rec.disk_free_bytes / (1024 * 1024);
+      text += `, ${freeMb.toFixed(0)} MB free`;
+      // Warn while there is still time to do something about it.
+      if (freeMb < 500 && !stale) {
+        banner.className = "warn";
+        banner.textContent =
+          `DISK NEARLY FULL — ${freeMb.toFixed(0)} MB left`;
+      }
+    }
+    recstate.className = "active";
+    recstate.textContent = text;
+  } else if (rec.state === "failed") {
+    recstate.className = "failed";
+    recstate.textContent = "recording: FAILED — " + (rec.error || "unknown");
+    if (!stale) {
+      banner.className = "warn";
+      banner.textContent = "NOT RECORDING — " + (rec.error || "write failed");
+    }
+  } else {
+    recstate.className = "off";
+    recstate.textContent = "recording: off";
+  }
+
+  // A health file that stopped being updated means eeye is wedged or
+  // gone -- which reads as healthy if you only look at its contents.
+  if (drone.age_s !== undefined && drone.age_s > 5 && !stale) {
+    banner.className = "warn";
+    banner.textContent =
+      `DRONE NOT REPORTING — last health update ${drone.age_s.toFixed(0)}s ago`;
+  }
+}
+
+async function pollHealth() {
+  try {
+    const r = await fetch("/health?src=" + encodeURIComponent(previewSrc),
+                          { cache: "no-store" });
+    renderHealth(await r.json());
+  } catch (e) {
+    // The topside server itself is unreachable -- the browser cannot
+    // reach the machine it loaded this page from, so nothing on screen
+    // can be trusted to be current.
+    banner.className = "stale";
+    banner.textContent = "TOPSIDE UNREACHABLE — display is frozen";
+    video.className = "stale";
+  }
+}
+setInterval(pollHealth, 1000);
+pollHealth();
+
+refreshFromDrone();
+</script>
+</body>
+</html>

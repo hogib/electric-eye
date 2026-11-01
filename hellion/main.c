@@ -5,6 +5,7 @@
 //   hellion check [-n name]        one-shot health check; exit 0/1/2
 #define _POSIX_C_SOURCE 200809L
 
+#include "control.h"
 #include "hconfig.h"
 #include "hellion.h"
 #include "hlog.h"
@@ -59,6 +60,7 @@ static int run(const char *config_path) {
          cfg.pipeline_count == 1 ? "" : "s", config_path);
 
   HsWriter *status = hs_writer_open(cfg.name);
+  Control *control = control_start(&cfg);
 
   Pipeline *pipes[hcfg_max_pipelines] = {0};
   for (size_t i = 0; i < cfg.pipeline_count; i++)
@@ -91,6 +93,7 @@ static int run(const char *config_path) {
       }
     }
     hs_writer_publish(status, &snap);
+    control_set_status(control, &snap);
 
     struct timespec ts = {0, (long)status_period_ms * 1000000L};
     nanosleep(&ts, NULL); // a signal cuts it short, which is fine
@@ -99,6 +102,7 @@ static int run(const char *config_path) {
   printf("hellion \"%s\" stopping\n", cfg.name);
   for (size_t i = 0; i < cfg.pipeline_count; i++)
     pipeline_stop(pipes[i]);
+  control_stop(control);
   hs_writer_close(status);
   printf("hellion \"%s\" stopped\n", cfg.name);
   if (capturing)

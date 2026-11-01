@@ -103,6 +103,13 @@ typedef struct {
   char name[hcfg_max_name];
   char role[16];
   char eeye_config[256];
+  // HTTP: where to serve the page and API ("" = not at all), the hellion
+  // at the other end of the tether, the stream the page previews by
+  // default, and where snapshots go.
+  char control[hcfg_max_spec];
+  char peer[hcfg_max_spec];
+  char preview[hcfg_max_name];
+  char snapshot_dir[256];
   size_t pipeline_count;
   PipelineConfig pipelines[hcfg_max_pipelines];
 } HellionConfig;

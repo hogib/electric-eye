@@ -29,7 +29,7 @@ Two things shape almost every design decision in the codebase:
 | [effects.md](effects.md) | The effect chain, every operator, LUT fusion, the buffer ping-pong |
 | [output.md](output.md) | Virtual camera, preview stream, recording, health reporting |
 | [bus.md](bus.md) | The frame bus: streams between programs, its byte layout, reading it from C or Python |
-| [hellion.md](hellion.md) | The tether relay: pipelines, RTP over the tether and to QGC, the two placements, `hellion top`, `hellion check` |
+| [hellion.md](hellion.md) | The tether relay: pipelines, RTP over the tether and to QGC, the two placements, the browser page and its API, `hellion top`, `hellion check` |
 | [config.md](config.md) | Every config key, the hot-reload contract, the parser |
 | [topside.md](topside.md) | Web UI, config agent, network tooling, tether addressing |
 | [testing.md](testing.md) | Test suites, and the bit-exactness harness for SIMD work |

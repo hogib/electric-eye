@@ -1,6 +1,7 @@
 {
   "name": "rov",
   "role": "rov",
+  "control": "8091",
   "eeye_config": "/var/lib/eeye/effects.json",
   "pipelines": [
     {"name": "pilot-up", "source": "bus:pilot", "framerate": 30,

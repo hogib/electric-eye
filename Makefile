@@ -11,7 +11,7 @@
 # here needs make 4.x: no !=, no .ONESHELL, no $(file).
 #
 # Everything is overridable from the command line or environment: CC,
-# CFLAGS, CPPFLAGS, LDFLAGS, LDLIBS, BUILDDIR, PKG_CONFIG, PYTHON, and
+# HOSTCC, CFLAGS, CPPFLAGS, LDFLAGS, LDLIBS, BUILDDIR, PKG_CONFIG, PYTHON, and
 #   OPENMP=0|1                   default: on if $(CC) can build with it
 #   TURBOJPEG_CFLAGS/_LIBS       default: pkg-config, else -lturbojpeg
 # e.g. a libjpeg-turbo built from source into /opt/ljt:
@@ -22,6 +22,9 @@ BUILDDIR ?= builddir
 BUILD ?= debugoptimized
 PKG_CONFIG ?= pkg-config
 PYTHON ?= python3
+# Builds tools that run during the build (the page embedder); differs from
+# CC only when cross-compiling.
+HOSTCC ?= cc
 
 ifeq ($(BUILD),debugoptimized)
 OPTFLAGS := -O2 -g
@@ -113,10 +116,13 @@ SRC := \
 # (the frame bus, child processes, camera capture, the loopback output).
 HSRC := \
 	hellion/check.c \
+	hellion/control.c \
 	hellion/ffmpeg.c \
 	hellion/hconfig.c \
 	hellion/hlog.c \
 	hellion/hstatus.c \
+	hellion/http.c \
+	hellion/jpeg.c \
 	hellion/main.c \
 	hellion/pipeline.c \
 	hellion/sinks.c \
@@ -140,8 +146,22 @@ all: $(BUILDDIR)/$(EXE) $(BUILDDIR)/$(HEXE)
 $(BUILDDIR)/$(EXE): $(call obj,$(SRC))
 	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ $^ $(ALL_LDLIBS)
 
-$(BUILDDIR)/$(HEXE): $(call obj,$(HSRC))
+$(BUILDDIR)/$(HEXE): $(call obj,$(HSRC)) $(OBJDIR)/gen/page.o
 	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ $^ $(ALL_LDLIBS)
+
+# The web page goes inside the binary: hellion/web/index.html becomes a C
+# array through a small tool built for the build machine (HOSTCC), so a
+# cross build still runs it here.
+$(BUILDDIR)/embed: hellion/embed.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -O2 -o $@ $<
+
+$(OBJDIR)/gen/page.c: hellion/web/index.html $(BUILDDIR)/embed
+	@mkdir -p $(dir $@)
+	$(BUILDDIR)/embed page_html $< $@
+
+$(OBJDIR)/gen/page.o: $(OBJDIR)/gen/page.c
+	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 $(OBJDIR)/hellion/%.o: EE_CPPFLAGS += -Ihellion
 
@@ -157,7 +177,7 @@ $(OBJDIR)/%.o: %.c
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
 	canny health camera_ctrl recorder stream_server effect_chain child_proc \
-	virtual_cam fbus hellion
+	virtual_cam fbus hellion http
 
 # Extra translation units each test needs beyond the one it includes:
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
@@ -176,8 +196,9 @@ test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
 test_stream_server_SRC := src/video_frame.c
 test_child_proc_SRC :=
 test_fbus_SRC :=
+test_http_SRC :=
 test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
-	hellion/hstatus.c hellion/udp_relay.c \
+	hellion/hstatus.c hellion/http.c hellion/jpeg.c hellion/udp_relay.c \
 	hellion/pipeline.c hellion/sinks.c src/camera_ctrl.c src/child_proc.c \
 	src/fbus.c src/jpeg_decode.c src/rpicam_in.c src/v4l2_in.c src/v4l2_out.c \
 	src/video_frame.c src/virtual_cam.c
@@ -228,6 +249,21 @@ check-record:
 endif
 
 check: $(CHECKS)
+
+# Fuzzes hellion's HTTP parsers with libFuzzer (needs clang): the one part
+# of hellion that parses bytes from the network. Not part of `check` --
+# it runs until FUZZ_SECONDS is up. Seeds live in tests/fuzz_http_seeds/;
+# anything new it finds goes into $(BUILDDIR)/fuzz-http-corpus/.
+FUZZ_CC ?= clang
+FUZZ_SECONDS ?= 60
+.PHONY: fuzz-http
+fuzz-http:
+	@mkdir -p $(BUILDDIR)/fuzz-http-corpus
+	$(FUZZ_CC) -g -O1 -std=gnu99 -Isrc -Ihellion \
+	  -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+	  -o $(BUILDDIR)/fuzz_http tests/fuzz_http.c
+	$(BUILDDIR)/fuzz_http -max_total_time=$(FUZZ_SECONDS) -max_len=9000 \
+	  $(BUILDDIR)/fuzz-http-corpus tests/fuzz_http_seeds
 
 clean:
 	rm -rf $(BUILDDIR)

@@ -385,6 +385,9 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
   memset(&cfg, 0, sizeof cfg);
   snprintf(cfg.name, sizeof cfg.name, "hellion");
   snprintf(cfg.role, sizeof cfg.role, "rov");
+  snprintf(cfg.preview, sizeof cfg.preview, "pilot");
+  snprintf(cfg.snapshot_dir, sizeof cfg.snapshot_dir,
+           "/var/lib/hellion/snapshots");
 
   Cursor c = {.s = buf, .len = len, .pos = 0};
   skip_ws(&c);
@@ -421,6 +424,34 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
             (strcmp(cfg.role, "rov") != 0 &&
              strcmp(cfg.role, "topside") != 0)) {
           printf("hellion config: \"role\" must be \"rov\" or \"topside\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "control") == 0) {
+        if (!parse_string(&c, cfg.control, sizeof cfg.control) ||
+            (cfg.control[0] && !valid_port(cfg.control) &&
+             !valid_host_port(cfg.control))) {
+          printf("hellion config: \"control\" must be a port (\"8080\"), "
+                 "\"addr:port\", or \"\" for no web page\n");
+          return false;
+        }
+      } else if (strcmp(key, "peer") == 0) {
+        if (!parse_string(&c, cfg.peer, sizeof cfg.peer) ||
+            (cfg.peer[0] && !valid_host_port(cfg.peer))) {
+          printf("hellion config: \"peer\" must be \"host:port\" (the "
+                 "other hellion's \"control\"), or \"\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "preview") == 0) {
+        if (!parse_string(&c, cfg.preview, sizeof cfg.preview) ||
+            !fbus_valid_name(cfg.preview)) {
+          printf("hellion config: \"preview\" must be a stream name\n");
+          return false;
+        }
+      } else if (strcmp(key, "snapshot_dir") == 0) {
+        if (!parse_string(&c, cfg.snapshot_dir, sizeof cfg.snapshot_dir) ||
+            cfg.snapshot_dir[0] != '/') {
+          printf("hellion config: \"snapshot_dir\" must be an absolute "
+                 "path\n");
           return false;
         }
       } else if (strcmp(key, "eeye_config") == 0) {
