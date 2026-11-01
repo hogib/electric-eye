@@ -1,0 +1,3 @@
+# Fuzz seeds are raw HTTP: their CRLFs are the point, so no line-ending
+# conversion (core.autocrlf would turn them into LF).
+tests/fuzz_http_seeds/** -text
