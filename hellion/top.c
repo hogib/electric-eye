@@ -77,15 +77,22 @@ static void line_end(void) {
   line_reset();
 }
 
+// Not inlined, on purpose: inlined into a caller whose states are a few
+// short literals, GCC 15 "proves" the longer names in the tables below can
+// never match them and warns (-Wstring-compare) -- true, and harmless.
+__attribute__((noinline)) static bool same(const char *a, const char *b) {
+  return strcmp(a, b) == 0;
+}
+
 static Color state_color(const char *state) {
   static const char *const good[] = {"running", "publishing", "writing",
                                      "sending", "receiving", "alive", "ok"};
   static const char *const meh[] = {"waiting", "idle", "starting", "stale"};
   for (size_t i = 0; i < sizeof good / sizeof good[0]; i++)
-    if (strcmp(state, good[i]) == 0)
+    if (same(state, good[i]))
       return C_OK;
   for (size_t i = 0; i < sizeof meh / sizeof meh[0]; i++)
-    if (strcmp(state, meh[i]) == 0)
+    if (same(state, meh[i]))
       return C_WARN;
   return C_BAD;
 }
