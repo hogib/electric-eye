@@ -1,6 +1,6 @@
 # Testing
 
-14 suites, ~190 tests, run with `make check` (`-j` runs them in parallel).
+16 suites, ~210 tests, run with `make check` (`-j` runs them in parallel).
 
 ## The suites
 
@@ -18,6 +18,8 @@
 | `stream_server` | Preview thread: complete JPEGs, a viewer that never reads gets dropped, offers never block |
 | `camera_ctrl` | Range scaling, unit conversion, rpicam argv |
 | `health` | Health file contents and escaping |
+| `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group |
+| `virtual_cam` | The optional webcam output: quiet checks for a missing device, back-off for one that will not open. `EEYE_TEST_LOOPBACK=/dev/videoN` also writes to a real one |
 | `topside` | Python: link staleness, health relay, recorder |
 | `record` | Python: duration parsing, ffmpeg command construction |
 

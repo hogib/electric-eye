@@ -7,7 +7,7 @@
 #include "stream_server.h"
 #include "rpicam_in.h"
 #include "v4l2_in.h"
-#include "v4l2_out.h"
+#include "virtual_cam.h"
 #include "video_frame.h"
 #include <errno.h>
 #include <linux/videodev2.h>
@@ -113,11 +113,9 @@ void *producer_loop(void *arg) {
   // time; an empty ring_buffer_in is already something they handle by
   // idling, so the rest of the pipeline just pauses rather than dying.
   //
-  // This intentionally does NOT extend to consumer_loop's v4l2loopback
-  // device: a missing v4l2loopback kernel module is a setup problem no
-  // amount of retrying open() fixes, unlike a USB camera that may
-  // genuinely come back. That class of failure is left to exit the process
-  // and rely on the systemd unit's Restart= for recovery instead.
+  // consumer_loop's v4l2loopback output has its own, independent retry
+  // (virtual_cam.c), so neither end of the pipeline waiting on its device
+  // stops the other.
   while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
     CaptureHandle in;
     if (!capture_open(args, &in)) {
@@ -188,6 +186,7 @@ void *producer_loop(void *arg) {
       }
 
       frame->pts = pts++;
+      frame->capture_ns = 0; // a backend that knows better sets it
 
       if (!capture_frame(&in, frame)) {
         // v4l2_in_capture already retried transient per-frame decode
@@ -203,6 +202,10 @@ void *producer_loop(void *arg) {
         ring_push_wait(args->ring_buffer_free, frame, NULL);
         break;
       }
+      // No driver timestamp (rpicam, or a driver stamping another clock):
+      // the moment it arrived is the next best thing.
+      if (frame->capture_ns == 0)
+        frame->capture_ns = vf_now_ns();
 
       ring_push_wait(args->ring_buffer_in, frame, args->is_running);
     }
@@ -269,12 +272,10 @@ void *effects_loop(void *arg) {
 void *consumer_loop(void *arg) {
   ConsumerArgs *args = (ConsumerArgs *)arg;
 
-  V4l2Out *out = v4l2_out_open(args->outpath, args->frame_width,
-                               args->frame_height, V4L2_PIX_FMT_YUV422P);
-  if (!out) {
-    __atomic_store_n(args->is_running, false, __ATOMIC_SEQ_CST);
-    return NULL;
-  }
+  // Optional: a missing or failing loopback device is retried by
+  // virtual_cam.c and never stops the pipeline (see virtual_cam.h).
+  VirtualCam *vcam = virtual_cam_create(args->outpath, args->frame_width,
+                                        args->frame_height);
 
   // Live-preview stream tap (see stream_server.h): unlike the virtual-cam
   // write above, this is genuinely optional -- a topside viewer over the
@@ -321,17 +322,8 @@ void *consumer_loop(void *arg) {
     }
 
     // The pilot's feed first, before any optional tap gets a look at the
-    // frame.
-    if (!v4l2_out_write(out, frame)) {
-      // The loopback device went away or rejected the frame. Stop the whole
-      // pipeline rather than spinning on a dead device.
-      printf("Virtual camera write failed; shutting down.\n");
-      // NULL: this frame must go back to the pool regardless of
-      // is_running (which the very next line is about to clear anyway).
-      ring_push_wait(args->ring_buffer_free, frame, NULL);
-      __atomic_store_n(args->is_running, false, __ATOMIC_SEQ_CST);
-      break;
-    }
+    // frame. A failure is handled (and logged) inside virtual_cam.c.
+    virtual_cam_write(vcam, frame);
 
     // Independent config read from effects_loop's -- this frame's chain
     // was already decided by the time it got here, but the recording
@@ -409,7 +401,7 @@ void *consumer_loop(void *arg) {
   // Drains and closes the recording, returning any frames it still holds.
   recorder_destroy(recorder);
   stream_server_close(stream);
-  v4l2_out_close(out);
+  virtual_cam_destroy(vcam);
   return NULL;
 }
 

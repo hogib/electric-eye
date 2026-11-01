@@ -20,43 +20,44 @@ This was investigated and explicitly rejected as an optimization: v4l2loopback s
 one buffer between `write()` and its MMAP output path, so MMAP would not have saved a
 copy. Checked against the driver source before writing any code.
 
-**A failed write is fatal to the run.** Unlike a missing camera, a loopback device that
-went away or rejected a frame is not something retrying fixes, so `consumer_loop` stops
-the whole pipeline rather than spinning on a dead device. Recovery is the systemd
-unit's `Restart=`.
+### Optional, and retried
 
-### Loading the module
+`output_device` sets the device (`""` turns it off). It is **optional**: a device that
+is missing at startup, or a write that fails mid-run, is logged and retried, and the
+rest of the pipeline carries on. `virtual_cam.c` owns the retry:
 
-`virtual_cam_ensure_loaded()` runs `modprobe` (via fork/exec, not `system()`, so a
-caller-controlled `card_label` is never shell-interpreted).
+| Situation | Retry | Logged |
+|---|---|---|
+| Device node missing | stat every 2s | once, with why it might be missing |
+| Node exists, open fails | backs off 2s → 4s → … → 30s | each attempt, with the reason |
+| Node opens at a different frame size | same back-off | each attempt |
+| A write fails | closed at once, reopened 2s later | once |
 
-Two non-obvious behaviors:
+It used to be fatal, with systemd's `Restart=` as the recovery. That coupled restarts:
+under `exclusive_caps=1`, a reader holding the device can stop a restarted `eeye` from
+reopening it for a moment, and those failures counted against the unit's start limit.
+The webcam device is a convenience for programs that only know webcams; it must not be
+able to take the pipeline down.
 
-- **`modprobe` succeeding does not mean `/dev/videoN` exists yet.** udev creates the
-  node asynchronously and can lag module insertion by tens of milliseconds. The code
-  polls for the path (up to 2s, 50ms steps) rather than letting that race surface as a
-  confusing `ENOENT` deep inside `v4l2_out_open()`.
-- **Loading a module needs `CAP_SYS_MODULE`**, which a plain user — even one in the
-  `video` group — does not have. `eeye.service` grants exactly that one capability via
-  `AmbientCapabilities` rather than running the whole daemon as root.
+### The module is loaded at boot, not by `eeye`
 
-If the module was already loaded before this process started, `eeye` leaves its
-parameters alone and will not unload it on exit. It only unloads a module it loaded
-itself, so it cannot pull the device out from under another consumer.
+`install.sh` puts v4l2loopback in `/etc/modules-load.d` with its options in
+`/etc/modprobe.d`. `eeye` never runs `modprobe`, so it needs no `CAP_SYS_MODULE` (the
+unit runs with no capabilities at all), and it can never unload the module out from
+under another program.
 
 ### The Secure Boot diagnostic
 
-A failed `modprobe` is commonly misread as a permissions problem. On Secure Boot
-systems the far more likely cause is that `v4l2loopback-dkms` built and signed the
-module fine, but the signing key was never enrolled — the kernel then refuses to load
-any unenrolled out-of-tree module with **the exact same EPERM** a missing
-`CAP_SYS_MODULE` produces.
+When the device is missing because the module isn't loaded, `eeye` says how to load it,
+and checks for the case that is commonly misread as a permissions problem. On Secure
+Boot systems `v4l2loopback-dkms` may have built and signed the module fine, but the
+signing key was never enrolled — the kernel then refuses to load any unenrolled
+out-of-tree module with **the same EPERM** a permissions problem produces.
 
 Distinguishing them would ideally mean reading dmesg for the lockdown message, but
-`kernel.dmesg_restrict` (the Debian/Ubuntu default) blocks that for anything short of
-root or `CAP_SYSLOG` — exactly the case `eeye.service` runs under. So the code shells
-out to `mokutil`, which reads EFI variables and needs no special capability, and prints
-MOK enrollment guidance instead of "run as root".
+`kernel.dmesg_restrict` (the Debian/Ubuntu default) blocks that for an unprivileged
+process. So `eeye` runs `mokutil`, which reads EFI variables and needs no special
+capability, and mentions MOK enrollment when one is pending.
 
 ## Preview stream (`stream_server.c`)
 

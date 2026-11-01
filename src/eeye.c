@@ -11,7 +11,6 @@
 #include "v4l2_in.h"
 #include "video_frame.h"
 #include "video_threads.h"
-#include "virtual_cam.h"
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -33,11 +32,10 @@ extern char **environ;
 // deliberately no compile-time default here to drift out of sync with
 // config_defaults, which is the single source of truth for the fallback.
 
-// virtual_cam_ensure_loaded() is what actually makes virtual_cam_device_path
-// exist; cons_args.outpath below points at the same path.
-static const uint32_t virtual_cam_video_nr = 10;
-static const char virtual_cam_card_label[] = "VirtualCam";
-static const char virtual_cam_device_path[] = "/dev/video10";
+// The camera and v4l2loopback device paths, copied out of the startup
+// config: the arg structs below keep pointers to them for the whole run.
+static char capture_device[max_device_path_len];
+static char output_device[max_device_path_len];
 
 // Live-preview stream tap (see stream_server.h). Off by default (Config's
 // stream_frame_interval starts at 0); this is only the port it listens on
@@ -82,27 +80,17 @@ static void handle_shutdown_signal(int sig) {
 }
 
 /*
- * .filename is the V4L2 camera device (MJPEG capture -- see v4l2_in.h).
- * .outpath is the v4l2loopback virtual camera device.
+ * .filename is the V4L2 camera device, .outpath the v4l2loopback device;
+ * both come from the config ("capture_device", "output_device") and are
+ * filled in by main().
  *
- * ffmpeg is no longer required at build or run time; both ends of the
- * pipeline talk directly to their /dev/videoN devices now.
- *
- * One-time host setup required:
- *   sudo apt install v4l2loopback-dkms libturbojpeg0-dev
- *
- * v4l2loopback itself no longer needs to be modprobed by hand -- see
- * virtual_cam.c, called from main() below -- but loading a kernel module
- * needs CAP_SYS_MODULE, so this binary must run as root (e.g. `sudo
- * ./eeye`) or, under eeye.service, with the AmbientCapabilities=
- * CAP_SYS_MODULE line already set there. Without either, startup fails
- * fast with the equivalent manual `sudo modprobe` command printed.
- *
- * Confirm your real camera's device number with:
+ * The v4l2loopback output is optional and eeye never loads the module:
+ * install.sh loads it at boot, and virtual_cam.c explains and keeps
+ * retrying if it is missing. So eeye needs no capabilities beyond the
+ * 'video' group. Confirm your camera's device with:
  *   v4l2-ctl --list-devices
  */
-ProducerArgs prod_args = {.filename = "/dev/video0",
-                          .is_running = &is_running,
+ProducerArgs prod_args = {.is_running = &is_running,
                           .ring_buffer_in = &ring_buffer_in,
                           .ring_buffer_free = &ring_buffer_free};
 
@@ -118,7 +106,6 @@ WorkerArgs work_args = {
 };
 
 ConsumerArgs cons_args = {
-    .outpath = virtual_cam_device_path,
     .is_running = &is_running,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
@@ -240,6 +227,13 @@ int main(int argc, char **argv) {
   uint32_t capture_width = startup_config.capture_width;
   uint32_t capture_height = startup_config.capture_height;
 
+  snprintf(capture_device, sizeof capture_device, "%s",
+           startup_config.capture_device);
+  snprintf(output_device, sizeof output_device, "%s",
+           startup_config.output_device);
+  prod_args.filename = capture_device;
+  cons_args.outpath = output_device;
+
   // Settle CAPTURE_AUTO here, once, rather than in producer_loop: the
   // reconnect loop there runs repeatedly, and re-probing on every retry
   // would let the backend silently change mid-session (e.g. a USB webcam
@@ -309,23 +303,6 @@ int main(int argc, char **argv) {
   } else {
     printf("Geometry: %ux%u, no downscaling\n", out_width, out_height);
   }
-
-  // Loads v4l2loopback (if not already loaded) so the one-time `sudo
-  // modprobe ...` from this file's header comment no longer has to be run
-  // by hand before every launch. atexit() -- rather than a call at the
-  // bottom of main() -- covers every return path below uniformly,
-  // including the early failure returns that follow. Registered before
-  // the call it guards (not after): virtual_cam_ensure_loaded() can load
-  // the module and then still fail (device node never appeared) -- in
-  // which case it has already set the "we loaded it" state that
-  // virtual_cam_unload() checks, so cleanup must still run on the
-  // immediate `return 1` below. virtual_cam_unload() itself is a no-op
-  // whenever that state wasn't set, so registering it unconditionally
-  // here is always safe.
-  atexit(virtual_cam_unload);
-  if (!virtual_cam_ensure_loaded(virtual_cam_video_nr, virtual_cam_card_label,
-                                 virtual_cam_device_path))
-    return 1;
 
   printf("Initializing pipeline...\n");
   ring_init(&ring_buffer_in);

@@ -1,8 +1,13 @@
+// _POSIX_C_SOURCE before any header include: clock_gettime() is hidden
+// under strict ISO mode (-std=c99) without it. Same guard as v4l2_in.c.
+#define _POSIX_C_SOURCE 200809L
+
 #include "video_frame.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  *@params:
@@ -181,4 +186,10 @@ VideoFrame **vf_pool_create(unsigned int pool_size, uint32_t width,
   }
 
   return pool;
+}
+
+uint64_t vf_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }

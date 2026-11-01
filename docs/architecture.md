@@ -184,13 +184,13 @@ five blocked pushes.
 4. **Resolve `capture_source`** if it is `auto` (probes for a Pi camera).
 5. **`v4l2_in_negotiate_size()`** (V4L2 backend only) — asks the camera what it can
    actually do and rewrites the requested geometry. Advisory; failure is fine.
-6. **Load v4l2loopback** via `virtual_cam_ensure_loaded()`, with `atexit` registered
-   *first* so cleanup runs even on the failure path.
+6. *(Nothing here touches v4l2loopback: the module is loaded at boot, and the output
+   device is opened lazily by `consumer_loop` — see [output.md](output.md).)*
 7. **Allocate the frame pool** at the now-final output geometry.
 8. **Start the config watcher**, then the three pipeline threads, then stats.
 
-Step 3 deliberately precedes step 6: a bad config should fail without having loaded a
-kernel module. Step 5 must precede step 7 because the pool is sized from the negotiated
+Step 3 deliberately comes first: a bad config should fail before anything is allocated.
+Step 5 must precede step 7 because the pool is sized from the negotiated
 geometry and every frame in it has to match what the camera is eventually opened at.
 
 ## Shutdown
@@ -206,11 +206,7 @@ effects and consumer loops additionally keep running while their input ring is
 non-empty, so in-flight frames are finished rather than dropped. On its way out the
 consumer stops the recorder, which writes whatever it still has queued, closes the file
 and returns its frames to the pool, then stops the stream thread. Then: join, final
-stats snapshot, free the pool, and `atexit` unloads v4l2loopback if this process loaded
-it.
-
-`virtual_cam_unload()` only unloads a module this process loaded — it will not yank the
-device out from under another consumer that set it up independently.
+stats snapshot, free the pool.
 
 ## Camera reconnection
 
@@ -221,10 +217,8 @@ lag process start) and "camera disappeared mid-session" with the same mechanism.
 Retry is every 2s, logged on the first failure and then every 15th attempt (~30s) so an
 unplugged camera does not flood the log for hours.
 
-**This deliberately does not extend to the loopback device.** A missing v4l2loopback
-module is a setup problem no amount of retrying `open()` fixes, unlike a USB camera
-that may genuinely come back. That class of failure exits the process and relies on the
-systemd unit's `Restart=` instead.
+The loopback output has its own, independent retry in `virtual_cam.c` (see
+[output.md](output.md)), so neither end waiting on its device stops the other.
 
 One consequence worth remembering: a reconnect calls `v4l2_in_open()` fresh, so a
 replugged camera comes back at its factory defaults. Camera controls are re-applied on
@@ -264,8 +258,8 @@ All in `video_threads.c` unless noted:
 | `send_timeout_ms` | 200 | `stream_server.c`; a viewer that can't take a whole frame in this long is dropped |
 | `frame_pool_size` | 8 | `eeye.c`; frames in circulation, and the worst-case output lag |
 | `recorder_max_queued` | 3 | `recorder.h`; frames the recording thread may hold before it drops |
-| `virtual_cam_video_nr` | 10 | `eeye.c` → `/dev/video10` |
+| `retry_missing_ms` / `retry_max_ms` | 2000 / 30000 | `virtual_cam.c`; checks for a missing output device, and the open back-off cap |
 | `stream_server_port` | 9000 | `eeye.c` |
 
-Framerate and both device paths are compile-time constants. Resolution is not — it
-comes from config.
+Framerate is a compile-time constant. Resolution and both device paths are not — they
+come from config (`capture_device`, `output_device`).

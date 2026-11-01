@@ -83,7 +83,7 @@ StreamServer *stream_server_open(uint16_t port) {
   // (fe80::/64), which every host self-assigns on every live link. An
   // IPv4-only listener is simply unreachable that way -- which is exactly
   // why the tether used to need manual address setup on both ends.
-  int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     printf("stream_server: socket() failed: %s\n", strerror(errno));
     return NULL;
@@ -184,6 +184,8 @@ static void accept_pending(StreamServer *s) {
   int fd = accept(s->listen_fd, NULL, NULL);
   if (fd < 0)
     return; // EAGAIN/EWOULDBLOCK: nothing pending, the common case
+  // accept() does not inherit close-on-exec from the listening socket.
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
 
   // Single-viewer server: last connection wins. The old socket is closed
   // here rather than through drop_client(), which would clear `viewer` for

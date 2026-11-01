@@ -10,7 +10,8 @@ This is the distinction to internalize before changing anything:
 `record_format` (read when a recording starts), `stream_frame_interval`, `stream_quality`, `stream_raw`, and everything under `camera`.
 
 **Startup-only** — read once by `config_load_once()` before any thread exists.
-`capture_width`, `capture_height`, `downscale`, `capture_source`, `capture_format`.
+`capture_width`, `capture_height`, `downscale`, `capture_source`, `capture_format`,
+`capture_device`, `output_device`.
 
 Changing a startup-only key in a running config is **detected, logged, and ignored**:
 
@@ -22,8 +23,8 @@ eeye to apply it.
 
 Warning rather than silence, because a config field that appears to change but does
 nothing is exactly the kind of thing that costs an hour to notice. `capture_source` and
-`capture_format` get their own separate check so the message names the field that
-actually changed.
+`capture_format` get their own separate check, as do the two device paths, so the
+message names the field that actually changed.
 
 **Why geometry cannot be hot-reloaded:** it would mean draining and reallocating the
 frame pool while three threads hold frames from it, plus renegotiating the format on
@@ -49,6 +50,8 @@ has to understand them anyway or every reload of a geometry-carrying file would 
   "downscale": 1,
   "capture_source": "auto",
   "capture_format": "auto",
+  "capture_device": "/dev/video0",
+  "output_device": "/dev/video10",
   "camera": {}
 }
 ```
@@ -113,6 +116,17 @@ or `"yuv420"` for the Pi camera only: raw ISP output with no JPEG encode or deco
 opt-in until verified on hardware (see [capture.md](capture.md)). `"yuv420"` with
 `"capture_source": "v4l2"` is refused at parse time; with `"auto"` it is refused at
 startup if the probe picks V4L2.
+
+### Devices
+
+`capture_device` is the V4L2 camera (default `/dev/video0`; a stable
+`/dev/v4l/by-id/...` name works too, and survives USB re-enumeration). It cannot be
+empty. The rpicam backend ignores it.
+
+`output_device` is the v4l2loopback device the pilot's picture is written to (default
+`/dev/video10`); `""` turns that output off. It is optional at runtime: missing or
+failing, it is logged and retried while the pipeline carries on (see
+[output.md](output.md#optional-and-retried)).
 
 ### Streaming and recording
 

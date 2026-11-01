@@ -21,7 +21,7 @@ V4l2Out *v4l2_out_open(const char *path, uint32_t width, uint32_t height,
                        uint32_t fourcc) {
   // O_RDWR rather than O_WRONLY: V4L2 only requires drivers to accept O_RDWR,
   // and support for write-only opens is optional and inconsistent.
-  int fd = open(path, O_RDWR);
+  int fd = open(path, O_RDWR | O_CLOEXEC);
   if (fd < 0) {
     switch (errno) {
     case ENOENT:

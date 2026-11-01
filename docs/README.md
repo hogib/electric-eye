@@ -83,7 +83,8 @@ namespacing C gives you.
 | `point_opps.c` | `contrast` (the one point op that inspects the frame) |
 | `effect_chain.c` | Chain runner, LUT fusion, buffer ping-pong |
 | `v4l2_out.c` | Writes frames to the loopback device |
-| `virtual_cam.c` | Loads/unloads the v4l2loopback module |
+| `virtual_cam.c` | The optional webcam output: opens lazily, retries, explains a missing module |
+| `child_proc.c` | Runs helper programs (rpicam-vid, mokutil, ffmpeg) safely |
 | `stream_server.c` | JPEG preview tap over TCP, on its own thread |
 | `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |

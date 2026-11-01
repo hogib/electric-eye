@@ -124,7 +124,7 @@ static void switch_target(Recorder *r, const char *path, RecordFormat format) {
     printf("\n");
   }
 
-  r->file = fopen(path, "wb");
+  r->file = fopen(path, "wbe");
   if (!r->file) {
     int err = errno;
     printf("Recording failed to start: could not open %s: %s\n", path,

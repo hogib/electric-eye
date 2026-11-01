@@ -37,7 +37,17 @@ typedef struct {
   // sizes and strides describes all of them.
   size_t plane_sizes[max_planes];
   size_t stride[max_stride];
-  int64_t pts; // Presentation time stamp
+  // Frame number: producer_loop counts it up by exactly one per captured
+  // frame, so a gap downstream means frames were dropped there.
+  int64_t pts;
+
+  // When this frame was captured, as CLOCK_MONOTONIC nanoseconds: the
+  // driver's own timestamp when it gives a monotonic one (V4L2 usually
+  // stamps the moment the frame started arriving), else when eeye received
+  // it. 0 means unknown. Carried through untouched so anything lining
+  // frames up against other sensors -- autonomy, above all -- gets the
+  // camera's time, not the time a frame happened to reach it.
+  uint64_t capture_ns;
 
   // The three allocations behind the role pointers above. Roles can move
   // between them -- effect_chain.c swaps work and spare instead of copying
@@ -56,6 +66,9 @@ typedef struct {
 } VideoFrame;
 
 VideoFrame *vf_create(uint32_t width, uint32_t height, int64_t pts);
+
+// CLOCK_MONOTONIC now, in nanoseconds: the clock capture_ns is on.
+uint64_t vf_now_ns(void);
 void vf_free(VideoFrame *frame);
 
 // Points the work role (pixel_data/planes) at `data`, which must be one of

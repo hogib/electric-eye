@@ -5,16 +5,13 @@
 
 #include "rpicam_in.h"
 #include "camera_ctrl.h"
+#include "child_proc.h"
 #include "jpeg_decode.h"
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 // JPEG quality handed to rpicam-vid. This is the *capture* quality, well
 // above the preview tap's default (stream_quality, 60) because everything
@@ -36,9 +33,12 @@ static const size_t rpicam_max_frame_bytes = 16u * 1024 * 1024;
 // cadence; this is several frame intervals even at low rates.
 static const int rpicam_poll_timeout_ms = 4000;
 
+// How long rpicam_in_close() gives rpicam-vid to exit on SIGTERM before
+// killing it. It normally goes at once.
+static const int rpicam_stop_grace_ms = 1000;
+
 struct RpicamIn {
-  pid_t child;
-  int fd; // read end of the child's stdout
+  ChildProc proc; // rpicam-vid; proc.out_fd is its stdout
 
   uint32_t width; // source geometry, before downscale
   uint32_t height;
@@ -77,40 +77,30 @@ struct RpicamIn {
 // answer the same question -- "is this backend the right one here?" -- so
 // they collapse into one false rather than being distinguished.
 bool rpicam_in_available(void) {
-  int pipefd[2];
-  if (pipe(pipefd) != 0)
+  // Not installed is the usual answer on anything but a Pi, so it is
+  // checked quietly rather than reported as a failed spawn.
+  if (!child_program_exists("rpicam-vid"))
     return false;
 
-  pid_t pid = fork();
-  if (pid < 0) {
-    close(pipefd[0]);
-    close(pipefd[1]);
+  ChildProc proc;
+  char *const argv[] = {"rpicam-vid", "--list-cameras", NULL};
+  if (!child_spawn(&proc, "rpicam_in", argv,
+                   CHILD_PIPE_STDOUT | CHILD_STDERR_TO_STDOUT |
+                       CHILD_NULL_STDIN))
     return false;
-  }
-  if (pid == 0) {
-    close(pipefd[0]);
-    dup2(pipefd[1], STDOUT_FILENO);
-    dup2(pipefd[1], STDERR_FILENO);
-    close(pipefd[1]);
-    char *const argv[] = {"rpicam-vid", "--list-cameras", NULL};
-    execvp(argv[0], argv);
-    _exit(127);
-  }
 
-  close(pipefd[1]);
+  // Generous: listing cameras starts libcamera, which takes a moment.
   char out[4096];
-  size_t total = 0;
-  ssize_t n;
-  while (total + 1 < sizeof out &&
-         (n = read(pipefd[0], out + total, sizeof out - 1 - total)) > 0)
-    total += (size_t)n;
-  out[total] = '\0';
-  close(pipefd[0]);
+  child_read_all(proc.out_fd, out, sizeof out, 10000);
 
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0)
-    return false;
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+  // Its exit status is part of the answer, so wait for it to exit by
+  // itself rather than stopping it.
+  int status = -1;
+  if (!child_wait(&proc, 5000, &status))
+    status = child_stop(&proc, rpicam_stop_grace_ms);
+  else
+    child_stop(&proc, 0); // closes the pipe
+  if (status < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
     return false;
 
   // rpicam-vid prints "Available cameras" followed by an indexed list when
@@ -234,19 +224,6 @@ static bool fill_buffer(RpicamIn *in, size_t limit) {
   if (in->eof)
     return false;
 
-  struct pollfd pfd = {.fd = in->fd, .events = POLLIN, .revents = 0};
-  int pr = poll(&pfd, 1, rpicam_poll_timeout_ms);
-  if (pr < 0) {
-    if (errno == EINTR)
-      return true; // nothing read, but nothing wrong either
-    printf("rpicam_in: poll failed: %s\n", strerror(errno));
-    return false;
-  }
-  if (pr == 0) {
-    printf("rpicam_in: timed out waiting for data from rpicam-vid\n");
-    return false;
-  }
-
   if (in->buf_len == in->buf_cap) {
     if (in->buf_cap >= rpicam_max_frame_bytes) {
       printf("rpicam_in: no complete JPEG within %zu bytes; giving up on "
@@ -269,20 +246,24 @@ static bool fill_buffer(RpicamIn *in, size_t limit) {
   size_t room = in->buf_cap - in->buf_len;
   if (limit - in->buf_len < room)
     room = limit - in->buf_len;
-  ssize_t n = read(in->fd, in->buf + in->buf_len, room);
-  if (n < 0) {
-    if (errno == EINTR || errno == EAGAIN)
-      return true;
-    printf("rpicam_in: read failed: %s\n", strerror(errno));
+  size_t n = 0;
+  switch (child_read_some(in->proc.out_fd, in->buf + in->buf_len, room,
+                          rpicam_poll_timeout_ms, &n)) {
+  case CHILD_IO_OK:
+    in->buf_len += n;
+    return true;
+  case CHILD_IO_TIMEOUT:
+    printf("rpicam_in: timed out waiting for data from rpicam-vid\n");
     return false;
-  }
-  if (n == 0) {
+  case CHILD_IO_EOF:
     printf("rpicam_in: rpicam-vid closed its output\n");
     in->eof = true;
     return false;
+  case CHILD_IO_ERROR:
+  default:
+    printf("rpicam_in: read failed: %s\n", strerror(errno));
+    return false;
   }
-  in->buf_len += (size_t)n;
-  return true;
 }
 
 // Box-averages (or, at downscale 1, copies) one stride-padded yuv420 frame
@@ -465,60 +446,29 @@ RpicamIn *rpicam_in_open(uint32_t width, uint32_t height,
   argv[argc++] = "-";
   argv[argc] = NULL;
 
-  int pipefd[2];
-  if (pipe(pipefd) != 0) {
-    printf("rpicam_in: pipe() failed: %s\n", strerror(errno));
-    return NULL;
-  }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    printf("rpicam_in: fork() failed: %s\n", strerror(errno));
-    close(pipefd[0]);
-    close(pipefd[1]);
-    return NULL;
-  }
-  if (pid == 0) {
-    close(pipefd[0]);
-    dup2(pipefd[1], STDOUT_FILENO);
-    close(pipefd[1]);
-    // rpicam-vid writes progress and camera-tuning chatter to stderr on
-    // every run; it is left attached to this process's stderr so a real
-    // failure (missing camera, bad geometry) is visible to the operator
-    // rather than swallowed.
-    execvp(argv[0], argv);
-    // Reached only if exec failed. Write directly rather than printf:
-    // this is a forked child sharing the parent's stdio buffers.
-    const char msg[] = "rpicam_in: could not execute rpicam-vid (is "
-                       "rpicam-apps installed?)\n";
-    ssize_t ignored = write(STDERR_FILENO, msg, sizeof msg - 1);
-    (void)ignored;
-    _exit(127);
-  }
-
-  close(pipefd[1]);
-
   RpicamIn *in = (RpicamIn *)calloc(1, sizeof(RpicamIn));
-  if (!in) {
-    close(pipefd[0]);
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+  if (!in)
+    return NULL;
+
+  // rpicam-vid writes progress and camera-tuning chatter to stderr on
+  // every run; it is left attached to this process's stderr so a real
+  // failure (missing camera, bad geometry) is visible to the operator
+  // rather than swallowed.
+  if (!child_spawn(&in->proc, "rpicam_in", argv,
+                   CHILD_PIPE_STDOUT | CHILD_NULL_STDIN)) {
+    free(in);
     return NULL;
   }
-  in->child = pid;
-  in->fd = pipefd[0];
   in->width = width;
   in->height = height;
   in->downscale = downscale;
   in->format = yuv420 ? FORMAT_YUV420 : FORMAT_MJPEG;
 
-#if defined(F_SETPIPE_SZ)
   // yuv420 moves ~41MB/s at 720p30 through this pipe; a 1MB pipe buffer
   // (up from 64KB) takes that in a few reads per frame instead of ~20.
   // Best-effort: past /proc/sys/fs/pipe-max-size this simply fails.
   if (yuv420)
-    fcntl(in->fd, F_SETPIPE_SZ, 1 << 20);
-#endif
+    child_set_pipe_size(in->proc.out_fd, 1 << 20);
 
   if (yuv420) {
     in->y_stride = ((size_t)width + 63) & ~(size_t)63;
@@ -571,16 +521,11 @@ void rpicam_in_close(RpicamIn *in) {
   if (!in)
     return;
 
-  if (in->fd >= 0)
-    close(in->fd);
-
-  if (in->child > 0) {
-    // SIGTERM, then reap. rpicam-vid exits promptly on it; closing the
-    // read end above would also make it die of SIGPIPE on its next write,
-    // but waiting for that would mean blocking until it happens to write.
-    kill(in->child, SIGTERM);
-    waitpid(in->child, NULL, 0);
-  }
+  // Closes the pipe, then SIGTERM, then (only if it ignores that) SIGKILL.
+  // rpicam-vid exits promptly on SIGTERM; it would also die of SIGPIPE on
+  // its next write to the closed pipe, but waiting for that would mean
+  // blocking until it happens to write.
+  child_stop(&in->proc, rpicam_stop_grace_ms);
 
   jpeg_decoder_destroy(in->decoder);
   free(in->buf);

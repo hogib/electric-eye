@@ -1,42 +1,44 @@
 #pragma once
+#include "video_frame.h"
 #include <stdbool.h>
 #include <stdint.h>
 
 /*
- * Auto-manages the v4l2loopback kernel module so `sudo modprobe
- * v4l2loopback ...` no longer has to be run by hand before every launch.
+ * The v4l2loopback output: the pilot's picture as a webcam any program can
+ * open (OBS, ffplay, a browser).
  *
- * virtual_cam_ensure_loaded() checks whether v4l2loopback is already loaded
- * (via /sys/module/v4l2loopback) and, if not, loads it with the given
- * video_nr/card_label via modprobe(8) -- this requires the process to have
- * CAP_SYS_MODULE (root, or a passwordless sudo/polkit rule scoped to
- * modprobe). If the module is already loaded, it is left exactly as found:
- * the kernel doesn't re-apply module parameters to an already-loaded
- * module, and doing so would risk pulling the device out from under some
- * *other* consumer that set it up independently -- see virtual_cam_unload().
+ * It is optional. eeye's own output is the frame bus; this device is for
+ * programs that only know webcams. So a device that is missing at startup,
+ * or that goes away mid-run, is logged and retried -- it never stops the
+ * pipeline. That also makes restarts independent: under exclusive_caps=1,
+ * a reader holding the device can keep a restarted eeye from reopening it
+ * for a moment, and that must not count against systemd's restart budget.
  *
- * Either way, this also waits (briefly, bounded) for device_path (e.g.
- * "/dev/video10") to actually appear before returning -- module insertion
- * and udev's creation of the /dev node are two separate asynchronous
- * steps, so a caller that opens device_path immediately after this
- * returns can otherwise lose that race.
+ * eeye does not load the kernel module. install.sh loads it at boot with
+ * the right options; loading it here needed CAP_SYS_MODULE, and unloading
+ * it on exit could pull the device out from under another program.
  *
- * Returns true once device_path exists and is ready to open (whether the
- * module already was, or because this call loaded it), false if loading
- * failed or device_path never appeared -- either way already logged with a
- * manual-fallback command.
+ * Retry policy, so the log stays readable over a long dive:
+ * - device node missing: checked every 2s, silently after the first
+ *   explanation of why it might be missing;
+ * - node present but open fails (busy, wrong module options): backs off
+ *   from 2s to 30s, since each attempt logs v4l2_out_open()'s reason;
+ * - a write fails: closed at once, retried 2s later.
  */
-bool virtual_cam_ensure_loaded(uint32_t video_nr, const char *card_label,
-                               const char *device_path);
 
-/*
- * Unloads v4l2loopback via `modprobe -r`, but only if this same process is
- * the one that loaded it in virtual_cam_ensure_loaded() -- a no-op
- * otherwise (module was already present before this process started, or
- * loading never succeeded), so it's always safe to call unconditionally at
- * shutdown, including via atexit().
- *
- * Failure (e.g. EBUSY because some other process still has the device
- * open) is logged, not fatal -- shutdown proceeds either way.
- */
-void virtual_cam_unload(void);
+typedef struct VirtualCam VirtualCam;
+
+// `path` "" (or NULL) means no v4l2 output; returns NULL then, and every
+// call below treats NULL as a no-op. Never touches the device itself: the
+// first write opens it.
+VirtualCam *virtual_cam_create(const char *path, uint32_t width,
+                               uint32_t height);
+
+// Writes one frame, opening the device first if it is due another try.
+// Returns true only if the frame was written.
+bool virtual_cam_write(VirtualCam *vc, const VideoFrame *frame);
+
+// Whether the device is open and the last write succeeded.
+bool virtual_cam_connected(const VirtualCam *vc);
+
+void virtual_cam_destroy(VirtualCam *vc);

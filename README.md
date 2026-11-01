@@ -48,15 +48,17 @@ compiler has it. Old toolchains are fine: this builds on Debian 7 onward. A
 distro too old to package libturbojpeg 1.4 can point the build at one built from
 source; see the top of the `Makefile`.
 
-Running by hand needs `CAP_SYS_MODULE` to load v4l2loopback — use `sudo`, or
-pre-load the module yourself:
+`eeye` needs no root and no capabilities, just the `video` group. It does not load
+v4l2loopback: `install.sh` sets it to load at boot. On a machine where it isn't loaded,
+load it yourself:
 
 ```sh
 sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1
 ```
 
-The systemd unit grants just that one capability instead of running as root.
-`eeye` only unloads a module it loaded itself, so a pre-loaded one is left alone.
+The v4l2loopback output is optional. If `output_device` is missing, or goes away
+mid-run, `eeye` says why, carries on, and picks it up when it appears. The camera and
+output devices are set by `capture_device` and `output_device` in the config.
 
 ## Field checklist
 
@@ -111,8 +113,8 @@ Logs are the first stop: `journalctl -u eeye -f`, or stdout if running by hand.
 |---|---|---|
 | `Camera unavailable (attempt N)` | Camera not detected. `eeye` retries forever; it does **not** need a restart. | Check the cable. `v4l2-ctl --list-devices` |
 | `Permission denied opening /dev/video0` | Not in the `video` group. | `sudo usermod -aG video $USER`, then log out and back in |
-| `Failed to load v4l2loopback` | Needs `CAP_SYS_MODULE`. | Run with `sudo`, or use the systemd unit |
-| `Failed to load v4l2loopback` **and** Secure Boot is on | Module built but its signing key was never enrolled — the kernel reports this as the same "operation not permitted" a missing capability does. | Reboot and enroll the key at the blue MOK screen. `mokutil --list-new` shows a pending enrollment |
+| `Virtual camera: /dev/video10 does not exist because v4l2loopback is not loaded` | The module isn't loaded. The pipeline still runs; only the webcam device is missing. | `sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1`, or re-run `install.sh` |
+| `modprobe: ... Operation not permitted` **and** Secure Boot is on | Module built but its signing key was never enrolled — the kernel reports this as the same "operation not permitted" a permissions problem does. `eeye` mentions it when it sees a pending enrollment. | Reboot and enroll the key at the blue MOK screen. `mokutil --list-new` shows a pending enrollment |
 | `neither MJPEG nor YUYV is available at exactly WxH` | Camera doesn't offer that mode and negotiation couldn't substitute one. | `v4l2-ctl --list-formats-ext -d /dev/video0`, then set `capture_width`/`capture_height` to a listed mode |
 | `is not 4:2:2 nor 4:2:0 subsampled` | Unsupported chroma format. | Try a resolution where the camera offers YUYV |
 
@@ -589,7 +591,7 @@ straight to [docs/extending.md](docs/extending.md) if you are here to change one
 
 `src/` is a flat set of translation units: capture (`v4l2_in`, `rpicam_in`, shared
 MJPEG decode in `jpeg_decode`), output (`v4l2_out`), preview tap (`stream_server`),
-module load/unload (`virtual_cam`), ring buffer, frame pool, effects (`conv.c` for
+optional webcam output with retry (`virtual_cam`), child processes (`child_proc`), ring buffer, frame pool, effects (`conv.c` for
 sobel/blur, `point_opps.c` for contrast), the chain runner (`effect_chain.c` —
 where grayscale/invert/threshold/tint/light live, fused into LUTs), and config
 hot-reload (`config.c`), wired together in `video_threads.c` / `eeye.c`.

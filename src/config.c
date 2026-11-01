@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "config.h"
+#include "json_cursor.h"
 #include <errno.h>
 #include <linux/limits.h>
 #include <poll.h>
@@ -52,6 +53,8 @@ static const Config config_defaults = {
     .downscale = 1, // full resolution: what this ran at before the field existed
     .capture_source = CAPTURE_AUTO,
     .capture_format = FORMAT_AUTO,
+    .capture_device = "/dev/video0",
+    .output_device = "/dev/video10",
     // Every camera control unset -- "leave the camera alone". Spelled out
     // here rather than fixed up at each use of config_defaults, since a
     // zero-initialized CameraControls would mean "force every control to
@@ -96,196 +99,6 @@ static void split_path(const char *path, char *dir, size_t dir_cap,
     snprintf(dir, dir_cap, "%.*s", (int)dir_len, path);
   }
   snprintf(name, name_cap, "%s", slash + 1);
-}
-
-typedef struct {
-  const char *s;
-  size_t len;
-  size_t pos;
-} Cursor;
-
-static void skip_ws(Cursor *c) {
-  while (c->pos < c->len) {
-    unsigned char ch = (unsigned char)c->s[c->pos];
-    if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
-      c->pos++;
-    } else {
-      break;
-    }
-  }
-}
-
-static bool cur_peek(const Cursor *c, char *out) {
-  if (c->pos >= c->len)
-    return false;
-  *out = c->s[c->pos];
-  return true;
-}
-
-static bool cur_expect(Cursor *c, char expected) {
-  char ch;
-  if (!cur_peek(c, &ch) || ch != expected)
-    return false;
-  c->pos++;
-  return true;
-}
-
-// No escape sequences: every key and every string value in this schema is a
-// plain identifier ("effect", "sobel", ...), so a backslash in the input is
-// treated as a malformed file rather than something to interpret.
-static bool parse_string(Cursor *c, char *out, size_t out_cap) {
-  if (!cur_expect(c, '"'))
-    return false;
-
-  size_t n = 0;
-  while (c->pos < c->len) {
-    char ch = c->s[c->pos];
-    if (ch == '"') {
-      c->pos++;
-      if (n >= out_cap)
-        return false;
-      out[n] = '\0';
-      return true;
-    }
-    if (ch == '\\')
-      return false;
-    if (n + 1 >= out_cap)
-      return false;
-    out[n++] = ch;
-    c->pos++;
-  }
-  return false; // ran off the end without a closing quote
-}
-
-static bool parse_u8(Cursor *c, uint8_t *out) {
-  size_t start = c->pos;
-  if (c->pos < c->len && c->s[c->pos] == '-')
-    c->pos++; // consumed so strtol sees the sign; range check below rejects it
-
-  bool any_digit = false;
-  while (c->pos < c->len && c->s[c->pos] >= '0' && c->s[c->pos] <= '9') {
-    c->pos++;
-    any_digit = true;
-  }
-  if (!any_digit) {
-    c->pos = start;
-    return false;
-  }
-
-  char buf[32];
-  size_t n = c->pos - start;
-  if (n >= sizeof buf) { // pathological digit run; bail before strtol sees it
-    c->pos = start;
-    return false;
-  }
-  memcpy(buf, c->s + start, n);
-  buf[n] = '\0';
-
-  char *end = NULL;
-  long v = strtol(buf, &end, 10);
-  if (end == buf || *end != '\0' || v < 0 || v > 255) {
-    c->pos = start;
-    return false;
-  }
-
-  *out = (uint8_t)v;
-  return true;
-}
-
-// Signed, and wider than the u8/u16 parsers above: brightness is
-// -100..100 and exposure is in microseconds, which passes 65535 at a
-// fortieth of a second.
-static bool parse_i32(Cursor *c, int32_t *out) {
-  size_t start = c->pos;
-  if (c->pos < c->len && c->s[c->pos] == '-')
-    c->pos++;
-
-  bool any_digit = false;
-  while (c->pos < c->len && c->s[c->pos] >= '0' && c->s[c->pos] <= '9') {
-    c->pos++;
-    any_digit = true;
-  }
-  if (!any_digit) {
-    c->pos = start;
-    return false;
-  }
-
-  char buf[32];
-  size_t n = c->pos - start;
-  if (n >= sizeof buf) {
-    c->pos = start;
-    return false;
-  }
-  memcpy(buf, c->s + start, n);
-  buf[n] = '\0';
-
-  char *end = NULL;
-  long v = strtol(buf, &end, 10);
-  if (end == buf || *end != '\0' || v < INT32_MIN + 1 || v > INT32_MAX) {
-    c->pos = start;
-    return false;
-  }
-  *out = (int32_t)v;
-  return true;
-}
-
-// The only bool-valued key so far. Accepts the two JSON literals and
-// nothing else -- 0/1 would be a reasonable extension but silently
-// accepting a number where a bool belongs is the kind of leniency that
-// hides a typo.
-static bool parse_bool(Cursor *c, bool *out) {
-  if (c->pos + 4 <= c->len && memcmp(c->s + c->pos, "true", 4) == 0) {
-    c->pos += 4;
-    *out = true;
-    return true;
-  }
-  if (c->pos + 5 <= c->len && memcmp(c->s + c->pos, "false", 5) == 0) {
-    c->pos += 5;
-    *out = false;
-    return true;
-  }
-  return false;
-}
-
-// Same shape as parse_u8 above, widened for the capture dimensions --
-// those are the only config values that don't fit in a byte. Kept as a
-// separate function rather than a shared parse_uint(max) because the two
-// callers' error messages and range checks read better spelled out, and
-// this way parse_u8's hot path (every effect parameter) stays exactly as
-// it was.
-static bool parse_u16(Cursor *c, uint16_t *out) {
-  size_t start = c->pos;
-  if (c->pos < c->len && c->s[c->pos] == '-')
-    c->pos++; // consumed so strtol sees the sign; range check below rejects it
-
-  bool any_digit = false;
-  while (c->pos < c->len && c->s[c->pos] >= '0' && c->s[c->pos] <= '9') {
-    c->pos++;
-    any_digit = true;
-  }
-  if (!any_digit) {
-    c->pos = start;
-    return false;
-  }
-
-  char buf[32];
-  size_t n = c->pos - start;
-  if (n >= sizeof buf) { // pathological digit run; bail before strtol sees it
-    c->pos = start;
-    return false;
-  }
-  memcpy(buf, c->s + start, n);
-  buf[n] = '\0';
-
-  char *end = NULL;
-  long v = strtol(buf, &end, 10);
-  if (end == buf || *end != '\0' || v < 0 || v > 65535) {
-    c->pos = start;
-    return false;
-  }
-
-  *out = (uint16_t)v;
-  return true;
 }
 
 // Only for error messages -- the parser itself never needs to go this
@@ -840,6 +653,21 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"downscale\"\n");
           return false;
         }
+      } else if (strcmp(key, "capture_device") == 0) {
+        if (!parse_string(&c, parsed.capture_device,
+                          sizeof parsed.capture_device) ||
+            parsed.capture_device[0] == '\0') {
+          printf("Config: invalid value for \"capture_device\" (expected a "
+                 "device path such as \"/dev/video0\")\n");
+          return false;
+        }
+      } else if (strcmp(key, "output_device") == 0) {
+        if (!parse_string(&c, parsed.output_device,
+                          sizeof parsed.output_device)) {
+          printf("Config: invalid value for \"output_device\" (expected a "
+                 "device path, or \"\" for no v4l2 output)\n");
+          return false;
+        }
       } else {
         printf("Config: unknown key \"%s\"\n", key);
         return false;
@@ -932,7 +760,7 @@ void config_output_geometry(const Config *cfg, uint32_t *out_width,
 }
 
 static bool config_try_load(const char *path, Config *out) {
-  FILE *f = fopen(path, "rb");
+  FILE *f = fopen(path, "rbe");
   if (!f) {
     printf("Config: could not open %s: %s\n", path, strerror(errno));
     return false;
@@ -972,7 +800,7 @@ bool config_load_once(const char *path, Config *out) {
   // config_watch_start; anything else (present but unreadable, malformed,
   // over the size limit) is a real error worth refusing to start on, since
   // there is no earlier geometry to keep running with.
-  FILE *probe = fopen(path, "rb");
+  FILE *probe = fopen(path, "rbe");
   if (!probe) {
     printf("Config: %s not found; using default geometry (%ux%u, downscale "
            "%u)\n",
@@ -1021,6 +849,19 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
            names[parsed->capture_source]);
   }
 
+  if (startup_geometry_valid &&
+      (strcmp(parsed->capture_device, startup_geometry.capture_device) != 0 ||
+       strcmp(parsed->output_device, startup_geometry.output_device) != 0)) {
+    printf("Config: \"capture_device\"/\"output_device\" changed (%s, %s -> "
+           "%s, %s) but they only take effect at startup -- still using the "
+           "original devices. Restart eeye to apply it.\n",
+           startup_geometry.capture_device,
+           startup_geometry.output_device[0] ? startup_geometry.output_device
+                                             : "(none)",
+           parsed->capture_device,
+           parsed->output_device[0] ? parsed->output_device : "(none)");
+  }
+
   size_t slot = w->ring_pos % config_ring_size;
   w->ring_pos++;
   w->ring[slot] = *parsed;
@@ -1047,7 +888,7 @@ static void write_reload_status(const char *config_path, bool ok) {
   snprintf(status_path, sizeof status_path, "%s.status", config_path);
   snprintf(tmp_path, sizeof tmp_path, "%s.status.tmp", config_path);
 
-  FILE *f = fopen(tmp_path, "wb");
+  FILE *f = fopen(tmp_path, "wbe");
   if (!f) {
     printf("Config: could not write reload status to %s: %s\n", tmp_path,
            strerror(errno));

@@ -78,7 +78,7 @@ void health_publish(const char *config_path, const HealthSnapshot *snap) {
   if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp)
     return;
 
-  FILE *f = fopen(tmp, "wb");
+  FILE *f = fopen(tmp, "wbe");
   if (!f)
     return; // best-effort: health reporting must never break the pipeline
 

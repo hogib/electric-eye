@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "rpicam_in.c"
 #include "test_harness.h"
+#include <unistd.h>
 
 // Builds a syntactically valid JPEG: SOI, optional segments, SOS, entropy
 // data, EOI. Real enough for a marker walker, without needing an encoder.
@@ -260,7 +261,8 @@ static size_t make_yuv420(uint8_t *out, uint32_t w, uint32_t h, uint8_t seed) {
 static void check_yuv420_capture(uint32_t w, uint32_t h, uint32_t n) {
   int fds[2];
   CHECK(pipe(fds) == 0);
-  RpicamIn in = {.fd = fds[0], .width = w, .height = h, .downscale = n,
+  RpicamIn in = {.proc = {.pid = 0, .in_fd = -1, .out_fd = fds[0]},
+                 .width = w, .height = h, .downscale = n,
                  .format = FORMAT_YUV420};
   in.y_stride = (w + 63) & ~63u;
   in.c_stride = (w / 2 + 31) & ~31u;

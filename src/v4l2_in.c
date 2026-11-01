@@ -199,6 +199,25 @@ static JpegDecodeResult unpack_yuyv_frame(const uint8_t *yuyv, size_t yuyv_size,
   return JPEG_DECODE_OK;
 }
 
+// The driver's capture time for a dequeued buffer, in CLOCK_MONOTONIC
+// nanoseconds, or 0 when it gives none on that clock (some drivers stamp
+// with the wall clock, or not at all). The flag only exists in kernel
+// headers from 3.9 on; without it there is no way to tell which clock a
+// timestamp is on, so it is not trusted.
+static uint64_t driver_timestamp_ns(const struct v4l2_buffer *buf) {
+#if defined(V4L2_BUF_FLAG_TIMESTAMP_MASK) &&                                   \
+    defined(V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
+  if ((buf->flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) ==
+          V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC &&
+      (buf->timestamp.tv_sec > 0 || buf->timestamp.tv_usec > 0))
+    return (uint64_t)buf->timestamp.tv_sec * 1000000000u +
+           (uint64_t)buf->timestamp.tv_usec * 1000u;
+#else
+  (void)buf;
+#endif
+  return 0;
+}
+
 bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
   // A handful of retries absorbs an isolated corrupt USB transfer (real,
   // if uncommon, on actual hardware) without surfacing it as a pipeline
@@ -232,6 +251,7 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
 
     const uint8_t *data = (const uint8_t *)in->buffers[buf.index].start;
     frame->source_jpeg_len = 0; // set again by a successful MJPEG decode
+    frame->capture_ns = driver_timestamp_ns(&buf);
     JpegDecodeResult result =
         (in->capture_format == V4L2_PIX_FMT_MJPEG)
             ? jpeg_decode_frame(in->jpeg_decoder, data, buf.bytesused, frame)
@@ -467,7 +487,7 @@ bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
   if (downscale == 0)
     downscale = 1;
 
-  int fd = open(path, O_RDWR | O_NONBLOCK);
+  int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     // Not an error worth reporting here: the camera being absent at
     // startup is an expected, already-handled state (producer_loop retries
@@ -513,7 +533,7 @@ bool v4l2_in_negotiate_size(const char *path, uint32_t *width,
 V4l2In *v4l2_in_open(const char *path, uint32_t width, uint32_t height,
                      uint32_t framerate_hint, uint32_t downscale,
                      CaptureFormat want_format) {
-  int fd = open(path, O_RDWR | O_NONBLOCK);
+  int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
     switch (errno) {
     case ENOENT:

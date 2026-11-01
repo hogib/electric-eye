@@ -24,6 +24,8 @@ static void test_defaults_match_documentation(void) {
   CHECK_EQ_INT(c.stream_quality, 60);
   CHECK_EQ_INT(c.capture_source, CAPTURE_AUTO);
   CHECK_EQ_INT(c.record_path[0], '\0');
+  CHECK(strcmp(c.capture_device, "/dev/video0") == 0);
+  CHECK(strcmp(c.output_device, "/dev/video10") == 0);
   // An omitted chain keeps the built-in single-stage sobel default.
   CHECK_EQ_INT(c.stage_count, 1);
   CHECK_EQ_INT(c.stages[0].effect, EFFECT_SOBEL);
@@ -400,6 +402,31 @@ static void test_capture_source_values(void) {
   CHECK(!parse("{\"capture_source\":2}", &c)); // not a string
 }
 
+static void test_device_paths(void) {
+  Config c;
+  CHECK(parse("{\"capture_device\":\"/dev/v4l/by-id/usb-cam\","
+              "\"output_device\":\"/dev/video42\"}",
+              &c));
+  CHECK(strcmp(c.capture_device, "/dev/v4l/by-id/usb-cam") == 0);
+  CHECK(strcmp(c.output_device, "/dev/video42") == 0);
+
+  // "" turns the v4l2 output off; there is no such thing as no camera.
+  CHECK(parse("{\"output_device\":\"\"}", &c));
+  CHECK_EQ_INT(c.output_device[0], '\0');
+  CHECK(!parse("{\"capture_device\":\"\"}", &c));
+
+  CHECK(!parse("{\"capture_device\":0}", &c));
+  CHECK(!parse("{\"output_device\":true}", &c));
+
+  // Fixed-size fields: an overlong path is refused, not truncated.
+  char json[512];
+  char long_path[max_device_path_len + 8];
+  memset(long_path, 'a', sizeof long_path - 1);
+  long_path[sizeof long_path - 1] = '\0';
+  snprintf(json, sizeof json, "{\"output_device\":\"%s\"}", long_path);
+  CHECK(!parse(json, &c));
+}
+
 static void test_record_path_round_trips(void) {
   Config c;
   CHECK(parse("{\"record_path\":\"/tmp/out.raw\"}", &c));
@@ -519,6 +546,7 @@ int main(void) {
   RUN_TEST(test_downscale_restricted_to_powers);
   RUN_TEST(test_geometry_divisibility_rule);
   RUN_TEST(test_capture_source_values);
+  RUN_TEST(test_device_paths);
   RUN_TEST(test_capture_format_values);
   RUN_TEST(test_record_path_round_trips);
   RUN_TEST(test_oversized_inputs_rejected);

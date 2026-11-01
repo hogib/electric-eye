@@ -128,6 +128,10 @@ enum { max_chain_stages = 8 };
 // path (see video_threads.c), so the two can never drift out of sync.
 enum { max_record_path_len = 256 };
 
+// capture_device / output_device. /dev/video<N> and /dev/v4l/by-id/...
+// names both fit comfortably.
+enum { max_device_path_len = 128 };
+
 typedef struct {
   EffectStage stages[max_chain_stages];
   size_t stage_count; // may be 0: an empty chain is a valid pass-through
@@ -225,6 +229,18 @@ typedef struct {
   // device. "auto", "mjpeg" and "yuyv" are V4L2 choices (rpicam treats
   // them all as MJPEG); "yuv420" is rpicam-only.
   CaptureFormat capture_format;
+
+  // The V4L2 camera to open (unused by the rpicam backend, which has no
+  // device node). Startup-only: the frame pool is sized from what this
+  // device negotiates.
+  char capture_device[max_device_path_len];
+
+  // The v4l2loopback device the pilot's picture is written to, for any
+  // program that wants a webcam (OBS, ffplay, a browser). "" turns it off.
+  // Optional output: when the device is missing, or goes away mid-run,
+  // eeye logs it and keeps retrying while everything else carries on.
+  // Startup-only, like the rest of this group.
+  char output_device[max_device_path_len];
 } Config;
 
 /*
@@ -249,7 +265,9 @@ typedef struct {
  *     "capture_height": 720,
  *     "downscale": 2,
  *     "capture_source": "auto",
- *     "capture_format": "auto"
+ *     "capture_format": "auto",
+ *     "capture_device": "/dev/video0",
+ *     "output_device": "/dev/video10"
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -292,6 +310,9 @@ typedef struct {
  * one of "auto", "mjpeg", "yuyv") picks the V4L2 pixel format and is also
  * startup-only; "yuyv" is the zero-decode path and is worth pinning
  * explicitly on a camera chosen for it, since "auto" prefers MJPEG.
+ * "capture_device" (default "/dev/video0") is the V4L2 camera and
+ * "output_device" (default "/dev/video10"; "" for none) the v4l2loopback
+ * device the pilot's picture is written to. Both are startup-only.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

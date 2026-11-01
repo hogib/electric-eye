@@ -87,6 +87,7 @@ ALL_LDLIBS = $(EE_LDLIBS) $(LDLIBS)
 SRC := \
 	src/eeye.c \
 	src/camera_ctrl.c \
+	src/child_proc.c \
 	src/config.c \
 	src/conv.c \
 	src/effect_chain.c \
@@ -122,14 +123,16 @@ $(OBJDIR)/%.o: %.c
 # parser, the JPEG frame splitter, the negotiation ranker -- are reachable
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
-	canny health camera_ctrl recorder stream_server effect_chain
+	canny health camera_ctrl recorder stream_server effect_chain child_proc \
+	virtual_cam
 
 # Extra translation units each test needs beyond the one it includes:
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
 # frame pool, so those get linked in alongside.
 test_config_SRC := src/camera_ctrl.c
 test_ring_buffer_SRC :=
-test_jpeg_framing_SRC := src/camera_ctrl.c src/jpeg_decode.c src/video_frame.c
+test_jpeg_framing_SRC := src/camera_ctrl.c src/child_proc.c src/jpeg_decode.c \
+	src/video_frame.c
 test_negotiation_SRC := src/jpeg_decode.c src/video_frame.c
 test_jpeg_decode_SRC := src/jpeg_decode.c src/video_frame.c
 test_log_edges_SRC := src/conv.c src/video_frame.c
@@ -138,6 +141,8 @@ test_health_SRC :=
 test_camera_ctrl_SRC :=
 test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
 test_stream_server_SRC := src/video_frame.c
+test_child_proc_SRC :=
+test_virtual_cam_SRC := src/child_proc.c src/v4l2_out.c src/video_frame.c
 test_effect_chain_SRC := src/camera_ctrl.c src/config.c src/conv.c \
 	src/point_opps.c src/video_frame.c
 
