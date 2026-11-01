@@ -19,7 +19,7 @@
  */
 
 enum {
-  hs_version = 1,
+  hs_version = 2,
   hs_max_pipelines = 8,
   hs_max_sinks = 8,
   hs_spec_len = 64,
@@ -36,6 +36,14 @@ typedef struct {
   uint64_t frames;            // passed through so far
   uint64_t dropped;           // frames it could not keep up with
   double fps;                 // over the last couple of seconds
+
+  // Network endpoints (RTP) only: what the link is doing.
+  bool net;
+  double kbps;       // over the last second
+  double loss_pct;   // packets lost, over the last second
+  uint64_t packets;  // total
+  uint64_t lost;     // total, from RTP sequence gaps
+  double idle_s;     // since the last packet; -1 if none yet
 } HsEndpoint;
 
 typedef struct {

@@ -261,7 +261,7 @@ static size_t make_yuv420(uint8_t *out, uint32_t w, uint32_t h, uint8_t seed) {
 static void check_yuv420_capture(uint32_t w, uint32_t h, uint32_t n) {
   int fds[2];
   CHECK(pipe(fds) == 0);
-  RpicamIn in = {.proc = {.pid = 0, .in_fd = -1, .out_fd = fds[0]},
+  RpicamIn in = {.proc = {.pid = 0, .in_fd = -1, .out_fd = fds[0], .err_fd = -1},
                  .width = w, .height = h, .downscale = n,
                  .format = FORMAT_YUV420};
   in.y_stride = (w + 63) & ~63u;

@@ -20,6 +20,29 @@ static void split_spec(const char *spec, char *kind, size_t kind_cap,
   snprintf(arg, arg_cap, "%s", colon + 1);
 }
 
+// 1-65535, digits only.
+static bool valid_port(const char *s) {
+  if (!*s || strlen(s) > 5)
+    return false;
+  long v = 0;
+  for (const char *c = s; *c; c++) {
+    if (*c < '0' || *c > '9')
+      return false;
+    v = v * 10 + (*c - '0');
+  }
+  return v >= 1 && v <= 65535;
+}
+
+// "host:port" or "[v6addr]:port", with a valid port.
+static bool valid_host_port(const char *s) {
+  const char *colon = strrchr(s, ':');
+  if (!colon || colon == s || !valid_port(colon + 1))
+    return false;
+  if (s[0] == '[')
+    return colon[-1] == ']' && colon - s > 2;
+  return true;
+}
+
 static bool parse_source(PipelineConfig *p) {
   char kind[16];
   split_spec(p->source_spec, kind, sizeof kind, p->source_arg,
@@ -30,9 +53,12 @@ static bool parse_source(PipelineConfig *p) {
     p->source = SRC_RPICAM;
   } else if (strcmp(kind, "bus") == 0 && fbus_valid_name(p->source_arg)) {
     p->source = SRC_BUS;
+  } else if (strcmp(kind, "rtp") == 0 && valid_port(p->source_arg)) {
+    p->source = SRC_RTP;
   } else {
     printf("hellion config: pipeline \"%s\": bad source \"%s\" (expected "
-           "\"v4l2:<device>\", \"rpicam\", or \"bus:<stream>\")\n",
+           "\"v4l2:<device>\", \"rpicam\", \"bus:<stream>\", or "
+           "\"rtp:<port>\")\n",
            p->name, p->source_spec);
     return false;
   }
@@ -46,9 +72,11 @@ static bool parse_sink(const PipelineConfig *p, SinkConfig *s) {
     s->kind = SINK_BUS;
   } else if (strcmp(kind, "v4l2") == 0 && s->arg[0]) {
     s->kind = SINK_V4L2;
+  } else if (strcmp(kind, "rtp") == 0 && valid_host_port(s->arg)) {
+    s->kind = SINK_RTP;
   } else {
     printf("hellion config: pipeline \"%s\": bad sink \"%s\" (expected "
-           "\"bus:<stream>\" or \"v4l2:<device>\")\n",
+           "\"bus:<stream>\", \"v4l2:<device>\", or \"rtp:<host>:<port>\")\n",
            p->name, s->spec);
     return false;
   }
@@ -109,6 +137,52 @@ static bool parse_sinks(Cursor *c, PipelineConfig *p) {
   }
 }
 
+// It ends up on ffmpeg's command line (as one argument, never through a
+// shell), but there is still no reason to accept anything but a name.
+static bool valid_encoder(const char *s) {
+  if (!*s)
+    return false;
+  for (const char *c = s; *c; c++)
+    if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_'))
+      return false;
+  return true;
+}
+
+static bool parse_relays(Cursor *c, PipelineConfig *p) {
+  if (!cur_expect(c, '[')) {
+    printf("hellion config: pipeline \"%s\": \"relay\" must be a list\n",
+           p->name);
+    return false;
+  }
+  skip_ws(c);
+  char ch;
+  if (cur_peek(c, &ch) && ch == ']') {
+    c->pos++;
+    return true;
+  }
+  for (;;) {
+    if (p->relay_count == hcfg_max_relays) {
+      printf("hellion config: pipeline \"%s\": more than %d relays\n",
+             p->name, hcfg_max_relays);
+      return false;
+    }
+    char *dst = p->relays[p->relay_count];
+    skip_ws(c);
+    if (!parse_string(c, dst, hcfg_max_spec) || !valid_host_port(dst)) {
+      printf("hellion config: pipeline \"%s\": each relay must be "
+             "\"host:port\"\n",
+             p->name);
+      return false;
+    }
+    p->relay_count++;
+    int r = next_or_close(c, ']', "\"relay\"");
+    if (r < 0)
+      return false;
+    if (r == 0)
+      return true;
+  }
+}
+
 static bool parse_format(const char *s, CaptureFormat *out) {
   if (strcmp(s, "auto") == 0)
     *out = FORMAT_AUTO;
@@ -124,7 +198,13 @@ static bool parse_format(const char *s, CaptureFormat *out) {
 }
 
 static bool parse_pipeline(Cursor *c, PipelineConfig *p) {
-  *p = (PipelineConfig){.width = 1280, .height = 720, .format = FORMAT_AUTO};
+  *p = (PipelineConfig){.width = 1280,
+                        .height = 720,
+                        .format = FORMAT_AUTO,
+                        .encoder = "libx264",
+                        .bitrate_kbps = 4000,
+                        .gop = 30,
+                        .framerate = 30};
   bool have_source = false;
 
   if (!cur_expect(c, '{')) {
@@ -177,6 +257,37 @@ static bool parse_pipeline(Cursor *c, PipelineConfig *p) {
         printf("hellion config: bad \"height\"\n");
         return false;
       }
+    } else if (strcmp(key, "relay") == 0) {
+      if (!parse_relays(c, p))
+        return false;
+    } else if (strcmp(key, "encoder") == 0) {
+      if (!parse_string(c, p->encoder, sizeof p->encoder) ||
+          !valid_encoder(p->encoder)) {
+        printf("hellion config: bad \"encoder\" (an ffmpeg encoder name, "
+               "e.g. \"libx264\" or \"h264_v4l2m2m\")\n");
+        return false;
+      }
+    } else if (strcmp(key, "bitrate_kbps") == 0) {
+      int32_t v;
+      if (!parse_i32(c, &v) || v < 100 || v > 100000) {
+        printf("hellion config: \"bitrate_kbps\" must be 100-100000\n");
+        return false;
+      }
+      p->bitrate_kbps = (uint32_t)v;
+    } else if (strcmp(key, "framerate") == 0) {
+      uint16_t v;
+      if (!parse_u16(c, &v) || v < 1 || v > 240) {
+        printf("hellion config: \"framerate\" must be 1-240\n");
+        return false;
+      }
+      p->framerate = v;
+    } else if (strcmp(key, "gop") == 0) {
+      uint16_t v;
+      if (!parse_u16(c, &v) || v < 1 || v > 600) {
+        printf("hellion config: \"gop\" must be 1-600 frames\n");
+        return false;
+      }
+      p->gop = v;
     } else if (strcmp(key, "format") == 0) {
       char fmt[16];
       if (!parse_string(c, fmt, sizeof fmt) || !parse_format(fmt, &p->format)) {
@@ -214,6 +325,12 @@ static bool parse_pipeline(Cursor *c, PipelineConfig *p) {
     printf("hellion config: pipeline \"%s\": %ux%u -- width and height must "
            "be even and non-zero\n",
            p->name, p->width, p->height);
+    return false;
+  }
+  if (p->relay_count && p->source != SRC_RTP) {
+    printf("hellion config: pipeline \"%s\": \"relay\" only applies to an "
+           "\"rtp:<port>\" source\n",
+           p->name);
     return false;
   }
   if (p->format == FORMAT_YUV420 && p->source != SRC_RPICAM) {

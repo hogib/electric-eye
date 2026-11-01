@@ -161,6 +161,28 @@ static void test_stderr_can_join_stdout(void) {
   child_stop(&c, 500);
 }
 
+// stdout and stderr on separate pipes: data and complaints are not mixed.
+static void test_stderr_on_its_own_pipe(void) {
+  ChildProc c;
+  char *const argv[] = {"sh", "-c", "echo data; echo complaint >&2", NULL};
+  CHECK(child_spawn(&c, "test", argv,
+                    CHILD_PIPE_STDOUT | CHILD_PIPE_STDERR | CHILD_NULL_STDIN));
+  CHECK(c.err_fd >= 0);
+  char out[64], err[64];
+  child_read_all(c.out_fd, out, sizeof out, 2000);
+  child_read_all(c.err_fd, err, sizeof err, 2000);
+  CHECK(strcmp(out, "data\n") == 0);
+  CHECK(strcmp(err, "complaint\n") == 0);
+  child_stop(&c, 500);
+  CHECK_EQ_INT(c.err_fd, -1);
+
+  // Without the flag there is no stderr pipe.
+  char *const quiet[] = {"true", NULL};
+  CHECK(child_spawn(&c, "test", quiet, CHILD_NULL_STDIN));
+  CHECK_EQ_INT(c.err_fd, -1);
+  child_stop(&c, 500);
+}
+
 static void test_read_all_truncates_and_drains(void) {
   ChildProc c;
   char *const argv[] = {"head", "-c", "100000", "/dev/zero", NULL};
@@ -222,7 +244,7 @@ static void test_stop_reaches_grandchildren(void) {
 }
 
 static void test_stop_is_safe_on_empty_and_reaped(void) {
-  ChildProc empty = {.pid = 0, .in_fd = -1, .out_fd = -1};
+  ChildProc empty = {.pid = 0, .in_fd = -1, .out_fd = -1, .err_fd = -1};
   CHECK_EQ_INT(child_stop(&empty, 10), -1);
 
   ChildProc c;
@@ -247,6 +269,7 @@ int main(void) {
   RUN_TEST(test_parent_fds_do_not_leak_into_child);
   RUN_TEST(test_child_gets_default_sigpipe);
   RUN_TEST(test_stderr_can_join_stdout);
+  RUN_TEST(test_stderr_on_its_own_pipe);
   RUN_TEST(test_read_all_truncates_and_drains);
   RUN_TEST(test_write_to_exited_child_is_eof);
   RUN_TEST(test_stop_reaches_grandchildren);

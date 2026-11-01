@@ -1,6 +1,7 @@
 #pragma once
 #include "hconfig.h"
 #include "hstatus.h"
+#include "udp_relay.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,10 +33,14 @@ typedef struct SinkImpl SinkImpl;
  * failure (reported in *rep); a sink whose destination is merely missing
  * for now (a v4l2 device not there yet) opens anyway and keeps retrying.
  */
-SinkImpl *sink_impl_open(const SinkConfig *cfg, uint32_t width,
-                         uint32_t height, SinkReport *rep);
+SinkImpl *sink_impl_open(const SinkConfig *cfg, const PipelineConfig *pc,
+                         uint32_t width, uint32_t height, SinkReport *rep);
 
 // Sends one frame. Returns false if it was not delivered; *rep says why.
 bool sink_impl_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep);
+
+// Network sinks: what the link is doing. False for the others. Safe to
+// call from another thread while the sink thread writes.
+bool sink_impl_net(SinkImpl *s, RelayStats *out);
 
 void sink_impl_close(SinkImpl *s);

@@ -1,20 +1,22 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "pipeline.h"
+#include "child_proc.h"
 #include "fbus.h"
+#include "ffmpeg.h"
 #include "rpicam_in.h"
 #include "sinks.h"
 #include "v4l2_in.h"
 #include "video_frame.h"
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
-// Asked of cameras; like eeye, a hint the driver may not honor exactly.
-static const uint32_t camera_framerate = 30;
 // How long a missing source waits before trying again.
 static const int source_retry_ms = 2000;
 // fps is measured over windows at least this long.
@@ -28,6 +30,7 @@ typedef struct {
 
 typedef struct Sink {
   SinkConfig cfg;
+  const PipelineConfig *pc; // the owning pipeline's; outlives the sink
   pthread_t thread;
   pthread_mutex_t lock;
   pthread_cond_t cond;
@@ -49,6 +52,9 @@ typedef struct Sink {
   uint64_t dropped;
   SinkReport rep;
   FpsMeter fps;
+  // The sink thread's implementation, published so the status thread can
+  // ask a network sink for its link stats. Set and cleared under lock.
+  SinkImpl *impl;
 } Sink;
 
 struct Pipeline {
@@ -65,7 +71,25 @@ struct Pipeline {
   uint32_t width, height;
   Sink *sinks[hcfg_max_sinks];
   size_t sink_count;
+
+  // RTP source only, for the pipeline's whole life: the relay owns the
+  // tether port, so packets keep reaching relay targets (QGC) while the
+  // decoder restarts. The decoder is fed through dec_port.
+  UdpRelay *rtp_relay;
+  int dec_port;
+  char sdp_path[PATH_MAX];
+
+  // The decoder's complaints about damaged frames (from lost packets),
+  // counted rather than logged one by one: at 2% loss it is ~10 lines a
+  // second, which would bury everything else in top's log. Under lock.
+  uint64_t damage_total;
+  uint64_t damage_window;      // since damage_window_ns
+  uint64_t damage_last_window; // the previous full window, for status
+  uint64_t damage_window_ns;
 };
+
+// How often the decoder's damage count is summarised in the log.
+static const uint64_t damage_summary_ns = 10000000000ull;
 
 static uint64_t mono_ns(void) {
   struct timespec ts;
@@ -91,7 +115,8 @@ static bool nap(Pipeline *p, int ms) {
 static void set_source(Pipeline *p, const char *state, const char *detail) {
   pthread_mutex_lock(&p->lock);
   snprintf(p->src_state, sizeof p->src_state, "%s", state);
-  snprintf(p->src_detail, sizeof p->src_detail, "%s", detail);
+  snprintf(p->src_detail, sizeof p->src_detail, "%.*s", hs_detail_len - 1,
+           detail);
   pthread_mutex_unlock(&p->lock);
 }
 
@@ -113,10 +138,14 @@ static double fps_update(FpsMeter *m, uint64_t frames, uint64_t now) {
 static void *sink_loop(void *arg) {
   Sink *s = (Sink *)arg;
   SinkReport rep = {"starting", ""};
-  SinkImpl *impl = sink_impl_open(&s->cfg, s->width, s->height, &rep);
+  SinkImpl *impl = sink_impl_open(&s->cfg, s->pc, s->width, s->height, &rep);
+  // A sink that failed to open retries this often, not on every frame.
+  const uint64_t reopen_every_ns = 2000000000ull;
+  uint64_t next_open_ns = mono_ns() + reopen_every_ns;
 
   pthread_mutex_lock(&s->lock);
   s->rep = rep;
+  s->impl = impl;
   while (!s->stop) {
     if (!s->full) {
       struct timespec until;
@@ -146,29 +175,37 @@ static void *sink_loop(void *arg) {
     pthread_mutex_unlock(&s->lock);
 
     bool ok = false;
+    bool reopened = false;
     if (impl) {
       ok = sink_impl_write(impl, &f, &rep);
-    } else {
+    } else if (mono_ns() >= next_open_ns) {
       // Opening failed outright; try again now and then.
-      impl = sink_impl_open(&s->cfg, s->width, s->height, &rep);
+      impl = sink_impl_open(&s->cfg, s->pc, s->width, s->height, &rep);
+      next_open_ns = mono_ns() + reopen_every_ns;
+      reopened = impl != NULL;
     }
 
     pthread_mutex_lock(&s->lock);
     if (ok)
       s->frames++;
     s->rep = rep;
+    if (reopened)
+      s->impl = impl;
   }
+  s->impl = NULL; // before closing it, so status never reads a freed one
   pthread_mutex_unlock(&s->lock);
 
   sink_impl_close(impl);
   return NULL;
 }
 
-static Sink *sink_start(const SinkConfig *cfg, uint32_t w, uint32_t h) {
+static Sink *sink_start(const SinkConfig *cfg, const PipelineConfig *pc,
+                        uint32_t w, uint32_t h) {
   Sink *s = (Sink *)calloc(1, sizeof *s);
   if (!s)
     return NULL;
   s->cfg = *cfg;
+  s->pc = pc;
   s->width = w;
   s->height = h;
   s->plane_bytes[0] = (size_t)w * h;
@@ -241,7 +278,7 @@ static void restart_sinks(Pipeline *p, uint32_t w, uint32_t h) {
   Sink *fresh[hcfg_max_sinks];
   size_t n = 0;
   for (size_t i = 0; w && h && i < p->cfg.sink_count; i++) {
-    Sink *s = sink_start(&p->cfg.sinks[i], w, h);
+    Sink *s = sink_start(&p->cfg.sinks[i], &p->cfg, w, h);
     if (s)
       fresh[n++] = s;
   }
@@ -260,8 +297,119 @@ typedef struct {
   V4l2In *v4l2;
   RpicamIn *rpicam;
   FbusReader *bus;
+  // RTP: an ffmpeg decoder writing raw frames to dec.out_fd. Frames are
+  // read in pieces as they arrive, so a timeout mid-frame keeps its place
+  // rather than desynchronising the stream.
+  ChildProc dec;
+  bool dec_running;
+  size_t dec_have;
+  uint64_t dec_last_frame_ns;
+  char dec_line[256]; // the decoder's stderr line being assembled
+  size_t dec_line_len;
   uint32_t width, height;
 } Source;
+
+// One complete line of the decoder's stderr. libavcodec's H.264 decoder
+// prefixes everything it says about the bitstream with "[h264 @": with a
+// lossy link that is damaged frames, expected and already measured as
+// packet loss, so it is counted. Anything else is news and passes through.
+static void decoder_line(Pipeline *p, const char *line) {
+  if (strncmp(line, "[h264 @", 7) == 0) {
+    pthread_mutex_lock(&p->lock);
+    p->damage_total++;
+    p->damage_window++;
+    pthread_mutex_unlock(&p->lock);
+    return;
+  }
+  if (line[0])
+    printf("hellion: pipeline \"%s\": decoder: %s\n", p->cfg.name, line);
+}
+
+// Reads whatever the decoder has said, and summarises the damage count
+// every damage_summary_ns.
+static void drain_decoder_log(Pipeline *p, Source *src) {
+  char buf[1024];
+  for (;;) {
+    ssize_t n = read(src->dec.err_fd, buf, sizeof buf);
+    if (n <= 0)
+      break;
+    for (ssize_t i = 0; i < n; i++) {
+      if (buf[i] == '\n' || buf[i] == '\r') {
+        src->dec_line[src->dec_line_len] = '\0';
+        decoder_line(p, src->dec_line);
+        src->dec_line_len = 0;
+      } else if (src->dec_line_len < sizeof src->dec_line - 1) {
+        src->dec_line[src->dec_line_len++] = buf[i];
+      }
+    }
+  }
+
+  uint64_t now = mono_ns();
+  pthread_mutex_lock(&p->lock);
+  if (p->damage_window_ns == 0)
+    p->damage_window_ns = now;
+  uint64_t n = 0;
+  if (now - p->damage_window_ns >= damage_summary_ns) {
+    n = p->damage_window;
+    p->damage_last_window = n;
+    p->damage_window = 0;
+    p->damage_window_ns = now;
+  }
+  pthread_mutex_unlock(&p->lock);
+  if (n)
+    printf("hellion: pipeline \"%s\": the decoder reported %llu damaged-"
+           "bitstream errors in the last %.0fs (lost packets; see the link's "
+           "loss figure)\n",
+           p->cfg.name, (unsigned long long)n, damage_summary_ns / 1e9);
+}
+
+// How long a decoder may produce nothing while packets are arriving
+// before it is presumed wedged and restarted.
+static const uint64_t decoder_wedged_ns = 5000000000ull;
+
+// Sets up the RTP source's relay and decoder SDP, once per pipeline.
+static bool rtp_prepare(Pipeline *p, char *err, size_t err_cap) {
+  if (p->rtp_relay)
+    return true;
+  if (!ff_available()) {
+    snprintf(err, err_cap, "ffmpeg is not installed");
+    return false;
+  }
+  p->dec_port = udp_free_port_pair();
+  if (!p->dec_port) {
+    snprintf(err, err_cap, "no free local UDP port for the decoder");
+    return false;
+  }
+  snprintf(p->sdp_path, sizeof p->sdp_path, "%s/.hellion-%s-%ld.sdp",
+           fbus_dir(), p->cfg.name, (long)getpid());
+  if (!ff_write_sdp(p->sdp_path, p->dec_port)) {
+    snprintf(err, err_cap, "cannot write %.100s", p->sdp_path);
+    return false;
+  }
+
+  UdpRelay *r = udp_relay_open(p->cfg.source_arg, err, err_cap);
+  if (!r)
+    return false;
+  char dest[64];
+  snprintf(dest, sizeof dest, "127.0.0.1:%d", p->dec_port);
+  bool ok = udp_relay_add_dest(r, dest, err, err_cap);
+  for (size_t i = 0; ok && i < p->cfg.relay_count; i++)
+    ok = udp_relay_add_dest(r, p->cfg.relays[i], err, err_cap);
+  if (!ok || !udp_relay_start(r)) {
+    udp_relay_close(r);
+    return false;
+  }
+  printf("hellion: pipeline \"%s\": receiving RTP on UDP %d", p->cfg.name,
+         udp_relay_port(r));
+  for (size_t i = 0; i < p->cfg.relay_count; i++)
+    printf("%s%s", i ? ", " : "; relaying to ", p->cfg.relays[i]);
+  printf("\n");
+
+  pthread_mutex_lock(&p->lock);
+  p->rtp_relay = r;
+  pthread_mutex_unlock(&p->lock);
+  return true;
+}
 
 static bool device_exists(const char *path) {
   struct stat st;
@@ -287,14 +435,14 @@ static bool source_open(Pipeline *p, Source *src) {
     }
     v4l2_in_negotiate_size(c->source_arg, &w, &h, 1, c->format);
     src->v4l2 =
-        v4l2_in_open(c->source_arg, w, h, camera_framerate, 1, c->format);
+        v4l2_in_open(c->source_arg, w, h, c->framerate, 1, c->format);
     if (!src->v4l2) {
       set_source(p, "waiting", "camera would not open (see log)");
       return false;
     }
     break;
   case SRC_RPICAM:
-    src->rpicam = rpicam_in_open(w, h, camera_framerate, 1, NULL, c->format);
+    src->rpicam = rpicam_in_open(w, h, c->framerate, 1, NULL, c->format);
     if (!src->rpicam) {
       set_source(p, "waiting", "rpicam-vid would not start (see log)");
       return false;
@@ -312,6 +460,27 @@ static bool source_open(Pipeline *p, Source *src) {
     fbus_reader_geometry(src->bus, &w, &h);
     break;
   }
+  case SRC_RTP: {
+    char err[160];
+    if (!rtp_prepare(p, err, sizeof err)) {
+      set_source(p, "error", err);
+      return false;
+    }
+    // ffmpeg scales whatever it decodes to the configured size, so every
+    // frame on the pipe is exactly w x h I422.
+    FfDecoder d = {.sdp_path = p->sdp_path, .width = w, .height = h};
+    FfArgs args;
+    ff_decoder_args(&d, &args);
+    if (!child_spawn(&src->dec, "hellion", args.argv,
+                     CHILD_PIPE_STDOUT | CHILD_PIPE_STDERR | CHILD_NULL_STDIN)) {
+      set_source(p, "error", "could not start the ffmpeg decoder (see log)");
+      return false;
+    }
+    child_set_pipe_size(src->dec.out_fd, 1 << 20);
+    src->dec_running = true;
+    src->dec_last_frame_ns = mono_ns();
+    break;
+  }
   }
   src->width = w;
   src->height = h;
@@ -322,14 +491,62 @@ static void source_close(Source *src) {
   v4l2_in_close(src->v4l2);
   rpicam_in_close(src->rpicam);
   fbus_reader_close(src->bus);
+  if (src->dec_running)
+    child_stop(&src->dec, 1000);
   *src = (Source){0};
 }
 
 typedef enum { CAP_FRAME, CAP_IDLE, CAP_LOST } CaptureResult;
 
-static CaptureResult source_capture(Source *src, VideoFrame *vf,
+// One frame from the RTP decoder: exactly one I422 frame's bytes, read
+// in whatever pieces they arrive in.
+static CaptureResult rtp_capture(Pipeline *p, Source *src, VideoFrame *vf) {
+  const size_t total =
+      vf->plane_sizes[0] + vf->plane_sizes[1] + vf->plane_sizes[2];
+  while (src->dec_have < total) {
+    drain_decoder_log(p, src);
+    size_t got = 0;
+    ChildIo r = child_read_some(src->dec.out_fd, vf->raw_data + src->dec_have,
+                                total - src->dec_have, 500, &got);
+    if (r == CHILD_IO_OK) {
+      src->dec_have += got;
+      continue;
+    }
+    if (r != CHILD_IO_TIMEOUT) {
+      printf("hellion: pipeline \"%s\": the ffmpeg decoder exited (see "
+             "log); restarting it\n",
+             p->cfg.name);
+      return CAP_LOST;
+    }
+    // Nothing for a while. If packets are still arriving the decoder is
+    // wedged, not starved: restart it.
+    RelayStats rs;
+    udp_relay_stats(p->rtp_relay, &rs);
+    if (mono_ns() - src->dec_last_frame_ns > decoder_wedged_ns &&
+        rs.idle_s >= 0 && rs.idle_s < 1.0) {
+      printf("hellion: pipeline \"%s\": packets arriving but the decoder "
+             "has produced nothing for %.0fs; restarting it\n",
+             p->cfg.name, decoder_wedged_ns / 1e9);
+      return CAP_LOST;
+    }
+    return CAP_IDLE;
+  }
+  src->dec_have = 0;
+  src->dec_last_frame_ns = mono_ns();
+  return CAP_FRAME;
+}
+
+static CaptureResult source_capture(Pipeline *p, Source *src, VideoFrame *vf,
                                     int64_t *frame_no) {
   vf->capture_ns = 0;
+  if (src->dec_running) {
+    CaptureResult r = rtp_capture(p, src, vf);
+    if (r == CAP_FRAME)
+      (*frame_no)++;
+    // The camera's time stayed on the ROV: RTP carries no capture clock
+    // hellion reads yet, so this frame is stamped when it was decoded.
+    return r;
+  }
   if (src->bus) {
     FbusFrameInfo info;
     switch (fbus_reader_next(src->bus, vf->raw_planes, 500, &info)) {
@@ -389,7 +606,7 @@ static void *source_loop(void *arg) {
     uint8_t *const planes[3] = {vf->raw_planes[0], vf->raw_planes[1],
                                 vf->raw_planes[2]};
     while (!stopping(p)) {
-      CaptureResult r = source_capture(&src, vf, &frame_no);
+      CaptureResult r = source_capture(p, &src, vf, &frame_no);
       if (r == CAP_IDLE) {
         set_source(p, "idle", "connected, but no frames arriving");
         continue;
@@ -458,6 +675,15 @@ static void endpoint(HsEndpoint *e, const char *spec, const char *state,
   e->fps = fps;
 }
 
+static void endpoint_net(HsEndpoint *e, const RelayStats *rs) {
+  e->net = true;
+  e->kbps = rs->kbps;
+  e->loss_pct = rs->loss_pct;
+  e->packets = rs->packets;
+  e->lost = rs->lost;
+  e->idle_s = rs->idle_s;
+}
+
 void pipeline_status(Pipeline *p, HsPipeline *out) {
   uint64_t now = mono_ns();
   memset(out, 0, sizeof *out);
@@ -476,6 +702,16 @@ void pipeline_status(Pipeline *p, HsPipeline *out) {
     snprintf(out->source.state, sizeof out->source.state, "idle");
     snprintf(out->source.detail, sizeof out->source.detail,
              "no frames for %.0fs", (double)(now - p->src_last_frame_ns) / 1e9);
+  }
+  if (p->rtp_relay) {
+    RelayStats rs;
+    udp_relay_stats(p->rtp_relay, &rs);
+    endpoint_net(&out->source, &rs);
+    if (p->damage_last_window && strcmp(out->source.state, "running") == 0)
+      snprintf(out->source.detail, sizeof out->source.detail,
+               "decoder: %llu damaged-bitstream errors in the last %.0fs",
+               (unsigned long long)p->damage_last_window,
+               damage_summary_ns / 1e9);
   }
 
   // Sinks that failed to start are still listed, so they do not vanish
@@ -497,6 +733,9 @@ void pipeline_status(Pipeline *p, HsPipeline *out) {
     pthread_mutex_lock(&s->lock);
     endpoint(&out->sinks[i], spec, s->rep.state, s->rep.detail, s->frames,
              s->dropped, fps_update(&s->fps, s->frames, now));
+    RelayStats rs;
+    if (sink_impl_net(s->impl, &rs))
+      endpoint_net(&out->sinks[i], &rs);
     pthread_mutex_unlock(&s->lock);
   }
   pthread_mutex_unlock(&p->lock);
@@ -507,6 +746,9 @@ void pipeline_stop(Pipeline *p) {
     return;
   __atomic_store_n(&p->stop, true, __ATOMIC_RELEASE);
   pthread_join(p->thread, NULL);
+  udp_relay_close(p->rtp_relay);
+  if (p->sdp_path[0])
+    unlink(p->sdp_path);
   pthread_mutex_destroy(&p->lock);
   free(p);
 }

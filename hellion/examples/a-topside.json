@@ -1,0 +1,12 @@
+{
+  "name": "topside",
+  "role": "topside",
+  "eeye_config": "/var/lib/eeye/effects.json",
+  "pipelines": [
+    {"name": "camera-in", "source": "rtp:5610",
+     "width": 1280, "height": 720,
+     "sinks": ["bus:camera"]},
+    {"name": "pilot-out", "source": "bus:pilot", "framerate": 30,
+     "sinks": ["rtp:127.0.0.1:5600", "v4l2:/dev/video10"]}
+  ]
+}

@@ -40,6 +40,7 @@ typedef struct {
   pid_t pid;  // 0 when no child is running
   int in_fd;  // parent's end of the child's stdin, or -1
   int out_fd; // parent's end of the child's stdout, or -1
+  int err_fd; // parent's end of the child's stderr, or -1
 } ChildProc;
 
 enum {
@@ -51,6 +52,9 @@ enum {
   CHILD_STDERR_TO_STDOUT = 1u << 2,
   CHILD_QUIET_STDERR = 1u << 3, // the child's stderr goes to /dev/null
   CHILD_NULL_STDIN = 1u << 4,   // /dev/null instead of the parent's stdin
+  // err_fd reads the child's stderr separately, for a parent that wants to
+  // sort its messages rather than pass them all on (hellion's decoder).
+  CHILD_PIPE_STDERR = 1u << 5,
 };
 
 /*

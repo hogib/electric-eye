@@ -59,6 +59,13 @@ static void check_instance(const char *name) {
                pb->source.spec, pb->width, pb->height,
                (unsigned long long)moved);
       say(0, "pipeline %s: source %s", pb->name, what);
+      // A receiving link that delivers frames can still be losing
+      // packets: damaged frames now, a dropped link soon.
+      if (pb->source.net && pb->source.loss_pct >= 1.0) {
+        snprintf(what, sizeof what, "%.1f%% packet loss at %.0f kbit/s",
+                 pb->source.loss_pct, pb->source.kbps);
+        say(1, "pipeline %s: link in: %s", pb->name, what);
+      }
     } else {
       snprintf(what, sizeof what, "%s is %s%s%s", pb->source.spec,
                pb->source.state, pb->source.detail[0] ? ": " : "",

@@ -113,6 +113,7 @@ SRC := \
 # (the frame bus, child processes, camera capture, the loopback output).
 HSRC := \
 	hellion/check.c \
+	hellion/ffmpeg.c \
 	hellion/hconfig.c \
 	hellion/hlog.c \
 	hellion/hstatus.c \
@@ -120,6 +121,7 @@ HSRC := \
 	hellion/pipeline.c \
 	hellion/sinks.c \
 	hellion/top.c \
+	hellion/udp_relay.c \
 	src/camera_ctrl.c \
 	src/child_proc.c \
 	src/fbus.c \
@@ -174,7 +176,8 @@ test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
 test_stream_server_SRC := src/video_frame.c
 test_child_proc_SRC :=
 test_fbus_SRC :=
-test_hellion_SRC := hellion/hconfig.c hellion/hlog.c hellion/hstatus.c \
+test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
+	hellion/hstatus.c hellion/udp_relay.c \
 	hellion/pipeline.c hellion/sinks.c src/camera_ctrl.c src/child_proc.c \
 	src/fbus.c src/jpeg_decode.c src/rpicam_in.c src/v4l2_in.c src/v4l2_out.c \
 	src/video_frame.c src/virtual_cam.c

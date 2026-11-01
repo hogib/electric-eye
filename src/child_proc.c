@@ -109,15 +109,15 @@ static void close_inherited_fds(int keep, long scan_limit) {
       close((int)fd);
 }
 
-static void report_exec_error(int err_fd, int err) {
-  ssize_t ignored = write(err_fd, &err, sizeof err);
+static void report_exec_error(int exec_fd, int err) {
+  ssize_t ignored = write(exec_fd, &err, sizeof err);
   (void)ignored;
   _exit(127);
 }
 
 static void child_side(const char *path, char *const argv[], unsigned flags,
-                       int in_read, int out_write, int err_fd,
-                       long scan_limit) {
+                       int in_read, int out_write, int stderr_write,
+                       int exec_fd, long scan_limit) {
   // Back to defaults: an ignored SIGPIPE survives exec, and the parent's
   // signal mask is inherited by the child.
   static const int reset[] = {SIGPIPE, SIGINT, SIGTERM, SIGQUIT, SIGCHLD,
@@ -133,7 +133,7 @@ static void child_side(const char *path, char *const argv[], unsigned flags,
 
   if (flags & CHILD_PIPE_STDIN) {
     if (dup2(in_read, STDIN_FILENO) < 0)
-      report_exec_error(err_fd, errno);
+      report_exec_error(exec_fd, errno);
   } else if (flags & CHILD_NULL_STDIN) {
     int null_fd = open("/dev/null", O_RDONLY);
     if (null_fd >= 0 && null_fd != STDIN_FILENO) {
@@ -144,12 +144,15 @@ static void child_side(const char *path, char *const argv[], unsigned flags,
 
   if (flags & CHILD_PIPE_STDOUT) {
     if (dup2(out_write, STDOUT_FILENO) < 0)
-      report_exec_error(err_fd, errno);
+      report_exec_error(exec_fd, errno);
     if ((flags & CHILD_STDERR_TO_STDOUT) &&
         dup2(out_write, STDERR_FILENO) < 0)
-      report_exec_error(err_fd, errno);
+      report_exec_error(exec_fd, errno);
   }
-  if (flags & CHILD_QUIET_STDERR) {
+  if (flags & CHILD_PIPE_STDERR) {
+    if (dup2(stderr_write, STDERR_FILENO) < 0)
+      report_exec_error(exec_fd, errno);
+  } else if (flags & CHILD_QUIET_STDERR) {
     int null_fd = open("/dev/null", O_WRONLY);
     if (null_fd >= 0 && null_fd != STDERR_FILENO) {
       dup2(null_fd, STDERR_FILENO);
@@ -157,15 +160,15 @@ static void child_side(const char *path, char *const argv[], unsigned flags,
     }
   }
 
-  close_inherited_fds(err_fd, scan_limit);
+  close_inherited_fds(exec_fd, scan_limit);
 
   execv(path, argv);
-  report_exec_error(err_fd, errno);
+  report_exec_error(exec_fd, errno);
 }
 
 bool child_spawn(ChildProc *c, const char *tag, char *const argv[],
                  unsigned flags) {
-  *c = (ChildProc){.pid = 0, .in_fd = -1, .out_fd = -1};
+  *c = (ChildProc){.pid = 0, .in_fd = -1, .out_fd = -1, .err_fd = -1};
 
   char path[PATH_MAX];
   if (!resolve_program(argv[0], path, sizeof path)) {
@@ -177,17 +180,21 @@ bool child_spawn(ChildProc *c, const char *tag, char *const argv[],
     return false;
   }
 
-  int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1}, err_pipe[2] = {-1, -1};
+  int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1}, se_pipe[2] = {-1, -1},
+      exec_pipe[2] = {-1, -1};
   if (((flags & CHILD_PIPE_STDIN) && pipe2(in_pipe, O_CLOEXEC) != 0) ||
       ((flags & CHILD_PIPE_STDOUT) && pipe2(out_pipe, O_CLOEXEC) != 0) ||
-      pipe2(err_pipe, O_CLOEXEC) != 0) {
+      ((flags & CHILD_PIPE_STDERR) && pipe2(se_pipe, O_CLOEXEC) != 0) ||
+      pipe2(exec_pipe, O_CLOEXEC) != 0) {
     printf("%s: pipe failed: %s\n", tag, strerror(errno));
     close_fd(&in_pipe[0]);
     close_fd(&in_pipe[1]);
     close_fd(&out_pipe[0]);
     close_fd(&out_pipe[1]);
-    close_fd(&err_pipe[0]);
-    close_fd(&err_pipe[1]);
+    close_fd(&se_pipe[0]);
+    close_fd(&se_pipe[1]);
+    close_fd(&exec_pipe[0]);
+    close_fd(&exec_pipe[1]);
     return false;
   }
 
@@ -210,13 +217,15 @@ bool child_spawn(ChildProc *c, const char *tag, char *const argv[],
     close_fd(&in_pipe[1]);
     close_fd(&out_pipe[0]);
     close_fd(&out_pipe[1]);
-    close_fd(&err_pipe[0]);
-    close_fd(&err_pipe[1]);
+    close_fd(&se_pipe[0]);
+    close_fd(&se_pipe[1]);
+    close_fd(&exec_pipe[0]);
+    close_fd(&exec_pipe[1]);
     return false;
   }
   if (pid == 0)
-    child_side(path, argv, flags, in_pipe[0], out_pipe[1], err_pipe[1],
-               scan_limit);
+    child_side(path, argv, flags, in_pipe[0], out_pipe[1], se_pipe[1],
+               exec_pipe[1], scan_limit);
 
   // Also set from the parent: whichever of the two runs first, the group
   // exists before child_stop() could signal it.
@@ -224,22 +233,24 @@ bool child_spawn(ChildProc *c, const char *tag, char *const argv[],
 
   close_fd(&in_pipe[0]);
   close_fd(&out_pipe[1]);
-  close_fd(&err_pipe[1]);
+  close_fd(&se_pipe[1]);
+  close_fd(&exec_pipe[1]);
 
   // exec succeeded exactly when the error pipe closes with nothing in it
   // (close-on-exec closed the child's end).
   int child_errno = 0;
   ssize_t n;
   do {
-    n = read(err_pipe[0], &child_errno, sizeof child_errno);
+    n = read(exec_pipe[0], &child_errno, sizeof child_errno);
   } while (n < 0 && errno == EINTR);
-  close_fd(&err_pipe[0]);
+  close_fd(&exec_pipe[0]);
 
   if (n > 0) {
     printf("%s: could not execute %s: %s\n", tag, path,
            strerror(child_errno));
     close_fd(&in_pipe[1]);
     close_fd(&out_pipe[0]);
+    close_fd(&se_pipe[0]);
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
     }
     return false;
@@ -249,10 +260,13 @@ bool child_spawn(ChildProc *c, const char *tag, char *const argv[],
     fcntl(in_pipe[1], F_SETFL, fcntl(in_pipe[1], F_GETFL) | O_NONBLOCK);
   if (out_pipe[0] >= 0)
     fcntl(out_pipe[0], F_SETFL, fcntl(out_pipe[0], F_GETFL) | O_NONBLOCK);
+  if (se_pipe[0] >= 0)
+    fcntl(se_pipe[0], F_SETFL, fcntl(se_pipe[0], F_GETFL) | O_NONBLOCK);
 
   c->pid = pid;
   c->in_fd = in_pipe[1];
   c->out_fd = out_pipe[0];
+  c->err_fd = se_pipe[0];
   return true;
 }
 
@@ -420,10 +434,12 @@ int child_stop(ChildProc *c, int grace_ms) {
   close_fd(&c->in_fd);
   if (c->pid > 0 && had_stdin && child_wait(c, grace_ms, &status)) {
     close_fd(&c->out_fd);
+    close_fd(&c->err_fd);
     return status;
   }
 
   close_fd(&c->out_fd);
+  close_fd(&c->err_fd);
   if (c->pid <= 0)
     return status;
 

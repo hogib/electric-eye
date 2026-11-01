@@ -18,9 +18,9 @@
 | `stream_server` | Preview thread: complete JPEGs, a viewer that never reads gets dropped, offers never block |
 | `camera_ctrl` | Range scaling, unit conversion, rpicam argv |
 | `health` | Health file contents and escaping |
-| `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group |
+| `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group, stderr on its own pipe |
 | `virtual_cam` | The optional webcam output: quiet checks for a missing device, back-off for one that will not open. `EEYE_TEST_LOOPBACK=/dev/videoN` also writes to a real one |
-| `hellion` | Config parsing and errors; pipelines driven end to end over the bus (byte-exact forwarding, size changes, a failing sink not starving its neighbour, a missing source); the status file; log capture of own and child output |
+| `hellion` | Config parsing and errors, and the shipped example configs; pipelines driven end to end over the bus (byte-exact forwarding, size changes, a failing sink not starving its neighbour, a missing source); the UDP relay (forwarding, loss, late packets, SSRC change, wrap-around); an RTP round trip checking colour range (skipped without ffmpeg); the status file; log capture |
 | `fbus` | Frame bus across real processes: whole frames under a writer lapping the ring (and a deterministic lap), several readers, futex wake-up, writer restart, a killed writer detected by its heartbeat, bad files |
 | `topside` | Python: link staleness, health relay, recorder |
 | `record` | Python: duration parsing, ffmpeg command construction |

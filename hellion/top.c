@@ -298,6 +298,27 @@ static void draw_endpoint(const char *role, const HsEndpoint *e,
   if (e->detail[0])
     seg(C_DIM, "  %s", e->detail);
   line_end();
+
+  // The link under an RTP endpoint, on its own line.
+  if (e->net) {
+    seg(C_DIM, "  %-6s ", "");
+    seg(C_DIM, "%-26s ", is_sink ? "  link out" : "  link in");
+    if (e->idle_s < 0 || e->idle_s > 2.0) {
+      seg(C_WARN, "no packets%s",
+          e->idle_s < 0 ? " yet" : "");
+      if (e->idle_s > 2.0)
+        seg(C_DIM, " for %.0fs", e->idle_s);
+    } else {
+      seg(C_NONE, "%7.0f kbit/s", e->kbps);
+      seg(e->loss_pct >= 1.0   ? C_BAD
+          : e->loss_pct > 0.0 ? C_WARN
+                              : C_OK,
+          "  %5.1f%% loss", e->loss_pct);
+    }
+    seg(C_DIM, "  %llu packets, %llu lost in all",
+        (unsigned long long)e->packets, (unsigned long long)e->lost);
+    line_end();
+  }
 }
 
 static void draw_instance(const HsStatus *s) {
@@ -351,8 +372,12 @@ static HsStatus statuses[8];
 
 static int count_lines(const HsStatus *s) {
   int n = 1;
-  for (uint32_t i = 0; i < s->pipeline_count; i++)
-    n += 2 + (int)s->pipelines[i].sink_count;
+  for (uint32_t i = 0; i < s->pipeline_count; i++) {
+    const HsPipeline *p = &s->pipelines[i];
+    n += 2 + (int)p->sink_count + (p->source.net ? 1 : 0);
+    for (uint32_t k = 0; k < p->sink_count; k++)
+      n += p->sinks[k].net ? 1 : 0;
+  }
   return n;
 }
 

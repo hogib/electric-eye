@@ -1,0 +1,9 @@
+{
+  "name": "rov",
+  "role": "rov",
+  "pipelines": [
+    {"name": "camera-up", "source": "v4l2:/dev/video0",
+     "width": 1280, "height": 720, "framerate": 30,
+     "sinks": ["rtp:192.168.2.1:5610"]}
+  ]
+}

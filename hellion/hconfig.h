@@ -31,10 +31,17 @@
  *   sources  "v4l2:<device>"  a V4L2 camera (MJPEG or YUYV)
  *            "rpicam"         a Pi camera module, via rpicam-vid
  *            "bus:<stream>"   a frame bus stream (geometry from the stream)
+ *            "rtp:<port>"     H.264 over RTP arriving on UDP <port>
  *   sinks    "bus:<stream>"   publish to the frame bus
  *            "v4l2:<device>"  a v4l2loopback device (optional, retried)
- * Camera sources take "width"/"height" (default 1280x720) and "format"
- * ("auto", "mjpeg", "yuyv"; "yuv420" for rpicam).
+ *            "rtp:<host>:<port>"  encode to H.264, send over RTP
+ * Camera and RTP sources take "width"/"height" (default 1280x720; an RTP
+ * source scales what it decodes to that) and camera sources "format"
+ * ("auto", "mjpeg", "yuyv"; "yuv420" for rpicam). An RTP source takes
+ * "relay": ["host:port", ...] to forward its packets unchanged (to QGC,
+ * say). RTP sinks take "encoder" (default "libx264"), "bitrate_kbps"
+ * (default 4000) and "gop" (default 30). "framerate" (default 30) is the
+ * source's rate: asked of cameras, and what RTP sinks stamp frames at.
  *
  * Same strictness as eeye's config: an unknown key or a bad value is an
  * error with the reason printed, never ignored.
@@ -51,12 +58,16 @@ typedef enum {
   SRC_V4L2 = 0,
   SRC_RPICAM,
   SRC_BUS,
+  SRC_RTP, // H.264 over RTP arriving on a UDP port
 } SourceKind;
 
 typedef enum {
   SINK_BUS = 0,
   SINK_V4L2,
+  SINK_RTP, // encode to H.264 and send over RTP
 } SinkKind;
+
+enum { hcfg_max_relays = 4 };
 
 typedef struct {
   SinkKind kind;
@@ -74,6 +85,18 @@ typedef struct {
   CaptureFormat format;
   size_t sink_count;
   SinkConfig sinks[hcfg_max_sinks];
+
+  // RTP source: where to forward the received packets unchanged as well
+  // (QGC, a recorder), "host:port".
+  size_t relay_count;
+  char relays[hcfg_max_relays][hcfg_max_spec];
+  // RTP sinks: how to encode.
+  char encoder[32];       // default "libx264"
+  uint32_t bitrate_kbps;  // default 4000
+  uint32_t gop;           // default 30 (one keyframe a second at 30fps)
+  // The source's frame rate: asked of cameras, and what RTP sinks stamp
+  // frames at (so what a recording's timing assumes). Default 30.
+  uint32_t framerate;
 } PipelineConfig;
 
 typedef struct {

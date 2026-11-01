@@ -1,0 +1,10 @@
+{
+  "name": "topside",
+  "role": "topside",
+  "pipelines": [
+    {"name": "pilot-in", "source": "rtp:5610",
+     "width": 1280, "height": 720,
+     "relay": ["127.0.0.1:5600"],
+     "sinks": ["bus:pilot", "v4l2:/dev/video10"]}
+  ]
+}

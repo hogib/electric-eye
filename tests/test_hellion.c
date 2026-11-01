@@ -3,11 +3,13 @@
 // the log capture. Streams live in a private EEYE_BUS_DIR.
 #define _POSIX_C_SOURCE 200809L
 #include "child_proc.h"
+#include "ffmpeg.h"
 #include "fbus.h"
 #include "hconfig.h"
 #include "hlog.h"
 #include "hstatus.h"
 #include "pipeline.h"
+#include "udp_relay.h"
 #include "test_harness.h"
 #include <dirent.h>
 #include <fcntl.h>
@@ -320,6 +322,268 @@ static void test_pipeline_waits_for_missing_source(void) {
   pipeline_stop(p); // must not hang
 }
 
+// The shipped examples are what install.sh starts from: they must load.
+// (make check runs suites from the repository root.)
+static void test_example_configs_load(void) {
+  static const char *const files[] = {
+      "hellion/examples/a-rov.json", "hellion/examples/a-topside.json",
+      "hellion/examples/b-rov.json", "hellion/examples/b-topside.json"};
+  for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+    HellionConfig c;
+    bool ok = hconfig_load(files[i], &c);
+    if (!ok)
+      printf("    %s did not load\n", files[i]);
+    CHECK(ok);
+  }
+}
+
+// ---- RTP config -------------------------------------------------------------
+
+static void test_config_rtp(void) {
+  HellionConfig c;
+  CHECK(parse("{\"pipelines\":[{\"name\":\"down\",\"source\":\"rtp:5610\","
+              "\"width\":640,\"height\":480,"
+              "\"relay\":[\"127.0.0.1:5600\",\"[fe80::1%eth0]:5602\"],"
+              "\"sinks\":[\"bus:pilot\"]},"
+              "{\"name\":\"up\",\"source\":\"bus:pilot\","
+              "\"encoder\":\"h264_v4l2m2m\",\"bitrate_kbps\":2500,"
+              "\"gop\":15,\"framerate\":25,"
+              "\"sinks\":[\"rtp:192.168.2.1:5610\"]}]}",
+              &c));
+  CHECK_EQ_INT(c.pipelines[0].source, SRC_RTP);
+  CHECK(strcmp(c.pipelines[0].source_arg, "5610") == 0);
+  CHECK_EQ_INT(c.pipelines[0].relay_count, 2);
+  CHECK(strcmp(c.pipelines[0].relays[1], "[fe80::1%eth0]:5602") == 0);
+  CHECK_EQ_INT(c.pipelines[1].sinks[0].kind, SINK_RTP);
+  CHECK(strcmp(c.pipelines[1].sinks[0].arg, "192.168.2.1:5610") == 0);
+  CHECK(strcmp(c.pipelines[1].encoder, "h264_v4l2m2m") == 0);
+  CHECK_EQ_INT(c.pipelines[1].bitrate_kbps, 2500);
+  CHECK_EQ_INT(c.pipelines[1].gop, 15);
+  CHECK_EQ_INT(c.pipelines[1].framerate, 25);
+
+  // Defaults.
+  CHECK(parse("{\"pipelines\":[{\"name\":\"u\",\"source\":\"bus:a\","
+              "\"sinks\":[\"rtp:h:1\"]}]}",
+              &c));
+  CHECK(strcmp(c.pipelines[0].encoder, "libx264") == 0);
+  CHECK_EQ_INT(c.pipelines[0].bitrate_kbps, 4000);
+  CHECK_EQ_INT(c.pipelines[0].gop, 30);
+  CHECK_EQ_INT(c.pipelines[0].framerate, 30);
+
+  // Errors.
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"rtp:0\","
+               "\"sinks\":[\"bus:b\"]}]}",
+               &c)); // port 0
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"rtp:70000\","
+               "\"sinks\":[\"bus:b\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+               "\"sinks\":[\"rtp:5600\"]}]}",
+               &c)); // a sink needs a host
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+               "\"relay\":[\"h:1\"],\"sinks\":[\"bus:b\"]}]}",
+               &c)); // relay only for an rtp source
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"rtp:1\","
+               "\"relay\":[\"nohostport\"],\"sinks\":[\"bus:b\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+               "\"encoder\":\"x264; rm -rf\",\"sinks\":[\"bus:b\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+               "\"bitrate_kbps\":10,\"sinks\":[\"bus:b\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+               "\"framerate\":0,\"sinks\":[\"bus:b\"]}]}",
+               &c));
+}
+
+// ---- UDP relay ----------------------------------------------------------------
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+static int udp_listener(int *port) {
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind(fd, (struct sockaddr *)&a, sizeof a);
+  socklen_t l = sizeof a;
+  getsockname(fd, (struct sockaddr *)&a, &l);
+  *port = ntohs(a.sin_port);
+  struct timeval tv = {0, 300000};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  return fd;
+}
+
+static void send_rtp(int fd, int port, uint16_t seq, uint32_t ssrc,
+                     size_t len) {
+  uint8_t pkt[1500];
+  memset(pkt, 0xAB, sizeof pkt);
+  pkt[0] = 0x80; // version 2
+  pkt[1] = 96;
+  pkt[2] = (uint8_t)(seq >> 8);
+  pkt[3] = (uint8_t)seq;
+  pkt[8] = (uint8_t)(ssrc >> 24);
+  pkt[9] = (uint8_t)(ssrc >> 16);
+  pkt[10] = (uint8_t)(ssrc >> 8);
+  pkt[11] = (uint8_t)ssrc;
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = htons((uint16_t)port);
+  sendto(fd, pkt, len, 0, (struct sockaddr *)&a, sizeof a);
+}
+
+static int drain(int fd) {
+  int n = 0;
+  uint8_t buf[2048];
+  while (recv(fd, buf, sizeof buf, 0) > 0)
+    n++;
+  return n;
+}
+
+// Every packet reaches every destination unchanged, and the RTP stats see
+// through to what the link did: gaps are loss, late arrivals are not, and
+// a new sender (SSRC) is not a gap.
+static void test_udp_relay(void) {
+  char err[160];
+  int pa, pb;
+  int a = udp_listener(&pa), b = udp_listener(&pb);
+  UdpRelay *r = udp_relay_open("127.0.0.1:0", err, sizeof err);
+  CHECK(r != NULL);
+  char dest[64];
+  snprintf(dest, sizeof dest, "127.0.0.1:%d", pa);
+  CHECK(udp_relay_add_dest(r, dest, err, sizeof err));
+  snprintf(dest, sizeof dest, "127.0.0.1:%d", pb);
+  CHECK(udp_relay_add_dest(r, dest, err, sizeof err));
+  CHECK(!udp_relay_add_dest(r, "no-port", err, sizeof err));
+  CHECK(udp_relay_start(r));
+  int in = socket(AF_INET, SOCK_DGRAM, 0);
+  int port = udp_relay_port(r);
+  CHECK(port > 0);
+
+  // 1..10, skipping 4 and 5 (lost), then 4 arrives late, then 11..12.
+  for (uint16_t s = 1; s <= 10; s++)
+    if (s != 4 && s != 5)
+      send_rtp(in, port, s, 0x1111, 1200);
+  send_rtp(in, port, 4, 0x1111, 1200);
+  send_rtp(in, port, 11, 0x1111, 1200);
+  send_rtp(in, port, 12, 0x1111, 1200);
+  // A new sender, starting somewhere else entirely: no false gap.
+  send_rtp(in, port, 50000, 0x2222, 1200);
+  send_rtp(in, port, 50001, 0x2222, 1200);
+  // Not RTP at all: forwarded, counted, but no sequence bookkeeping.
+  send_rtp(in, port, 0, 0, 4);
+  sleep_ms(200);
+
+  CHECK_EQ_INT(drain(a), 14);
+  CHECK_EQ_INT(drain(b), 14);
+  RelayStats st;
+  udp_relay_stats(r, &st);
+  CHECK_EQ_INT(st.packets, 14);
+  CHECK_EQ_INT(st.lost, 1); // 5; 4 turned up late
+  CHECK_EQ_INT(st.late, 1);
+  CHECK(st.idle_s >= 0 && st.idle_s < 1.0);
+
+  // Wrap-around is not loss.
+  send_rtp(in, port, 65535, 0x3333, 100);
+  send_rtp(in, port, 0, 0x3333, 100);
+  send_rtp(in, port, 1, 0x3333, 100);
+  sleep_ms(100);
+  udp_relay_stats(r, &st);
+  CHECK_EQ_INT(st.lost, 1);
+
+  udp_relay_close(r);
+  close(in);
+  close(a);
+  close(b);
+
+  UdpRelay *bad = udp_relay_open("not-an-address:x", err, sizeof err);
+  CHECK(bad == NULL);
+}
+
+// ---- RTP end to end ---------------------------------------------------------
+
+static double mean_y(const Img *im) {
+  unsigned long sum = 0;
+  size_t n = (size_t)im->w * im->h;
+  for (size_t i = 0; i < n; i++)
+    sum += im->planes[0][i];
+  return (double)sum / (double)n;
+}
+
+// Bus -> encoder -> RTP -> relay -> decoder -> bus, through two pipelines
+// as on the ROV and topside. Uniform dark and bright frames must come
+// back at the brightness they went in: that only holds if the full->
+// limited range conversion on the way in and limited->full on the way out
+// are both right (wrong, and dark grey turns black or white turns grey).
+static void test_rtp_round_trip(void) {
+  if (!ff_available()) {
+    printf("    (skipped: ffmpeg is not installed)\n");
+    return;
+  }
+  int port = udp_free_port_pair();
+  char json[512];
+  snprintf(json, sizeof json,
+           "{\"pipelines\":[{\"name\":\"down\",\"source\":\"rtp:%d\","
+           "\"width\":320,\"height\":240,\"sinks\":[\"bus:rt-out\"]},"
+           "{\"name\":\"up\",\"source\":\"bus:rt-in\",\"gop\":10,"
+           "\"sinks\":[\"rtp:127.0.0.1:%d\"]}]}",
+           port, port);
+  HellionConfig c;
+  CHECK(parse(json, &c));
+  FbusWriter *in = fbus_writer_open("rt-in", 320, 240);
+  Pipeline *down = pipeline_start(&c.pipelines[0]);
+  Pipeline *up = pipeline_start(&c.pipelines[1]);
+
+  Img src, dst;
+  img_init(&src, 320, 240);
+  img_init(&dst, 320, 240);
+  memset(src.planes[1], 128, src.bytes - (size_t)320 * 240); // neutral chroma
+
+  static const uint8_t levels[] = {40, 200};
+  FbusReader *out = NULL;
+  for (int li = 0; li < 2; li++) {
+    memset(src.planes[0], levels[li], (size_t)320 * 240);
+    double got = -1;
+    // Publish at 30fps until the decoded output has settled on this level
+    // (the first frames after a change can be mid-transition).
+    for (int i = 0; i < 300; i++) {
+      fbus_writer_publish(in, (const uint8_t *const *)src.planes, i, 0);
+      sleep_ms(33);
+      if (!out)
+        out = fbus_reader_open("rt-out", NULL);
+      if (out && fbus_reader_next(out, dst.planes, 10, NULL) == FBUS_FRAME) {
+        got = mean_y(&dst);
+        if (got > levels[li] - 4 && got < levels[li] + 4 && i > 60)
+          break;
+      }
+    }
+    printf("    Y %u in, %.1f out\n", levels[li], got);
+    CHECK(got > levels[li] - 4 && got < levels[li] + 4);
+  }
+
+  HsPipeline st;
+  pipeline_status(up, &st);
+  CHECK(strcmp(st.sinks[0].state, "sending") == 0);
+  CHECK(st.sinks[0].net && st.sinks[0].packets > 0);
+  pipeline_status(down, &st);
+  CHECK(st.source.net && st.source.packets > 0);
+  CHECK_EQ_INT(st.source.lost, 0);
+
+  fbus_reader_close(out);
+  pipeline_stop(up);
+  pipeline_stop(down);
+  fbus_writer_close(in);
+  free(src.buf);
+  free(dst.buf);
+}
+
 // ---- Status file ----------------------------------------------------------
 
 static void test_status_round_trip(void) {
@@ -435,6 +699,10 @@ int main(void) {
   RUN_TEST(test_pipeline_follows_size_change);
   RUN_TEST(test_failing_sink_does_not_starve_others);
   RUN_TEST(test_pipeline_waits_for_missing_source);
+  RUN_TEST(test_config_rtp);
+  RUN_TEST(test_example_configs_load);
+  RUN_TEST(test_udp_relay);
+  RUN_TEST(test_rtp_round_trip);
   RUN_TEST(test_status_round_trip);
   RUN_TEST(test_log_capture);
 
