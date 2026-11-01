@@ -257,6 +257,37 @@ static void sink_offer(Sink *s, uint8_t *const planes[3], int64_t frame_no,
   pthread_mutex_unlock(&s->lock);
 }
 
+// The same, without the copy: the frame's own raw block goes into the
+// mailbox, and the frame takes the slot's block for the source to capture
+// the next one into. For the last (on the ROV, the only) sink of each
+// frame, which saves a full-frame copy -- 1.84MB at 720p, a millisecond on
+// a Pi -- per frame. Only when the layouts match exactly (they do: the
+// sinks are sized from the source), else a copy as above. The two blocks
+// come from malloc on both sides, and raw_data is always owned[1] (see
+// video_frame.h), so ownership moves with the pointers.
+static void sink_offer_swap(Sink *s, VideoFrame *vf, int64_t frame_no) {
+  size_t y = vf->plane_sizes[0], c = vf->plane_sizes[1];
+  if (s->plane_bytes[0] != y || s->plane_bytes[1] != c ||
+      vf->plane_sizes[2] != c || vf->owned[1] != vf->raw_data) {
+    sink_offer(s, vf->raw_planes, frame_no, vf->capture_ns);
+    return;
+  }
+  pthread_mutex_lock(&s->lock);
+  if (s->full)
+    s->dropped++;
+  uint8_t *frame_block = vf->raw_data;
+  vf->raw_data = vf->owned[1] = s->slot;
+  vf->raw_planes[0] = s->slot;
+  vf->raw_planes[1] = s->slot + y;
+  vf->raw_planes[2] = s->slot + y + c;
+  s->slot = frame_block;
+  s->slot_frame_no = frame_no;
+  s->slot_capture_ns = vf->capture_ns;
+  s->full = true;
+  pthread_cond_signal(&s->cond);
+  pthread_mutex_unlock(&s->lock);
+}
+
 static void sink_stop(Sink *s) {
   if (!s)
     return;
@@ -679,8 +710,6 @@ static void *source_loop(void *arg) {
     set_source(p, "running", "");
     was_running = true;
 
-    uint8_t *const planes[3] = {vf->raw_planes[0], vf->raw_planes[1],
-                                vf->raw_planes[2]};
     bool camera_restart = false;
     while (!stopping(p)) {
       CaptureResult r = source_capture(p, &src, vf, &frame_no);
@@ -707,8 +736,13 @@ static void *source_loop(void *arg) {
       pthread_mutex_unlock(&p->lock);
 
       // Only this thread replaces the sinks, so the copies stay valid.
-      for (size_t i = 0; i < n; i++)
-        sink_offer(sinks[i], planes, frame_no, vf->capture_ns);
+      // Every sink but the last gets a copy; the last gets the frame itself
+      // (see sink_offer_swap), after which vf's raw planes are another
+      // block -- the next capture goes there.
+      for (size_t i = 0; i + 1 < n; i++)
+        sink_offer(sinks[i], vf->raw_planes, frame_no, vf->capture_ns);
+      if (n > 0)
+        sink_offer_swap(sinks[n - 1], vf, frame_no);
 
       if (new_camera && src.v4l2) {
         apply_v4l2_camera(p, &src);
