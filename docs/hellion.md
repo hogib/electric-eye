@@ -127,7 +127,10 @@ And relay targets such as QGC keep getting packets while the decoder restarts.
 **Restarts.** An encoder that exits, or stops taking frames for 2s, is restarted with
 back-off (1s doubling to 30s; back to 1s after a 30s run). A decoder that exits is
 restarted at once, and one that produces nothing for 5s while packets keep arriving is
-presumed wedged and restarted.
+presumed wedged and restarted. That clock only runs while packets arrive: a decoder
+started during an outage is waiting, not wedged, and gets its 5s from when the video
+returns (an earlier version killed it the moment packets resumed, and the picture came
+back ~8s late after a cable pull; it now returns ~1.1s after the packets do).
 
 **Colour range.** The frame bus is full range (0–255, what the effects assume); H.264
 for QGC and every player is limited (16–235). The encoder converts full→limited and
@@ -249,11 +252,16 @@ quality lost, almost no CPU. At the default 4 Mbit/s that is ~1.8 GB/hour.
   that does the opposite — it writes the index only at the end, so an interrupted file
   has none.
 - **Stopping** sends ffmpeg SIGINT while packets are still flowing (it only notices the
-  signal when its next read returns) and takes about half a second.
+  signal when its next read returns) and takes about half a second; during an outage,
+  when no read will return, about a second, and the file is still complete.
 - **Refused** when under 500 MB is free in `record_dir`, when already recording, or
   before the pipeline is receiving. One recording at a time.
-- **If the stream stops** (the ROV goes off), ffmpeg's RTP input gives up after ~20s,
-  the file is finalized, and the page shows the recording as stopped with the reason.
+- **If the stream stops** (cable pulled, ROV restarting), ffmpeg's RTP input gives up
+  after ~20s and finalizes the file, but the recording is only **paused**: the page and
+  `top` show *waiting for video*, and when packets return it continues into
+  `<name>-part2.mp4`, then `-part3.mp4`, each playable on its own. A new file rather
+  than an append, because the encoder on the ROV may have restarted with new
+  parameters. Stop works while paused. The elapsed time counts from the first part.
 
 The page shows elapsed time and size while recording. `eeye`'s own raw recording
 (`record_path`, full quality, before effects, enormous) is separate and still on its

@@ -350,7 +350,10 @@ static void draw_instance(const HsStatus *s) {
 
   if (s->recording[0]) {
     seg(C_HEAD, " recording");
-    seg(strncmp(s->recording, "recording ", 10) == 0 ? C_OK : C_BAD, "  %s",
+    seg(strstr(s->recording, "paused")                   ? C_WARN
+        : strncmp(s->recording, "recording ", 10) == 0 ? C_OK
+                                                         : C_BAD,
+        "  %s",
         s->recording);
     line_end();
   }

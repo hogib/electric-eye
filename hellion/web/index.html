@@ -397,6 +397,11 @@ function loadConfig(cfg) {
   // drone does not mention stay untouched, so this page never starts
   // pushing values nobody chose.
   const cam = cfg.camera || {};
+  carriedCamera = {};
+  for (const [name, value] of Object.entries(cam)) {
+    if (!CAM_TOGGLES.includes(name) && !CAM_SLIDERS.includes(name))
+      carriedCamera[name] = value;
+  }
   for (const name of CAM_TOGGLES) {
     if (cam[name] !== undefined) {
       camEl(name).checked = !!cam[name];
@@ -524,6 +529,10 @@ const CAM_TOGGLES = ["auto_exposure", "auto_white_balance"];
 // Which fields this session has deliberately set. Starts empty so a page
 // load does not immediately push a full set of defaults at the camera.
 let camTouched = new Set();
+// Camera keys this page has no control for (sharpness, keep_framerate),
+// carried through as they came, like carriedGeometry: dropping them would
+// quietly put those controls back to their defaults on the next save.
+let carriedCamera = {};
 
 function camEl(name) { return document.getElementById("cam_" + name); }
 
@@ -543,7 +552,7 @@ function updateCamGating() {
 }
 
 function buildCameraObject() {
-  const cam = {};
+  const cam = {...carriedCamera};
   for (const name of CAM_TOGGLES) {
     if (camTouched.has(name)) cam[name] = camEl(name).checked;
   }
@@ -710,7 +719,14 @@ function renderRecorder(rec) {
     const secs = Math.floor((rec.elapsed_s || 0) % 60);
     const clock = `${mins}:${String(secs).padStart(2, "0")}`;
     let label = `Stop  ${clock}`;
-    if (rec.bytes) label += `  ${(rec.bytes / 1e6).toFixed(0)} MB`;
+    if (rec.paused) {
+      // The stream stopped; recording continues into a new part when it
+      // returns. Still "Stop": the recording is on until the pilot says.
+      label += "  (waiting for video)";
+    } else {
+      if (rec.part > 1) label += `  part ${rec.part}`;
+      if (rec.bytes) label += `  ${(rec.bytes / 1e6).toFixed(0)} MB`;
+    }
     setButtonLabel(btnRecord, "square", label);
   } else {
     setButtonLabel(btnRecord, "dot", "Record");

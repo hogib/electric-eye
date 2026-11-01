@@ -203,8 +203,12 @@ and the decoder's damage count appears next to it. Lower `bitrate_kbps` on the R
 ### Recording stopped without telling me
 
 The page shows the recording's elapsed time and size while it runs and turns red with the
-reason if it stops (the stream ended, the disk is nearly full). A recording will not
+reason if it stops (the disk is nearly full, ffmpeg failed). A recording will not
 start with under 500 MB free.
+
+If the **video stops** (tether pulled, ROV restarting), the recording is not lost: it
+shows *waiting for video*, and when packets return it carries on in a new file next to
+the first, `dive-…-part2.mp4`, `-part3.mp4` and so on. Every part plays on its own.
 
 ### I change settings and nothing happens
 
@@ -391,7 +395,13 @@ auto white balance gives up once everything is blue-green.
 ```
 
 Every field is optional, and **anything you leave out is left alone** — so a
-`"camera"` block with one key changes exactly one control.
+`"camera"` block with one key changes exactly one control. The one exception is
+`keep_framerate`, which is on unless you turn it off: many UVC webcams ship with
+auto exposure allowed to lengthen the shutter past the frame time in dim light (the
+V4L2 control is `exposure_dynamic_framerate`), and the test webcam dropped from 30 to
+17 fps in a dim room. Every frame downstream — the effects, the tether, QGC, the
+recording — inherits that. Set it `false` if you would rather have a brighter picture
+at a lower rate. Cameras without the control ignore it silently.
 
 | key | range | meaning |
 |---|---|---|
@@ -404,6 +414,7 @@ Every field is optional, and **anything you leave out is left alone** — so a
 | `contrast` | 0–200 | 100 = neutral |
 | `saturation` | 0–200 | 100 = neutral |
 | `sharpness` | 0–200 | 100 = neutral |
+| `keep_framerate` | bool | Default `true`: auto exposure may not lower the frame rate (see below) |
 
 These are **hot-reloadable** — adjust them from the page's Camera section and the
 picture changes immediately, no restart. They are also re-applied after a camera

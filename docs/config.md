@@ -169,7 +169,9 @@ logs it. Changing it while recording restarts the recording. See
 
 ### `camera`
 
-A nested object; every field optional, and **absent means "leave that control alone"**.
+A nested object; every field optional, and **absent means "leave that control alone"**,
+except `keep_framerate`, which defaults to `true` (a webcam that lowered its rate in dim
+light took the whole pipeline from 30 to 17 fps in field testing).
 
 | Key | Range | Notes |
 |---|---|---|
@@ -182,6 +184,7 @@ A nested object; every field optional, and **absent means "leave that control al
 | `contrast` | 0–200 | 100 neutral |
 | `saturation` | 0–200 | 100 neutral |
 | `sharpness` | 0–200 | 100 neutral |
+| `keep_framerate` | bool | **Default `true`.** V4L2 `exposure_dynamic_framerate` (UVC "auto exposure priority") off, so auto exposure cannot lower the frame rate; ignored silently by cameras without it |
 
 Range checks here are deliberately loose — they reject values that could only be a
 mistake (a Kelvin temperature of 9, a percentage of 500). The real per-device clamping

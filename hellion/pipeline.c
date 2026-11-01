@@ -323,8 +323,11 @@ static void decoder_line(Pipeline *p, const char *line) {
     pthread_mutex_unlock(&p->lock);
     return;
   }
-  // Its ~20s no-packets timeout, already shown as "no packets" on the link.
-  if (strstr(line, "Connection timed out"))
+  // Its ~20s no-packets timeout, already shown as "no packets" on the link;
+  // and ffmpeg's own "Last message repeated N times", which follows the
+  // H.264 complaints counted above.
+  if (strstr(line, "Connection timed out") ||
+      strstr(line, "Last message repeated"))
     return;
   if (line[0])
     printf("hellion: pipeline \"%s\": decoder: %s\n", p->cfg.name, line);
@@ -530,11 +533,17 @@ static CaptureResult rtp_capture(Pipeline *p, Source *src, VideoFrame *vf) {
       return CAP_LOST;
     }
     // Nothing for a while. If packets are still arriving the decoder is
-    // wedged, not starved: restart it.
+    // wedged, not starved: restart it. The clock only runs while packets
+    // arrive -- a decoder started during an outage (the old one timed out)
+    // has had nothing to decode, and was being killed the moment packets
+    // came back, before it could produce a frame.
     RelayStats rs;
     udp_relay_stats(p->rtp_relay, &rs);
-    if (mono_ns() - src->dec_last_frame_ns > decoder_wedged_ns &&
-        rs.idle_s >= 0 && rs.idle_s < 1.0) {
+    if (rs.idle_s < 0 || rs.idle_s >= 1.0) {
+      src->dec_last_frame_ns = mono_ns(); // starved, not wedged
+      return CAP_IDLE;
+    }
+    if (mono_ns() - src->dec_last_frame_ns > decoder_wedged_ns) {
       printf("hellion: pipeline \"%s\": packets arriving but the decoder "
              "has produced nothing for %.0fs; restarting it\n",
              p->cfg.name, decoder_wedged_ns / 1e9);

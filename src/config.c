@@ -71,7 +71,10 @@ static const Config config_defaults = {
                .brightness = camera_ctrl_unset,
                .contrast = camera_ctrl_unset,
                .saturation = camera_ctrl_unset,
-               .sharpness = camera_ctrl_unset},
+               .sharpness = camera_ctrl_unset,
+               // The one control set by default: see keep_framerate in
+               // camera_ctrl.h.
+               .keep_framerate = 1},
 };
 
 // The geometry actually in force, captured by config_load_once() before any
@@ -464,6 +467,11 @@ static bool parse_camera(Cursor *c, CameraControls *out) {
       ok = parse_bool(c, &b);
       if (ok)
         out->auto_white_balance = b ? 1 : 0;
+    } else if (strcmp(key, "keep_framerate") == 0) {
+      bool b;
+      ok = parse_bool(c, &b);
+      if (ok)
+        out->keep_framerate = b ? 1 : 0;
     } else if (strcmp(key, "exposure") == 0) {
       target = &out->exposure;
       lo = 1;

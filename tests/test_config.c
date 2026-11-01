@@ -111,17 +111,29 @@ static void test_effect_parameters_round_trip(void) {
 
 // Camera controls are a nested object where every field is optional and
 // "absent" must mean "leave the camera alone" -- not 0, which for
-// brightness would be mid-range and for contrast the minimum.
+// brightness would be mid-range and for contrast the minimum. The one
+// exception is keep_framerate, set by default (see camera_ctrl.h).
 static void test_camera_controls_default_to_unset(void) {
   Config c;
   CHECK(parse("{}", &c));
-  CHECK(!camera_ctrl_any_set(&c.camera));
+  CHECK_EQ_INT(c.camera.keep_framerate, 1);
+  CameraControls others = c.camera;
+  others.keep_framerate = camera_ctrl_unset;
+  CHECK(!camera_ctrl_any_set(&others));
   CHECK_EQ_INT(c.camera.brightness, camera_ctrl_unset);
   CHECK_EQ_INT(c.camera.exposure, camera_ctrl_unset);
 
-  // An empty object is valid and still changes nothing.
+  // An empty object is valid and changes nothing, the default included.
   CHECK(parse("{\"camera\":{}}", &c));
-  CHECK(!camera_ctrl_any_set(&c.camera));
+  CHECK_EQ_INT(c.camera.keep_framerate, 1);
+  others = c.camera;
+  others.keep_framerate = camera_ctrl_unset;
+  CHECK(!camera_ctrl_any_set(&others));
+
+  // It can be turned off, letting the camera slow down in dim light.
+  CHECK(parse("{\"camera\":{\"keep_framerate\":false}}", &c));
+  CHECK_EQ_INT(c.camera.keep_framerate, 0);
+  CHECK(!parse("{\"camera\":{\"keep_framerate\":1}}", &c)); // a bool
 
   // Mentioning one field must not disturb the others.
   CHECK(parse("{\"camera\":{\"brightness\":10}}", &c));

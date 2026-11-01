@@ -58,6 +58,15 @@ typedef struct {
   int32_t contrast;   // 0..200, 100 = neutral
   int32_t saturation; // 0..200, 100 = neutral
   int32_t sharpness;  // 0..200, 100 = neutral
+
+  // 1: the camera keeps its frame rate in auto exposure; 0: it may lower
+  // it to expose longer in dim light. Many UVC webcams can do the latter
+  // (V4L2's "exposure_dynamic_framerate"), and do it silently: on one
+  // tested webcam it was on, and a dim scene dropped 30fps to 17. For a
+  // pilot -- and for RTP timestamps and recordings, which assume a steady
+  // rate -- a steady frame rate is the better default, so eeye's config
+  // sets this to 1 unless told otherwise (see config.c).
+  int32_t keep_framerate;
 } CameraControls;
 
 // All fields unset -- the state meaning "change nothing".

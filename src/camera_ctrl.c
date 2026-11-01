@@ -18,6 +18,7 @@ void camera_ctrl_init(CameraControls *c) {
   c->contrast = camera_ctrl_unset;
   c->saturation = camera_ctrl_unset;
   c->sharpness = camera_ctrl_unset;
+  c->keep_framerate = camera_ctrl_unset;
 }
 
 bool camera_ctrl_any_set(const CameraControls *c) {
@@ -28,7 +29,8 @@ bool camera_ctrl_any_set(const CameraControls *c) {
          c->brightness != camera_ctrl_unset ||
          c->contrast != camera_ctrl_unset ||
          c->saturation != camera_ctrl_unset ||
-         c->sharpness != camera_ctrl_unset;
+         c->sharpness != camera_ctrl_unset ||
+         c->keep_framerate != camera_ctrl_unset;
 }
 
 bool camera_ctrl_equal(const CameraControls *a, const CameraControls *b) {
@@ -69,6 +71,9 @@ typedef struct {
   int32_t value;
   CtrlMapping mapping;
   bool is_auto_toggle; // written before the manual controls, see below
+  // Set by default rather than by the operator: a camera without it is
+  // normal and not worth a log line on every open.
+  bool quiet_if_missing;
 } PendingCtrl;
 
 // Writes one control, clamping to the device's own range rather than
@@ -80,8 +85,9 @@ typedef struct {
 static bool apply_one(int fd, const PendingCtrl *pc, bool auto_still_on) {
   struct v4l2_queryctrl q = {.id = pc->id};
   if (xioctl(fd, VIDIOC_QUERYCTRL, &q) < 0) {
-    printf("camera: this camera has no \"%s\" control; skipping it\n",
-           pc->name);
+    if (!pc->quiet_if_missing)
+      printf("camera: this camera has no \"%s\" control; skipping it\n",
+             pc->name);
     return true; // not a failure -- cameras legitimately differ
   }
   if (q.flags & V4L2_CTRL_FLAG_DISABLED) {
@@ -155,7 +161,7 @@ int camera_ctrl_apply(int fd, const CameraControls *c) {
   if (fd < 0 || !camera_ctrl_any_set(c))
     return 0;
 
-  PendingCtrl pending[9];
+  PendingCtrl pending[10];
   size_t n = 0;
 
   // Auto toggles first, unconditionally. V4L2_CID_EXPOSURE_AUTO is a menu
@@ -177,6 +183,17 @@ int camera_ctrl_apply(int fd, const CameraControls *c) {
                                  .value = c->auto_white_balance ? 1 : 0,
                                  .mapping = MAP_DIRECT,
                                  .is_auto_toggle = true};
+  }
+
+  // Whether auto exposure may lower the frame rate. V4L2 names it the
+  // other way round: EXPOSURE_AUTO_PRIORITY 1 lets exposure win.
+  if (c->keep_framerate != camera_ctrl_unset) {
+    pending[n++] = (PendingCtrl){.id = V4L2_CID_EXPOSURE_AUTO_PRIORITY,
+                                 .name = "keep_framerate",
+                                 .value = c->keep_framerate ? 0 : 1,
+                                 .mapping = MAP_DIRECT,
+                                 .is_auto_toggle = true,
+                                 .quiet_if_missing = true};
   }
 
   // Then the manual values those toggles gate.
