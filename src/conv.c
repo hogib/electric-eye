@@ -971,8 +971,9 @@ static uint8_t *canny_mag;
 static size_t canny_mag_cap;
 static uint8_t *canny_dir;
 static size_t canny_dir_cap;
-static uint8_t *canny_nms;
-static size_t canny_nms_cap;
+// Seeds found per row of non-maximum suppression (see stage 3).
+static uint32_t *canny_row_seeds;
+static size_t canny_row_seeds_cap;
 static uint32_t *canny_stack;
 static size_t canny_stack_cap;
 
@@ -1094,7 +1095,8 @@ void canny_edges(const uint8_t *const src_planes[3],
   if (!canny_grow((void **)&canny_blurred, &canny_blurred_cap, pixels) ||
       !canny_grow((void **)&canny_mag, &canny_mag_cap, pixels) ||
       !canny_grow((void **)&canny_dir, &canny_dir_cap, pixels) ||
-      !canny_grow((void **)&canny_nms, &canny_nms_cap, pixels) ||
+      !canny_grow((void **)&canny_row_seeds, &canny_row_seeds_cap,
+                  (size_t)height * sizeof *canny_row_seeds) ||
       !canny_grow((void **)&canny_stack, &canny_stack_cap,
                   pixels * sizeof *canny_stack))
     return; // leave dst untouched rather than crash, as the blur does
@@ -1180,22 +1182,33 @@ void canny_edges(const uint8_t *const src_planes[3],
     }
   }
 
-  // --- Stage 3: non-maximum suppression ---------------------------------
+  // --- Stage 3: non-maximum suppression, labelled ------------------------
   //
   // Keep a pixel only if it is a local maximum along the gradient
   // direction -- i.e. across the edge, not along it. This is what thins a
   // Sobel-style ridge several pixels wide down to a single pixel.
   //
-  // The interior is fully written below; the border must read as 0, since
-  // hysteresis relies on it never seeding or extending a contour.
-  clear_border(canny_nms, width, height);
+  // What is kept is written straight into the output as a label for stage
+  // 4: 255 at or above `high` (an edge outright: a seed), 1 at or above
+  // `low` (a candidate, an edge only if connected to one), 0 otherwise. A
+  // zero threshold labels nothing, as before: high == 0 seeds nothing and
+  // low == 0 extends nothing. Each row's seeds are collected as it is
+  // labelled, into that row's own region of the stack (a row has at most
+  // `width` of them), so finding them needs no serial pass over the frame.
+  //
+  // The border must read as 0: it then never seeds or extends a contour,
+  // which is what lets stage 4 skip bounds checks.
+  uint8_t *out_y = dst_planes[0];
+  const uint8_t strong_at = high, weak_at = low; // low <= high, swapped above
+  clear_border(out_y, width, height);
+  canny_row_seeds[0] = canny_row_seeds[height - 1] = 0;
 #pragma omp parallel for
   for (uint32_t y = 1; y < height - 1; ++y) {
     const uint8_t *above = canny_mag + (size_t)(y - 1) * width;
     const uint8_t *row = canny_mag + (size_t)y * width;
     const uint8_t *below = canny_mag + (size_t)(y + 1) * width;
     const uint8_t *dir = canny_dir + (size_t)y * width;
-    uint8_t *out = canny_nms + (size_t)y * width;
+    uint8_t *out = out_y + (size_t)y * width;
     uint32_t x = 1;
 #if defined(GS_NEON)
     // Branchless: all four candidate pairs come out of the same 3x3 window
@@ -1205,6 +1218,13 @@ void canny_edges(const uint8_t *const src_planes[3],
     const uint8x16_t dir_h = vdupq_n_u8(CANNY_DIR_HORIZONTAL);
     const uint8x16_t dir_nesw = vdupq_n_u8(CANNY_DIR_DIAG_NESW);
     const uint8x16_t dir_v = vdupq_n_u8(CANNY_DIR_VERTICAL);
+    // A zero threshold labels nothing: compare against 256 in effect, by
+    // masking the comparison off.
+    const uint8x16_t strong_v = vdupq_n_u8(strong_at);
+    const uint8x16_t weak_v = vdupq_n_u8(weak_at);
+    const uint8x16_t strong_on = vdupq_n_u8(strong_at ? 0xff : 0);
+    const uint8x16_t weak_on = vdupq_n_u8(weak_at ? 0xff : 0);
+    const uint8x16_t one = vdupq_n_u8(1);
     for (; x + 16 < width; x += 16) {
       const uint8x16_t m = vld1q_u8(&row[x]);
       const uint8x16_t al = vld1q_u8(&above[x - 1]), ac = vld1q_u8(&above[x]),
@@ -1222,7 +1242,11 @@ void canny_edges(const uint8_t *const src_planes[3],
       const uint8x16_t b =
           vbslq_u8(is_h, rr, vbslq_u8(is_nesw, bl, vbslq_u8(is_v, bc, br)));
       const uint8x16_t keep = vandq_u8(vcgeq_u8(m, a), vcgtq_u8(m, b));
-      vst1q_u8(&out[x], vandq_u8(m, keep));
+      const uint8x16_t kept = vandq_u8(m, keep);
+      const uint8x16_t strong =
+          vandq_u8(vcgeq_u8(kept, strong_v), strong_on);
+      const uint8x16_t weak = vandq_u8(vcgeq_u8(kept, weak_v), weak_on);
+      vst1q_u8(&out[x], vbslq_u8(strong, strong, vandq_u8(weak, one)));
     }
 #endif
     for (; x + 1 < width; ++x) {
@@ -1256,56 +1280,67 @@ void canny_edges(const uint8_t *const src_planes[3],
       // keeping the first of the pair. It still preserves a genuine
       // plateau along the ridge (where the comparison that matters is the
       // >= one), which is what a strict > on both sides would erase.
-      out[x] = (m >= a && m > b) ? m : 0;
+      const uint8_t kept = (m >= a && m > b) ? m : 0;
+      out[x] = (strong_at && kept >= strong_at) ? 255
+               : (weak_at && kept >= weak_at)   ? 1
+                                                : 0;
     }
+    // This row's seeds, into its own region of the stack.
+    uint32_t *seeds = canny_stack + (size_t)y * width;
+    uint32_t n = 0;
+    for (uint32_t sx = 1; sx + 1 < width; ++sx)
+      if (out[sx] == 255)
+        seeds[n++] = (uint32_t)((size_t)y * width + sx);
+    canny_row_seeds[y] = n;
   }
 
   // --- Stage 4: hysteresis ----------------------------------------------
   //
-  // Pixels at or above `high` are edges outright; those between `low` and
-  // `high` are edges only if connected to one. This is the stage that
-  // makes Canny's output cleaner than a plain threshold: it keeps the
-  // faint continuation of a real edge while dropping equally faint
-  // isolated noise.
+  // Seeds (255) are edges outright; candidates (1) are edges only if
+  // connected to one. This is the stage that makes Canny's output cleaner
+  // than a plain threshold: it keeps the faint continuation of a real edge
+  // while dropping equally faint isolated noise.
   //
   // Serial stack flood fill rather than a parallel bounded sweep. The
   // sweep caps the worst case (4.31ms vs 15.53ms on pure noise) but is
   // twice as slow on realistic content (0.93ms vs 0.46ms), and only
-  // approximates the connectivity this computes exactly. Since stage 1
-  // already brings the noise case down to ~0.5ms, the flood fill wins on
-  // the input this actually receives.
+  // approximates the connectivity this computes exactly. What used to be
+  // serial around it -- a memset of the output and a scan of the whole
+  // frame for seeds -- is now parallel (stage 3 and the clean-up below);
+  // the fill visits seeds in a different order, but the connected set it
+  // marks is the same, and so is every output byte.
   //
-  // Indexes out_y with the same i as canny_nms: stride == width was
-  // required above. And no pixel on the 1px border is ever pushed --
-  // canny_nms is 0 there and both thresholds must be non-zero to seed or
-  // extend -- so every popped pixel has a full 8-neighbourhood, with no
-  // bounds check or i / width needed to find it.
-  uint8_t *out_y = dst_planes[0];
-  memset(out_y, 0, pixels);
-
+  // The rows' seeds are compacted into one stack first. No pixel on the
+  // 1px border is ever pushed (it is labelled 0), so every popped pixel
+  // has a full 8-neighbourhood, with no bounds check or i / width needed.
   size_t sp = 0;
-  if (high > 0) {
-    for (size_t i = 0; i < pixels; ++i) {
-      if (canny_nms[i] >= high) {
-        out_y[i] = 255;
-        canny_stack[sp++] = (uint32_t)i;
-      }
-    }
+  for (uint32_t y = 1; y + 1 < height; ++y) {
+    uint32_t n = canny_row_seeds[y];
+    if (n && sp != (size_t)y * width)
+      memmove(canny_stack + sp, canny_stack + (size_t)y * width,
+              n * sizeof *canny_stack);
+    sp += n;
   }
 
   const ptrdiff_t w = (ptrdiff_t)width;
   const ptrdiff_t neighbours[8] = {-w - 1, -w, -w + 1, -1, 1, w - 1, w, w + 1};
-  if (low == 0)
-    sp = 0; // nothing between low and high can be promoted
   while (sp > 0) {
     const size_t i = canny_stack[--sp];
     for (int n = 0; n < 8; ++n) {
       const size_t j = (size_t)((ptrdiff_t)i + neighbours[n]);
-      if (out_y[j] == 0 && canny_nms[j] >= low) {
+      if (out_y[j] == 1) {
         out_y[j] = 255;
         canny_stack[sp++] = (uint32_t)j;
       }
     }
+  }
+
+  // Candidates no seed reached are not edges: 1 -> 0, 255 stays.
+#pragma omp parallel for
+  for (uint32_t y = 0; y < height; ++y) {
+    uint8_t *out = out_y + (size_t)y * width;
+    for (uint32_t x = 0; x < width; ++x)
+      out[x] = (uint8_t)(0u - (uint32_t)(out[x] >> 7));
   }
 
   // Luma-only edge map, so neutralize chroma -- same contract as

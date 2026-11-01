@@ -172,6 +172,17 @@ content** (0.93 ms vs 0.46 ms) and only approximates connectivity rather than co
 it. Since the mandatory blur already tames the noise case, the flood fill wins on the
 input Canny actually receives.
 
+What surrounds the fill no longer runs serially. Non-maximum suppression writes a
+label straight into the output (255 seed, 1 candidate, 0) and collects each row's
+seeds into that row's own region of the stack, in parallel; the fill then promotes
+neighbours labelled 1 (one test, where it was two), and a parallel pass turns the
+unreached 1s into 0s. That removed a serial memset of the output, a serial scan of the
+whole frame for seeds, and the separate suppression plane. Output is byte-identical
+(504 combinations of photo, strength and thresholds, at 1, 3 and 4 threads, on x86 and
+under qemu for both ARM NEON builds). On 4 x86 threads, 720p photos: 4.19→3.82,
+3.80→3.64 and 4.20→3.41 ms; on one thread it is ~5% slower, since the labelling and
+the clean-up add work that only pays across cores — and `eeye` always uses them all.
+
 Direction is quantized to four sectors using **integer comparisons only** — `|gy|*10`
 against `|gx|*4` and `|gx|*24`, the integer form of tan(22.5°) and tan(67.5°). No
 `atan2`, no float, not even a divide.
