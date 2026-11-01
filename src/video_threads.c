@@ -5,6 +5,8 @@
 #include "health.h"
 #include "recorder.h"
 #include "stream_server.h"
+#include "bus_in.h"
+#include "fbus.h"
 #include "rpicam_in.h"
 #include "v4l2_in.h"
 #include "virtual_cam.h"
@@ -33,17 +35,35 @@
 // slow enough that it stays a rounding error against per-frame work.
 #define HEALTH_PUBLISH_INTERVAL_MS 1000
 
-// The two capture backends have identical lifecycles from producer_loop's
+// The capture backends have identical lifecycles from producer_loop's
 // point of view -- open, capture repeatedly, close -- so they're unified
 // here rather than duplicating the whole reconnect loop below per backend.
-// Exactly one of the two handles is non-NULL at a time.
+// Exactly one of the handles is non-NULL at a time.
 typedef struct {
   V4l2In *v4l2;
   RpicamIn *rpicam;
+  BusIn *bus;
 } CaptureHandle;
 
-static bool capture_open(const ProducerArgs *args, CaptureHandle *h) {
+// `log_failure` asks the backend to explain a failed open; the caller
+// throttles it so a long outage doesn't flood the log. Only the bus
+// backend uses it -- the camera backends always explain.
+static bool capture_open(ProducerArgs *args, CaptureHandle *h,
+                         bool log_failure) {
   *h = (CaptureHandle){0};
+  if (args->capture_source == CAPTURE_BUS) {
+    bool wrong_size = false;
+    h->bus = bus_in_open(args->capture_stream, args->frame_width,
+                         args->frame_height, log_failure, &wrong_size);
+    if (wrong_size) {
+      // The pool can't follow a new size; a fresh start can. Under
+      // systemd that is automatic (Restart=always).
+      printf("Stopping so eeye can restart at the stream's new size.\n");
+      __atomic_store_n(args->restart_needed, true, __ATOMIC_SEQ_CST);
+      __atomic_store_n(args->is_running, false, __ATOMIC_SEQ_CST);
+    }
+    return h->bus != NULL;
+  }
   if (args->capture_source == CAPTURE_RPICAM) {
     const Config *cfg = config_current(args->config);
     h->rpicam = rpicam_in_open(args->capture_width, args->capture_height,
@@ -62,7 +82,8 @@ static bool capture_open(const ProducerArgs *args, CaptureHandle *h) {
 // V4L2 takes them as ioctls on the live device, so they apply instantly.
 // rpicam-vid takes them as spawn-time CLI flags, so a change there needs
 // the child restarted -- handled by the caller, since it is a visible
-// ~1s gap in the video rather than something to do silently.
+// ~1s gap in the video rather than something to do silently. A bus
+// stream has no camera to apply them to.
 static void capture_apply_controls(CaptureHandle *h, const CameraControls *c) {
   if (h->v4l2 && camera_ctrl_any_set(c))
     camera_ctrl_apply(v4l2_in_fd(h->v4l2), c);
@@ -70,18 +91,24 @@ static void capture_apply_controls(CaptureHandle *h, const CameraControls *c) {
 
 // Whether this backend can take a control change without being restarted.
 // V4L2 can (they are ioctls on the live device); rpicam cannot, since it
-// takes them as command-line arguments to a child process.
+// takes them as command-line arguments to a child process. A bus stream
+// ignores them, so there is nothing to restart either.
 static bool capture_controls_are_live(const CaptureHandle *h) {
-  return h->v4l2 != NULL;
+  return h->v4l2 != NULL || h->bus != NULL;
 }
 
-static bool capture_frame(CaptureHandle *h, VideoFrame *frame) {
+static bool capture_frame(ProducerArgs *args, CaptureHandle *h,
+                          VideoFrame *frame) {
+  if (h->bus)
+    return bus_in_capture(h->bus, frame, args->is_running);
   return h->rpicam ? rpicam_in_capture(h->rpicam, frame)
                    : v4l2_in_capture(h->v4l2, frame);
 }
 
 static void capture_close(CaptureHandle *h) {
-  if (h->rpicam)
+  if (h->bus)
+    bus_in_close(h->bus);
+  else if (h->rpicam)
     rpicam_in_close(h->rpicam);
   else
     v4l2_in_close(h->v4l2);
@@ -118,10 +145,14 @@ void *producer_loop(void *arg) {
   // stops the other.
   while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
     CaptureHandle in;
-    if (!capture_open(args, &in)) {
+    // Same throttle as the "unavailable" line below: the first failure,
+    // then every CAMERA_RECONNECT_LOG_EVERY-th.
+    bool log_this_attempt =
+        reconnect_attempt == 0 ||
+        (reconnect_attempt + 1) % CAMERA_RECONNECT_LOG_EVERY == 0;
+    if (!capture_open(args, &in, log_this_attempt)) {
       reconnect_attempt++;
-      if (reconnect_attempt == 1 ||
-          reconnect_attempt % CAMERA_RECONNECT_LOG_EVERY == 0) {
+      if (log_this_attempt && args->capture_source != CAPTURE_BUS) {
         printf("Camera unavailable (attempt %d); retrying every %ds...\n",
                reconnect_attempt, CAMERA_RECONNECT_DELAY_MS / 1000);
       }
@@ -149,7 +180,9 @@ void *producer_loop(void *arg) {
       have_last_controls = true;
     }
 
-    if (args->capture_source == CAPTURE_RPICAM)
+    if (args->capture_source == CAPTURE_BUS)
+      printf("Camera connected: bus stream \"%s\"\n", args->capture_stream);
+    else if (args->capture_source == CAPTURE_RPICAM)
       printf("Camera connected: Pi camera module (via rpicam-vid)\n");
     else
       printf("Camera connected: %s\n", args->filename);
@@ -188,7 +221,7 @@ void *producer_loop(void *arg) {
       frame->pts = pts++;
       frame->capture_ns = 0; // a backend that knows better sets it
 
-      if (!capture_frame(&in, frame)) {
+      if (!capture_frame(args, &in, frame)) {
         // v4l2_in_capture already retried transient per-frame decode
         // glitches internally; this is either a device-level error or a
         // persistent format mismatch. Fall back to the reconnect loop
@@ -277,6 +310,26 @@ void *consumer_loop(void *arg) {
   VirtualCam *vcam = virtual_cam_create(args->outpath, args->frame_width,
                                         args->frame_height);
 
+  // The frame bus: the pilot's picture and the untouched camera frame, for
+  // hellion, autonomy, and anything else on this machine (see fbus.h).
+  // Publishing copies into shared memory and never waits for a reader, so
+  // it is the one new piece of work on this thread. A stream that cannot
+  // be created only costs that stream.
+  FbusWriter *bus_pilot =
+      args->bus_pilot && args->bus_pilot[0]
+          ? fbus_writer_open(args->bus_pilot, args->frame_width,
+                             args->frame_height)
+          : NULL;
+  FbusWriter *bus_raw =
+      args->bus_raw && args->bus_raw[0]
+          ? fbus_writer_open(args->bus_raw, args->frame_width,
+                             args->frame_height)
+          : NULL;
+  if (args->bus_pilot && args->bus_pilot[0] && !bus_pilot)
+    printf("Warning: not publishing \"%s\" (see above).\n", args->bus_pilot);
+  if (args->bus_raw && args->bus_raw[0] && !bus_raw)
+    printf("Warning: not publishing \"%s\" (see above).\n", args->bus_raw);
+
   // Live-preview stream tap (see stream_server.h): unlike the virtual-cam
   // write above, this is genuinely optional -- a topside viewer over the
   // tether is a convenience, not something the local pipeline depends on.
@@ -324,6 +377,13 @@ void *consumer_loop(void *arg) {
     // The pilot's feed first, before any optional tap gets a look at the
     // frame. A failure is handled (and logged) inside virtual_cam.c.
     virtual_cam_write(vcam, frame);
+
+    // raw_planes is never written by the effect chain (see
+    // video_frame.h), so it is the camera's frame as captured.
+    fbus_writer_publish(bus_pilot, (const uint8_t *const *)frame->planes,
+                        frame->pts, frame->capture_ns);
+    fbus_writer_publish(bus_raw, (const uint8_t *const *)frame->raw_planes,
+                        frame->pts, frame->capture_ns);
 
     // Independent config read from effects_loop's -- this frame's chain
     // was already decided by the time it got here, but the recording
@@ -402,6 +462,8 @@ void *consumer_loop(void *arg) {
   recorder_destroy(recorder);
   stream_server_close(stream);
   virtual_cam_destroy(vcam);
+  fbus_writer_close(bus_pilot);
+  fbus_writer_close(bus_raw);
   return NULL;
 }
 

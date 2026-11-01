@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "config.h"
+#include "fbus.h"
 #include "json_cursor.h"
 #include <errno.h>
 #include <linux/limits.h>
@@ -55,6 +56,9 @@ static const Config config_defaults = {
     .capture_format = FORMAT_AUTO,
     .capture_device = "/dev/video0",
     .output_device = "/dev/video10",
+    .capture_stream = "camera",
+    .bus_pilot = "pilot",
+    .bus_raw = "raw",
     // Every camera control unset -- "leave the camera alone". Spelled out
     // here rather than fixed up at each use of config_defaults, since a
     // zero-initialized CameraControls would mean "force every control to
@@ -642,10 +646,27 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           parsed.capture_source = CAPTURE_V4L2;
         } else if (strcmp(src, "rpicam") == 0) {
           parsed.capture_source = CAPTURE_RPICAM;
+        } else if (strcmp(src, "bus") == 0) {
+          parsed.capture_source = CAPTURE_BUS;
         } else {
           printf("Config: unknown \"capture_source\": \"%s\" (expected "
-                 "\"auto\", \"v4l2\", or \"rpicam\")\n",
+                 "\"auto\", \"v4l2\", \"rpicam\", or \"bus\")\n",
                  src);
+          return false;
+        }
+      } else if (strcmp(key, "capture_stream") == 0 ||
+                 strcmp(key, "bus_pilot") == 0 ||
+                 strcmp(key, "bus_raw") == 0) {
+        char *dst = strcmp(key, "capture_stream") == 0 ? parsed.capture_stream
+                    : strcmp(key, "bus_pilot") == 0    ? parsed.bus_pilot
+                                                       : parsed.bus_raw;
+        bool may_be_empty = strcmp(key, "capture_stream") != 0;
+        if (!parse_string(&c, dst, max_stream_name_len) ||
+            (dst[0] == '\0' ? !may_be_empty : !fbus_valid_name(dst))) {
+          printf("Config: invalid value for \"%s\" (expected a stream name: "
+                 "letters, digits, '-' and '_', under %d characters%s)\n",
+                 key, max_stream_name_len,
+                 may_be_empty ? "; or \"\" for none" : "");
           return false;
         }
       } else if (strcmp(key, "downscale") == 0) {
@@ -735,6 +756,28 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
     printf("Config: \"capture_format\": \"yuv420\" needs \"capture_source\": "
            "\"rpicam\" -- it is the Pi camera's raw output, not a V4L2 "
            "format\n");
+    return false;
+  }
+
+  // A bus stream arrives at its publisher's size, already decoded; there
+  // is no decode to fold a downscale into. Its publisher scales instead.
+  if (parsed.capture_source == CAPTURE_BUS && parsed.downscale != 1) {
+    printf("Config: \"downscale\" must be 1 with \"capture_source\": \"bus\" "
+           "-- a bus stream's size is set by the program publishing it\n");
+    return false;
+  }
+  if (parsed.bus_pilot[0] && strcmp(parsed.bus_pilot, parsed.bus_raw) == 0) {
+    printf("Config: \"bus_pilot\" and \"bus_raw\" are both \"%s\"; they must "
+           "differ\n",
+           parsed.bus_pilot);
+    return false;
+  }
+  if (parsed.capture_source == CAPTURE_BUS &&
+      (strcmp(parsed.capture_stream, parsed.bus_pilot) == 0 ||
+       strcmp(parsed.capture_stream, parsed.bus_raw) == 0)) {
+    printf("Config: \"capture_stream\" \"%s\" is also one eeye publishes; "
+           "eeye would be reading its own output\n",
+           parsed.capture_stream);
     return false;
   }
 
@@ -841,7 +884,7 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
   // actually changed instead of printing sizes that didn't.
   if (startup_geometry_valid &&
       parsed->capture_source != startup_geometry.capture_source) {
-    static const char *const names[] = {"auto", "v4l2", "rpicam"};
+    static const char *const names[] = {"auto", "v4l2", "rpicam", "bus"};
     printf("Config: \"capture_source\" changed (%s -> %s) but it only takes "
            "effect at startup -- still capturing from the original source. "
            "Restart eeye to apply it.\n",
@@ -860,6 +903,15 @@ static void config_publish(ConfigWatcher *w, const Config *parsed) {
                                              : "(none)",
            parsed->capture_device,
            parsed->output_device[0] ? parsed->output_device : "(none)");
+  }
+
+  if (startup_geometry_valid &&
+      (strcmp(parsed->capture_stream, startup_geometry.capture_stream) != 0 ||
+       strcmp(parsed->bus_pilot, startup_geometry.bus_pilot) != 0 ||
+       strcmp(parsed->bus_raw, startup_geometry.bus_raw) != 0)) {
+    printf("Config: \"capture_stream\"/\"bus_pilot\"/\"bus_raw\" changed but "
+           "they only take effect at startup -- still using the original "
+           "streams. Restart eeye to apply it.\n");
   }
 
   size_t slot = w->ring_pos % config_ring_size;

@@ -591,7 +591,9 @@ straight to [docs/extending.md](docs/extending.md) if you are here to change one
 
 `src/` is a flat set of translation units: capture (`v4l2_in`, `rpicam_in`, shared
 MJPEG decode in `jpeg_decode`), output (`v4l2_out`), preview tap (`stream_server`),
-optional webcam output with retry (`virtual_cam`), child processes (`child_proc`), ring buffer, frame pool, effects (`conv.c` for
+optional webcam output with retry (`virtual_cam`), the frame bus between programs
+(`fbus`, read back by the `bus_in` capture backend; see [docs/bus.md](docs/bus.md)),
+child processes (`child_proc`), ring buffer, frame pool, effects (`conv.c` for
 sobel/blur, `point_opps.c` for contrast), the chain runner (`effect_chain.c` —
 where grayscale/invert/threshold/tint/light live, fused into LUTs), and config
 hot-reload (`config.c`), wired together in `video_threads.c` / `eeye.c`.

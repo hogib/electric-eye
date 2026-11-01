@@ -11,7 +11,7 @@ This is the distinction to internalize before changing anything:
 
 **Startup-only** — read once by `config_load_once()` before any thread exists.
 `capture_width`, `capture_height`, `downscale`, `capture_source`, `capture_format`,
-`capture_device`, `output_device`.
+`capture_device`, `output_device`, `capture_stream`, `bus_pilot`, `bus_raw`.
 
 Changing a startup-only key in a running config is **detected, logged, and ignored**:
 
@@ -52,6 +52,9 @@ has to understand them anyway or every reload of a geometry-carrying file would 
   "capture_format": "auto",
   "capture_device": "/dev/video0",
   "output_device": "/dev/video10",
+  "capture_stream": "camera",
+  "bus_pilot": "pilot",
+  "bus_raw": "raw",
   "camera": {}
 }
 ```
@@ -110,7 +113,7 @@ making the valid geometries depend on which camera is attached.
 
 ### Capture source and format
 
-`capture_source` is `"auto"`, `"v4l2"` or `"rpicam"`. `capture_format` is `"auto"`,
+`capture_source` is `"auto"`, `"v4l2"`, `"rpicam"` or `"bus"`. `capture_format` is `"auto"`,
 `"mjpeg"` or `"yuyv"` for a V4L2 camera (see [capture.md](capture.md#format-selection)),
 or `"yuv420"` for the Pi camera only: raw ISP output with no JPEG encode or decode,
 opt-in until verified on hardware (see [capture.md](capture.md)). `"yuv420"` with
@@ -127,6 +130,24 @@ empty. The rpicam backend ignores it.
 `/dev/video10`); `""` turns that output off. It is optional at runtime: missing or
 failing, it is logged and retried while the pipeline carries on (see
 [output.md](output.md#optional-and-retried)).
+
+### Frame bus
+
+`bus_pilot` (default `"pilot"`) and `bus_raw` (default `"raw"`) name the streams `eeye`
+publishes the processed and the untouched frame under; `""` turns either off. See
+[bus.md](bus.md).
+
+`"capture_source": "bus"` reads frames from the stream named by `capture_stream`
+(default `"camera"`) instead of a camera — what `eeye` does topside, reading the ROV's
+camera as `hellion` decodes it. The stream sets the geometry: `capture_width` and
+`capture_height` are ignored, `downscale` must be 1, and `eeye` waits at startup for
+the stream to appear. If the stream comes back at a different size, `eeye` exits with
+status 1 so systemd restarts it at the new one. Camera controls do nothing here; set
+them where the camera is.
+
+Refused at parse time: invalid names (letters, digits, `-`, `_`, under 32
+characters), `bus_pilot` equal to `bus_raw`, and reading a stream `eeye` itself
+publishes.
 
 ### Streaming and recording
 

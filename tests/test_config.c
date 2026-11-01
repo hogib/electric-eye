@@ -427,6 +427,42 @@ static void test_device_paths(void) {
   CHECK(!parse(json, &c));
 }
 
+static void test_bus_keys(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK(strcmp(c.capture_stream, "camera") == 0);
+  CHECK(strcmp(c.bus_pilot, "pilot") == 0);
+  CHECK(strcmp(c.bus_raw, "raw") == 0);
+
+  CHECK(parse("{\"capture_source\":\"bus\",\"capture_stream\":\"rov-cam\","
+              "\"bus_pilot\":\"pilot2\",\"bus_raw\":\"\"}",
+              &c));
+  CHECK_EQ_INT(c.capture_source, CAPTURE_BUS);
+  CHECK(strcmp(c.capture_stream, "rov-cam") == 0);
+  CHECK(strcmp(c.bus_pilot, "pilot2") == 0);
+  CHECK_EQ_INT(c.bus_raw[0], '\0'); // "" publishes nothing
+
+  // Names are file names in a shared directory: nothing that could
+  // escape it, and something to read from.
+  CHECK(!parse("{\"bus_pilot\":\"../x\"}", &c));
+  CHECK(!parse("{\"bus_raw\":\"a b\"}", &c));
+  CHECK(!parse("{\"capture_stream\":\"\"}", &c));
+  CHECK(!parse("{\"capture_stream\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+               &c));
+
+  // A bus stream is already at its publisher's size.
+  CHECK(!parse("{\"capture_source\":\"bus\",\"downscale\":2}", &c));
+  CHECK(parse("{\"capture_source\":\"v4l2\",\"downscale\":2}", &c));
+
+  // Publishing two streams under one name, or reading its own output.
+  CHECK(!parse("{\"bus_pilot\":\"same\",\"bus_raw\":\"same\"}", &c));
+  CHECK(parse("{\"bus_pilot\":\"\",\"bus_raw\":\"\"}", &c)); // both off is fine
+  CHECK(!parse("{\"capture_source\":\"bus\",\"capture_stream\":\"pilot\"}",
+               &c));
+  CHECK(parse("{\"capture_source\":\"v4l2\",\"capture_stream\":\"pilot\"}",
+              &c)); // only matters when actually reading the bus
+}
+
 static void test_record_path_round_trips(void) {
   Config c;
   CHECK(parse("{\"record_path\":\"/tmp/out.raw\"}", &c));
@@ -547,6 +583,7 @@ int main(void) {
   RUN_TEST(test_geometry_divisibility_rule);
   RUN_TEST(test_capture_source_values);
   RUN_TEST(test_device_paths);
+  RUN_TEST(test_bus_keys);
   RUN_TEST(test_capture_format_values);
   RUN_TEST(test_record_path_round_trips);
   RUN_TEST(test_oversized_inputs_rejected);

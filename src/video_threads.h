@@ -39,6 +39,12 @@ typedef struct {
   uint32_t capture_width;
   uint32_t capture_height;
   uint32_t downscale;
+  // CAPTURE_BUS: the stream to read (see bus_in.h).
+  const char *capture_stream;
+  // Set (with is_running cleared) when the run must end for a restart to
+  // fix it -- a bus stream that came back at a different size. main()
+  // exits non-zero then.
+  bool *restart_needed; // atomic (see compat.h)
 } ProducerArgs;
 
 // How long apply_effect_chain() takes per frame, accumulated by
@@ -75,6 +81,10 @@ typedef struct {
   uint32_t frame_width;
   uint32_t frame_height;
   uint16_t stream_port; // see stream_server.h; the live-preview tap's port
+  // Frame bus streams (fbus.h) for the processed and the untouched frame;
+  // "" publishes nothing.
+  const char *bus_pilot;
+  const char *bus_raw;
 } ConsumerArgs;
 
 // All three rings, read-only from here -- stats_loop only ever calls

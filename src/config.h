@@ -24,6 +24,10 @@ typedef enum {
   CAPTURE_AUTO = 0, // probe for a CSI camera, else V4L2
   CAPTURE_V4L2,     // a USB/UVC webcam, via v4l2_in.c
   CAPTURE_RPICAM,   // a Pi CSI camera module, via rpicam_in.c
+  // A frame bus stream (see fbus.h) -- frames another program publishes,
+  // e.g. hellion decoding the ROV's camera topside. Never chosen by
+  // "auto".
+  CAPTURE_BUS,
 } CaptureSource;
 
 // Which pixel format to ask a V4L2 camera for. Only meaningful on the
@@ -131,6 +135,9 @@ enum { max_record_path_len = 256 };
 // capture_device / output_device. /dev/video<N> and /dev/v4l/by-id/...
 // names both fit comfortably.
 enum { max_device_path_len = 128 };
+
+// capture_stream / bus_pilot / bus_raw; matches fbus_max_stream_name.
+enum { max_stream_name_len = 32 };
 
 typedef struct {
   EffectStage stages[max_chain_stages];
@@ -241,6 +248,15 @@ typedef struct {
   // eeye logs it and keeps retrying while everything else carries on.
   // Startup-only, like the rest of this group.
   char output_device[max_device_path_len];
+
+  // Frame bus (fbus.h). capture_stream is the stream read when
+  // capture_source is "bus"; its geometry is the pipeline's, so
+  // capture_width/height are ignored and downscale must be 1. bus_pilot
+  // and bus_raw are the names eeye publishes the processed and the
+  // untouched frame under; "" publishes nothing. All startup-only.
+  char capture_stream[max_stream_name_len];
+  char bus_pilot[max_stream_name_len];
+  char bus_raw[max_stream_name_len];
 } Config;
 
 /*
@@ -267,7 +283,10 @@ typedef struct {
  *     "capture_source": "auto",
  *     "capture_format": "auto",
  *     "capture_device": "/dev/video0",
- *     "output_device": "/dev/video10"
+ *     "output_device": "/dev/video10",
+ *     "capture_stream": "camera",
+ *     "bus_pilot": "pilot",
+ *     "bus_raw": "raw"
  *   }
  *
  * "chain" is a list of stages, applied in order; each is one of
@@ -313,6 +332,10 @@ typedef struct {
  * "capture_device" (default "/dev/video0") is the V4L2 camera and
  * "output_device" (default "/dev/video10"; "" for none) the v4l2loopback
  * device the pilot's picture is written to. Both are startup-only.
+ * "capture_source": "bus" reads frames from frame bus stream
+ * "capture_stream" (default "camera") instead of a camera. "bus_pilot"
+ * (default "pilot") and "bus_raw" (default "raw") name the streams eeye
+ * publishes; "" turns either off. All startup-only.
  *
  * Writer contract: write to a temp file in the same directory, then
  * rename() it onto the target path. A plain in-place overwrite can be

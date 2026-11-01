@@ -28,6 +28,7 @@ Two things shape almost every design decision in the codebase:
 | [capture.md](capture.md) | Both capture backends, pixel formats, resolution negotiation, camera controls |
 | [effects.md](effects.md) | The effect chain, every operator, LUT fusion, the buffer ping-pong |
 | [output.md](output.md) | Virtual camera, preview stream, recording, health reporting |
+| [bus.md](bus.md) | The frame bus: streams between programs, its byte layout, reading it from C or Python |
 | [config.md](config.md) | Every config key, the hot-reload contract, the parser |
 | [topside.md](topside.md) | Web UI, config agent, network tooling, tether addressing |
 | [testing.md](testing.md) | Test suites, and the bit-exactness harness for SIMD work |
@@ -85,6 +86,8 @@ namespacing C gives you.
 | `v4l2_out.c` | Writes frames to the loopback device |
 | `virtual_cam.c` | The optional webcam output: opens lazily, retries, explains a missing module |
 | `child_proc.c` | Runs helper programs (rpicam-vid, mokutil, ffmpeg) safely |
+| `fbus.c` | The frame bus: shared-memory streams between programs |
+| `bus_in.c` | Capture backend that reads a frame bus stream |
 | `stream_server.c` | JPEG preview tap over TCP, on its own thread |
 | `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |

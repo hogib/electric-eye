@@ -5,6 +5,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "compat.h"
+#include "bus_in.h"
 #include "config.h"
 #include "frame_ring_buffer.h"
 #include "rpicam_in.h"
@@ -36,6 +37,14 @@ extern char **environ;
 // config: the arg structs below keep pointers to them for the whole run.
 static char capture_device[max_device_path_len];
 static char output_device[max_device_path_len];
+// Likewise the frame bus stream names.
+static char capture_stream[max_stream_name_len];
+static char bus_pilot[max_stream_name_len];
+static char bus_raw[max_stream_name_len];
+
+// Set by producer_loop when the run has to end for a restart to fix it
+// (see ProducerArgs.restart_needed); main() then exits non-zero.
+static bool restart_needed = false; // atomic (see compat.h)
 
 // Live-preview stream tap (see stream_server.h). Off by default (Config's
 // stream_frame_interval starts at 0); this is only the port it listens on
@@ -91,6 +100,7 @@ static void handle_shutdown_signal(int sig) {
  *   v4l2-ctl --list-devices
  */
 ProducerArgs prod_args = {.is_running = &is_running,
+                          .restart_needed = &restart_needed,
                           .ring_buffer_in = &ring_buffer_in,
                           .ring_buffer_free = &ring_buffer_free};
 
@@ -233,6 +243,13 @@ int main(int argc, char **argv) {
            startup_config.output_device);
   prod_args.filename = capture_device;
   cons_args.outpath = output_device;
+  snprintf(capture_stream, sizeof capture_stream, "%s",
+           startup_config.capture_stream);
+  snprintf(bus_pilot, sizeof bus_pilot, "%s", startup_config.bus_pilot);
+  snprintf(bus_raw, sizeof bus_raw, "%s", startup_config.bus_raw);
+  prod_args.capture_stream = capture_stream;
+  cons_args.bus_pilot = bus_pilot;
+  cons_args.bus_raw = bus_raw;
 
   // Settle CAPTURE_AUTO here, once, rather than in producer_loop: the
   // reconnect loop there runs repeatedly, and re-probing on every retry
@@ -274,6 +291,22 @@ int main(int argc, char **argv) {
     v4l2_in_negotiate_size(prod_args.filename, &capture_width, &capture_height,
                            startup_config.downscale,
                            startup_config.capture_format);
+  }
+
+  // A bus stream's size is whatever its publisher chose, so wait for it to
+  // exist and take that (downscale is 1 here; config.c enforces it). The
+  // camera backends' answer to "not there yet" is the reconnect loop, but
+  // that runs after the pool is sized -- and the pool must match.
+  if (capture_source == CAPTURE_BUS) {
+    if (!bus_in_wait(capture_stream, &is_running, &capture_width,
+                     &capture_height))
+      return 0; // asked to stop while waiting
+    if (capture_width % 2 != 0 || capture_height % 2 != 0) {
+      printf("Error: bus stream \"%s\" is %ux%u; eeye needs an even width "
+             "and height (4:2:2 chroma is half width).\n",
+             capture_stream, capture_width, capture_height);
+      return 1;
+    }
   }
 
   uint32_t out_width = capture_width / startup_config.downscale;
@@ -399,5 +432,7 @@ int main(int argc, char **argv) {
   ring_destroy(&ring_buffer_in);
   ring_destroy(&ring_buffer_out);
   ring_destroy(&ring_buffer_free);
-  return 0;
+  // Non-zero when the run ended because only a restart can fix it (see
+  // ProducerArgs.restart_needed), so a supervisor sees a failure.
+  return __atomic_load_n(&restart_needed, __ATOMIC_SEQ_CST) ? 1 : 0;
 }

@@ -4,8 +4,9 @@ Threads, frames, and how a frame gets from the sensor to the loopback device.
 
 ## Threads
 
-Seven. Four are created in `main()`; the config watcher, recorder and stream threads
-are started by the modules that own them.
+Seven, plus one heartbeat per frame bus stream. Four are created in `main()`; the
+config watcher, recorder, stream and heartbeat threads are started by the modules that
+own them.
 
 | Thread | Entry point | Job |
 |---|---|---|
@@ -16,6 +17,7 @@ are started by the modules that own them.
 | stream | `stream_loop` in `stream_server.c` | JPEG-encodes and sends the preview to the connected viewer. |
 | stats | `stats_loop` | Logs ring occupancy and effects time every 5s. Purely diagnostic. |
 | config watcher | inside `config.c` | Watches the config file with inotify, republishes on change. |
+| bus heartbeat | `heartbeat_loop` in `fbus.c` | One per published stream. Stamps the stream every 500ms so readers can tell a running writer from a dead one. |
 
 The stats, recorder and stream threads are optional: if one fails to start, that
 feature is disabled with a log line and the pipeline carries on. The producer, effects
@@ -23,7 +25,9 @@ and consumer threads are fatal to start.
 
 **Nothing slow runs on the consumer thread.** It feeds the virtual camera, which is
 what the pilot is looking at, so the two taps only take a copy (preview) or ownership
-(recording) of the frame and return. A full disk or a bad tether can cost recorded or
+(recording) of the frame and return. Publishing to the frame bus is a copy into shared
+memory that never waits for a reader: about 25µs per 640×480 frame on an x86 dev
+machine (from the `fbus` stress test). Not yet measured on a Pi. A full disk or a bad tether can cost recorded or
 previewed frames, never the live feed. See [output.md](output.md).
 
 Only the producer thread ever touches the camera device, and only the consumer thread
@@ -56,9 +60,10 @@ A frame's round trip:
 1. Producer pops an empty frame from **free**.
 2. Producer captures into it (writing `raw_planes`), stamps `pts`, pushes to **in**.
 3. Effects pops from **in**, runs the chain (writing `planes`), pushes to **out**.
-4. Consumer pops from **out**, writes to the loopback device, offers the preview a
-   copy, then either hands the frame to the recorder (which pushes it back to **free**
-   once written) or pushes it back to **free** itself.
+4. Consumer pops from **out**, writes to the loopback device, publishes the frame to the
+   frame bus (`pilot` from `planes`, `raw` from `raw_planes`; see [bus.md](bus.md)),
+   offers the preview a copy, then either hands the frame to the recorder (which
+   pushes it back to **free** once written) or pushes it back to **free** itself.
 
 The pool is allocated once, up front, and never grows: `frame_pool_size` frames, 8.
 That is deliberately far below the rings' 31-slot capacity. Every pooled frame can end
