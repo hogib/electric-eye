@@ -171,6 +171,13 @@ HsReadResult hs_read(const char *name, HsStatus *out) {
     }
     for (uint32_t i = 0; i < hlog_lines; i++)
       out->log[i][hlog_line_len - 1] = '\0';
+    out->recording[hs_detail_len - 1] = '\0';
+    out->peer_addr[sizeof out->peer_addr - 1] = '\0';
+    out->peer_error[hs_detail_len - 1] = '\0';
+    if (out->peer_line_count > hs_peer_lines)
+      out->peer_line_count = hs_peer_lines;
+    for (uint32_t i = 0; i < hs_peer_lines; i++)
+      out->peer_lines[i][hs_detail_len - 1] = '\0';
   }
   return res;
 }

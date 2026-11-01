@@ -1,227 +1,253 @@
 # Electric Eye
 
-Realtime camera effects pipeline for Linux, built for a submersible drone (ROV).
-Captures from a camera, runs frames through a chain of effects, and publishes the
-result as a [v4l2loopback](https://github.com/umlaeute/v4l2loopback) virtual camera
-any app can open — plus an optional tethered web UI for live preview and remote
-control.
+Realtime camera effects for a submersible drone (ROV), built for a BlueROV and any
+GNU/Linux machine. Two programs:
 
-Runs on a Raspberry Pi with either a USB webcam or a Pi camera module. Nothing in
-`src/` is Pi-specific beyond `install.sh`'s package manager.
+- **`eeye`** — the vision layer. Takes frames from a camera (or from the tether),
+  runs them through a chain of effects, and publishes the pilot's picture and the
+  untouched camera frame on the **frame bus** for anything else on the machine —
+  `hellion`, autonomy code, OBS through a v4l2loopback webcam. No networking.
+- **`hellion`** — everything that touches the tether. Sends the video up from the ROV
+  as H.264 over RTP, receives it topside, feeds QGroundControl, records MP4, serves the
+  browser control page, and carries `eeye`'s config across. `hellion top` is a live
+  dashboard for an SSH session; `hellion check` is a pre-dive check.
 
-Being split into two programs: `eeye`, the effects pipeline, and `hellion`, which
-moves video over the tether and has `hellion top`, a live dashboard for SSH sessions,
-and `hellion check` ([docs/hellion.md](docs/hellion.md)). They share frames through
-the frame bus ([docs/bus.md](docs/bus.md)). The Python tools described below are
-being replaced along the way.
+Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (for
+`hellion`'s video) `ffmpeg`.
 
-- [Quick start](#quick-start) · [Field checklist](#field-checklist) ·
-  [Troubleshooting](#troubleshooting) · [Config reference](#config-reference)
+- [Quick start](#quick-start) · [Where eeye runs](#where-eeye-runs) ·
+  [In the field](#in-the-field) · [Troubleshooting](#troubleshooting) ·
+  [Config reference](#config-reference)
+
+> The old Python tools (`topside/web_ui.py`, `pi/config_agent.py`, `tools/eeye-net`,
+> `tools/eeye-record`) are replaced by `hellion` and will be removed. `install.sh`
+> does not set `hellion` up yet; until it does, start it by hand as below.
 
 ## Quick start
+
+On the ROV's Pi **and** on the topside machine:
 
 ```sh
 git clone <this repo>
 cd electric-eye
-sudo ./install.sh          # deps, build, v4l2loopback on boot, systemd service
+sudo apt install ffmpeg      # hellion's H.264 and RTP
+sudo ./install.sh            # deps, build, v4l2loopback on boot, eeye's systemd unit
 ```
 
-Idempotent — re-run it after `git pull` as the update path. If you weren't already
-in the `video` group, log out and back in before running `eeye` by hand.
+`install.sh` is idempotent — re-run it after `git pull` to update. It also configures
+the wired interface so a direct tether works with no DHCP server (`--no-network` skips
+that; it never restarts an interface you may be connected through). If you weren't in
+the `video` group before, log out and back in.
 
-It also configures the wired interface so the tether works with no DHCP server (see
-[Field checklist](#field-checklist), and [docs/topside.md](docs/topside.md) for why it
-is needed). `--no-network` skips that. It will not restart an interface that is already
-connected, so it is safe to run over SSH.
+Then set up `hellion` for the machine's role, from the examples (see
+[Where eeye runs](#where-eeye-runs) for which):
 
 ```sh
-ffplay /dev/video10        # watch the output
-journalctl -u eeye -f      # watch the logs
+sudo mkdir -p /etc/hellion /var/lib/hellion && sudo chown $USER /var/lib/hellion
+sudo cp hellion/examples/b-rov.json /etc/hellion/hellion.json        # on the ROV
+sudo cp hellion/examples/b-topside.json /etc/hellion/hellion.json    # topside
+builddir/hellion                                                      # on both
 ```
 
-Edit `eeye_config.json` while it runs; changes apply in ~200ms with no restart.
+Then open **`http://<topside>:8080/`** for the live picture and the controls, and point
+QGroundControl at UDP 5600 as usual.
+
+```sh
+builddir/hellion top              # live dashboard (q quits); works over SSH
+builddir/hellion check            # pre-dive: exit 0 healthy, 1 degraded, 2 down
+journalctl -u eeye -f             # eeye's log
+ffplay /dev/video10               # the pilot's picture as a webcam, on eeye's machine
+```
 
 ### Manual build
 
 ```sh
-make
-./builddir/eeye [config_path]     # default: ./eeye_config.json
+make                              # builddir/eeye and builddir/hellion
+make -j check                     # the test suites
 ```
 
 Needs GNU make, a C99 compiler (GCC 4.7+ or clang), and libturbojpeg 1.4+
-(`libturbojpeg0-dev` on Debian and Raspberry Pi OS). OpenMP is used when the
-compiler has it. Old toolchains are fine: this builds on Debian 7 onward. A
-distro too old to package libturbojpeg 1.4 can point the build at one built from
-source; see the top of the `Makefile`.
+(`libturbojpeg0-dev` on Debian and Raspberry Pi OS). OpenMP is used when the compiler
+has it. A distro too old to package libturbojpeg 1.4 can point the build at one built
+from source; see the top of the `Makefile`.
 
-`eeye` needs no root and no capabilities, just the `video` group. It does not load
-v4l2loopback: `install.sh` sets it to load at boot. On a machine where it isn't loaded,
-load it yourself:
+Neither program needs root. Both need the `video` group (cameras, v4l2loopback, and the
+frame bus's shared memory). `eeye` does not load v4l2loopback itself: `install.sh` sets
+it to load at boot. Elsewhere:
 
 ```sh
 sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1
 ```
 
-The v4l2loopback output is optional. If `output_device` is missing, or goes away
-mid-run, `eeye` says why, carries on, and picks it up when it appears. The camera and
-output devices are set by `capture_device` and `output_device` in the config.
+The v4l2loopback webcam is optional: if it is missing, `eeye` says why and carries on.
 
-## Field checklist
+## Where eeye runs
 
-The tether is a **direct Ethernet cable** — no router, no DHCP, no DNS. Nothing
-needs configuring: both drone ports listen on IPv6 and IPv4, and every host
-self-assigns an IPv6 link-local address on any live link.
+`eeye` can run on either side of the tether; `hellion` runs on both. Pick one —
+**B is the one to use** unless the ROV's Pi cannot afford the effects.
 
-**On the drone** (same config path `eeye` was started with — see
-[wrong config path](#i-change-settings-and-nothing-happens)):
+**B — `eeye` on the ROV** (`b-rov.json`, `b-topside.json`)
 
-```sh
-python3 pi/config_agent.py --config-path eeye_config.json
+```
+ROV:      camera → eeye → frame bus "pilot" → hellion → H.264/RTP ─┐
+topside:  ┌──────────────────────────────────── tether UDP 5610 ◄──┘
+          └→ hellion → relayed unchanged → QGroundControl (UDP 5600)
+                     → decoded → frame bus "pilot" → page preview, /dev/video10
+                     → recorded as MP4
 ```
 
-**Topside:**
+One encode, on the ROV; QGroundControl gets the ROV's packets unchanged, so the pilot
+pays no extra latency. Autonomy code running on the ROV reads the camera from the frame
+bus next to `eeye`.
 
-```sh
-tools/eeye-net check                          # pre-dive: is everything talking?
-python3 topside/web_ui.py --drone-host auto   # then open http://localhost:8080/
+**A — `eeye` topside** (`a-rov.json`, `a-topside.json`)
+
+```
+ROV:      camera → hellion → H.264/RTP → tether UDP 5610
+topside:  hellion → decoded → frame bus "camera" → eeye → frame bus "pilot"
+          → hellion → H.264/RTP → QGroundControl (UDP 5600), /dev/video10
 ```
 
-The page has the live feed, **Record** and **Snapshot** buttons, and the effect
-chain. Recordings and stills land in `./captures` (`--output-dir` to change it).
-Recording can also be driven from the command line, which is what the button
-runs underneath:
+The ROV only encodes its camera; the effects run on the topside machine, which then
+encodes again for QGroundControl.
+
+The examples use the BlueROV's fixed addresses (topside 192.168.2.1, ROV 192.168.2.2).
+Keep the tether port away from 5600: many viewers also take port+1 for RTCP.
+**Turn off BlueOS's own video stream** for the camera `eeye` or `hellion` uses — only
+one program can hold a camera.
+
+Cockpit cannot show the processed picture: it gets video from BlueOS over WebRTC.
+Use QGroundControl, the page, or the webcam device.
+
+## In the field
+
+**Before the dive**, on the topside machine:
 
 ```sh
-tools/eeye-record --split 10m                 # a new file every 10 minutes
+builddir/hellion check
 ```
 
-`check` walks the whole path — cable carrier, control channel, video, and whether
-the two drone-side processes agree on a config file — and prints the exact fix for
-whatever it finds. It **only reads**: it changes nothing on the drone or topside,
-so it is safe mid-dive. Exit codes: `0` healthy, `1` degraded, `2` no drone found.
+```
+[ OK ] hellion "topside" (topside) responding
+[ OK ] peer: 192.168.2.2:8091, last contact 0.3s ago
+[ OK ] pipeline pilot-in: source rtp:5610 (1280x720, 36 frames in 1.2s)
+[ OK ] pipeline pilot-in: sink bus:pilot (36 frames)
+[ OK ] bus stream pilot: 1280x720, last frame 0.02s ago
+Healthy.
+```
+
+Exit `0` healthy, `1` degraded (a sink waiting, packet loss of 1% or more, the ROV not
+answering), `2` down (no video). Every line names what is wrong.
+
+**During the dive**, the page at `http://<topside>:8080/`:
+
+- **The picture** — any frame bus stream (`pilot`, or `camera`/`raw` to see past the
+  effects), at ~15fps. When frames stop it greys out with a banner saying how stale it
+  is: a frozen picture never looks live.
+- **Effects and camera controls** — applied within ~200ms. The page reports whether
+  `eeye` **accepted** the change; if it rejected it, the previous config stays in force
+  and on disk.
+- **Record** — the H.264 stream as it arrives over the tether, copied into an MP4 with no
+  re-encode (~1.8 GB/hour at 4 Mbit/s). Fragmented MP4, so a recording cut off by a
+  crash or power loss still plays up to its last second. Files go to
+  `/var/lib/hellion/recordings`.
+- **Snapshot** — a JPEG of the preview, to `/var/lib/hellion/snapshots`.
+
+**Over SSH**, on either machine:
 
 ```sh
-tools/eeye-net discover          # find drones, print the command to connect
-tools/eeye-net fix               # print (never run) one-time nmcli/mDNS setup
+builddir/hellion top
 ```
 
-Addresses look like `fe80::ba27:ebff:fe4a:1c2d%eth0`. The `%interface` suffix is
-part of the address — every link has its own `fe80::/64` — so keep the quotes when
-passing one to a shell.
+Every pipeline with its fps, drops, and — for the tether — bitrate and **packet loss**;
+every frame bus stream; `eeye`'s health; the last log lines; and the **other end of the
+tether** as it describes itself, so on the ROV you can see what the topside actually
+receives.
 
 ## Troubleshooting
 
-Logs are the first stop: `journalctl -u eeye -f`, or stdout if running by hand.
+Start with `builddir/hellion check` and `builddir/hellion top`; then the logs:
+`journalctl -u eeye -f`, and `hellion`'s output (the last lines are in `top` too).
 
 ### No video anywhere
 
-| Log line | Cause | Fix |
+| What you see | Cause | Fix |
 |---|---|---|
-| `Camera unavailable (attempt N)` | Camera not detected. `eeye` retries forever; it does **not** need a restart. | Check the cable. `v4l2-ctl --list-devices` |
+| `Camera unavailable (attempt N)` in `eeye`'s log | Camera not detected. `eeye` retries forever; it does **not** need a restart. | Check the cable. `v4l2-ctl --list-devices`; set `capture_device` |
 | `Permission denied opening /dev/video0` | Not in the `video` group. | `sudo usermod -aG video $USER`, then log out and back in |
-| `Virtual camera: /dev/video10 does not exist because v4l2loopback is not loaded` | The module isn't loaded. The pipeline still runs; only the webcam device is missing. | `sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1`, or re-run `install.sh` |
-| `modprobe: ... Operation not permitted` **and** Secure Boot is on | Module built but its signing key was never enrolled — the kernel reports this as the same "operation not permitted" a permissions problem does. `eeye` mentions it when it sees a pending enrollment. | Reboot and enroll the key at the blue MOK screen. `mokutil --list-new` shows a pending enrollment |
-| `neither MJPEG nor YUYV is available at exactly WxH` | Camera doesn't offer that mode and negotiation couldn't substitute one. | `v4l2-ctl --list-formats-ext -d /dev/video0`, then set `capture_width`/`capture_height` to a listed mode |
-| `is not 4:2:2 nor 4:2:0 subsampled` | Unsupported chroma format. | Try a resolution where the camera offers YUYV |
+| `top`: topside `link in` says `no packets` | Nothing arriving on the tether port. | Is `hellion` running on the ROV (`top` there)? Does its `rtp:` sink point at the topside's address and port? |
+| `top`: ROV source `waiting … no such stream "pilot"` (placement B) | `eeye` is not running on the ROV, or publishes under another name. | `systemctl status eeye`; `bus_pilot` in its config |
+| `Virtual camera: /dev/video10 does not exist because v4l2loopback is not loaded` | The module isn't loaded. Only the webcam device is missing; everything else runs. | `sudo modprobe v4l2loopback video_nr=10 card_label=VirtualCam exclusive_caps=1`, or re-run `install.sh` |
+| `modprobe: ... Operation not permitted` **and** Secure Boot is on | The module's signing key was never enrolled — the kernel says "not permitted" either way. | Reboot and enroll the key at the blue MOK screen; `mokutil --list-new` shows it pending |
+| `neither MJPEG nor YUYV is available at exactly WxH` | Camera doesn't offer that mode. | `v4l2-ctl --list-formats-ext -d /dev/video0`, then set `capture_width`/`capture_height` to a listed mode |
+
+### QGroundControl shows nothing
+
+QGC listens on UDP 5600. In placement B the topside `hellion` relays to
+`127.0.0.1:5600` (`relay` in its config); in placement A its `pilot-out` pipeline sends
+there. Make sure **BlueOS is not also sending** to 5600, and nothing else on the
+topside machine has the port.
 
 ### The picture is frozen but looks live
 
-That was a real hazard and is now surfaced. When frames stop arriving the UI
-desaturates the image and shows a pulsing red banner naming how stale it is:
+It can't, any more: when frames stop arriving the page desaturates the picture and shows
+a pulsing banner naming how stale it is (`LINK LOST — showing a frozen frame from 4.0s
+ago`). `hellion top` shows which hop stopped.
 
-```
-LINK LOST — showing a frozen frame from 4.0s ago
-```
+### Blocky or smeared picture
 
-If you see that, you are **not** looking at live video. `tools/eeye-net check`
-diagnoses which half of the link is down.
+Packet loss on the tether. `top` shows it on the `link in` line, `check` warns from 1%,
+and the decoder's damage count appears next to it. Lower `bitrate_kbps` on the ROV's
+`rtp:` sink, or check the tether.
 
 ### Recording stopped without telling me
 
-It tells you now. The sidebar shows `recording: ACTIVE — 812 MB written,
-4210 MB free`, and turns red with the reason if it stops:
-
-```
-recording: FAILED — write failed: No space left on device
-```
-
-Raw I422 is ~53 MB/s at 1280×720, so a disk fills fast. `eeye` also logs how
-long you have when recording starts:
-
-```
-Recording: 41000 MB free at /data/dive.raw (~780 seconds at this geometry)
-```
-
-`downscale` stretches that — it applies before the recording tap, so
-`downscale: 2` quarters the rate.
-
-### Is that real, or is it my filter?
-
-Tick **Show raw camera (bypass effects)** in the UI, or set `"stream_raw":
-true`. The preview switches to the untouched camera frame while the virtual
-camera and recording keep running the full chain, and it hot-reloads like
-everything else.
-
-### Black screen in the web UI
-
-Almost always the stream tap being off rather than a network fault — it ships off
-by default. From outside, the port **accepts your connection and then sends
-nothing**, so a port check looks healthy.
-
-```sh
-tools/eeye-net check <address>     # names this specific case
-```
-
-Fix: set `"stream_frame_interval"` to `2` or `3`. `0` disables the tap entirely.
+The page shows the recording's elapsed time and size while it runs and turns red with the
+reason if it stops (the stream ended, the disk is nearly full). A recording will not
+start with under 500 MB free.
 
 ### I change settings and nothing happens
 
-`config_agent.py` and `eeye` were given **different config paths**, so your edits
-land in a file `eeye` never reads. Both processes look completely healthy and the
-UI reports success.
-
-```sh
-pgrep -af 'eeye|config_agent'      # on the drone — the paths must match exactly
-tools/eeye-net check <address>     # detects it by cross-checking geometry
-```
-
-Also check: geometry and `capture_source` are **startup-only** (see
-[Config reference](#config-reference)). Changing them is logged and ignored until
-restart.
+Geometry, devices and stream names are **startup-only** (see
+[Config reference](#config-reference)): changing them is logged and ignored until
+`eeye` restarts. If the page says `eeye` never answered, `eeye` is not running, or is
+watching a different file than `eeye_config` in `hellion`'s config.
 
 ### Config rejected
 
-`eeye` keeps running on the last valid config and logs why. An unknown key is a
-hard error, not a warning — a typo should be loud:
+`eeye` keeps running on the last valid config and logs why — an unknown key is a hard
+error, so a typo is loud:
 
 ```
 Config: unknown key "bogus_key"
 ```
 
-Strict JSON only: no comments, no trailing commas. Validate with
-`python3 -m json.tool eeye_config.json`. Each load attempt writes
-`<config_path>.status` containing `{"ok":true|false}` — that is the definitive
-answer to whether a change took effect.
+From the page, `hellion` also puts the previous file back, so `eeye` will still start
+next time. Strict JSON only: no comments, no trailing commas.
 
 ### Pipeline can't keep up
 
 Set `"downscale"` to `2`. It is by far the biggest lever — see the table in
 [Resolution](#resolution). Then reduce `blur_strength` (cost is linear in it, but
-visible blur grows much more slowly, so past ~20 you are mostly buying frame time).
+visible blur grows much more slowly).
 
-`journalctl -u eeye | grep full_stalls` — nonzero means a stage is falling behind.
+`journalctl -u eeye | grep full_stalls` — nonzero means a stage is falling behind. On
+the ROV, a Pi 4 can encode in hardware: `"encoder": "h264_v4l2m2m"` on the `rtp:` sink's
+pipeline.
 
-### The drone won't restart cleanly
+### eeye won't restart cleanly
 
 ```sh
 systemctl status eeye
 ```
 
-The unit restarts on failure but gives up after 5 restarts in 60s, so a persistent
-fault surfaces as a failed service instead of looping silently. A missing camera
-does not trigger this — that is retried internally.
+The unit restarts on failure but gives up after 5 restarts in 60s, so a persistent fault
+surfaces as a failed service instead of looping silently. A missing camera does not
+trigger this — that is retried internally.
 
 ## Config reference
+
+`eeye`'s config (`eeye_config.json`; under `install.sh`, the path in `eeye.service`). `hellion`'s own config is in [docs/hellion.md](docs/hellion.md#config).
 
 Every key is optional. Defaults shown:
 
@@ -230,20 +256,23 @@ Every key is optional. Defaults shown:
   "chain": [{"effect": "sobel"}],
   "record_path": "",
   "record_format": "raw",
-  "stream_frame_interval": 0,
-  "stream_quality": 60,
   "capture_width": 1280,
   "capture_height": 720,
   "downscale": 1,
   "capture_source": "auto",
   "capture_format": "auto",
-  "stream_raw": false,
+  "capture_device": "/dev/video0",
+  "output_device": "/dev/video10",
+  "capture_stream": "camera",
+  "bus_pilot": "pilot",
+  "bus_raw": "raw",
   "camera": {}
 }
 ```
 
 > **Startup-only:** `capture_width`, `capture_height`, `downscale`,
-> `capture_source`, `capture_format`. Everything else is hot-reloadable. Changing these in a running
+> `capture_source`, `capture_format`, `capture_device`, `output_device`,
+> `capture_stream`, `bus_pilot`, `bus_raw`. Everything else is hot-reloadable. Changing these in a running
 > config is logged and ignored — applying them live would mean reallocating the
 > frame pool while three threads hold frames from it.
 
@@ -331,7 +360,7 @@ Everything downstream — effects, virtual camera, preview, recording — runs a
 `capture ÷ downscale`. Measured at 1280×720 with `blur_strength: 12` + `sobel`,
 steady 30fps:
 
-| `downscale` | pipeline | CPU | preview frame |
+| `downscale` | pipeline | CPU | JPEG frame at q60 |
 |---|---|---|---|
 | 1 | 1280×720 | 134% | 59.4 KB |
 | 2 | 640×360 | 55% | 16.4 KB |
@@ -376,7 +405,7 @@ Every field is optional, and **anything you leave out is left alone** — so a
 | `saturation` | 0–200 | 100 = neutral |
 | `sharpness` | 0–200 | 100 = neutral |
 
-These are **hot-reloadable** — adjust them from the UI's Camera section and the
+These are **hot-reloadable** — adjust them from the page's Camera section and the
 picture changes immediately, no restart. They are also re-applied after a camera
 reconnect, since a replugged camera comes back at its factory defaults.
 
@@ -450,159 +479,122 @@ during decode.
 
 ### Recording
 
-Two options, and for a whole dive you almost certainly want the second.
+Two kinds, for different jobs.
 
-**Topside, encoded (`tools/eeye-record`)** — ~1.2 GB/hour, and costs the drone
-nothing, since it re-uses frames already being sent for the preview:
+**Topside, `hellion`** — the page's **Record** button. The H.264 stream exactly as it
+crosses the tether, copied into a fragmented MP4: ~1.8 GB/hour at the default
+4 Mbit/s, no re-encode, and a file cut off by a crash still plays. In placement B that
+is the pilot's picture; in placement A it is the camera before effects. Details in
+[docs/hellion.md](docs/hellion.md#recording).
 
-```sh
-tools/eeye-record                          # H.264 to dive-<timestamp>.mp4
-tools/eeye-record --raw --split 10m        # raw camera, a new file every 10min
-tools/eeye-record --quality high -o run.mp4
-```
+**Onboard, `eeye`'s `"record_path"`** — writes the camera frame **before the effect
+chain**, on `eeye`'s machine. Empty means off. By default it is raw I422, no container:
+full rate, full quality, and enormous — ~53 MB/s, ~190 GB/hour at 1280×720. Use it for
+short clips where compression would matter.
 
-It records the **preview stream**, so what you get depends on two drone-side
-settings — framerate is `30 ÷ stream_frame_interval`, quality is
-`stream_quality`, and `stream_raw` decides whether effects are burned in. The
-tool prints exactly what it is about to capture before it starts:
+`"record_format": "mjpeg"` writes the JPEG frames the camera itself sent instead: no
+re-encode, roughly an order of magnitude smaller, playable with
+`ffplay -f mjpeg -framerate 30 -i FILE`. It needs an MJPEG camera; with a YUYV camera it
+falls back to raw and says so in the log.
 
-```
-Source         : processed image (effects burned in), ~15 fps, JPEG quality 75
-```
-
-`--raw` / `--effects` flip `stream_raw` on the drone for you. It connects
-through `web_ui.py` rather than to the drone directly, because the drone serves
-one viewer at a time — connecting straight to it would kick the pilot off
-their video.
-
-**Onboard (`"record_path"`)** — writes the camera frame **before the effect
-chain**. Empty means off. By default it is raw I422, no container: the
-full-rate, full-quality, effect-free source, and it is enormous: ~53 MB/s,
-~190 GB/hour at 1280×720. Use it for short clips where the compression or the
-dropped frames of the topside path would matter.
-
-`"record_format": "mjpeg"` writes the JPEG frames the camera itself sent
-instead: no re-encode, roughly an order of magnitude smaller, playable with
-`ffplay -f mjpeg -framerate 30 -i FILE`. It needs an MJPEG camera stream; with
-a YUYV camera it falls back to raw and says so in the log.
-
-Recording runs on its own thread, so a disk that can't keep up drops recorded
-frames (counted as `dropped_frames` in the health file) rather than freezing
-the live feed.
-
-`downscale` applies (it happens during capture decode, upstream of this tap),
-so recordings shrink proportionally — ~48 GB/hour at `downscale: 2`. Play back
-at `capture ÷ downscale`:
+Recording runs on its own thread, so a disk that can't keep up drops recorded frames
+(counted as `dropped_frames` in the health file) rather than freezing the live feed.
+`downscale` applies, so recordings shrink with it. Play raw back at
+`capture ÷ downscale`:
 
 ```sh
 ffplay -f rawvideo -pix_fmt yuv422p -s 640x360 -r 30 -i FILE   # downscale 2
 ```
 
-| | topside (`eeye-record`) | onboard (`record_path`) |
+### Frame bus and devices
+
+| Key | Default | |
 |---|---|---|
-| size | ~1.2 GB/hour | ~190 GB/hour raw, far less as `mjpeg` |
-| framerate | `30 ÷ stream_frame_interval` | full capture rate |
-| quality | JPEG then H.264 | untouched (raw) or the camera's JPEG (`mjpeg`) |
-| effects | follows `stream_raw` | always excluded |
-| costs the drone | nothing extra | disk write per frame |
+| `bus_pilot` | `"pilot"` | Frame bus stream for the processed picture (`""` for none) |
+| `bus_raw` | `"raw"` | Frame bus stream for the untouched camera frame (`""` for none) |
+| `capture_source: "bus"` | — | Read frames from a frame bus stream instead of a camera (placement A, topside) |
+| `capture_stream` | `"camera"` | Which stream, with `capture_source: "bus"`; its size sets the geometry |
+| `capture_device` | `"/dev/video0"` | The V4L2 camera |
+| `output_device` | `"/dev/video10"` | The v4l2loopback webcam (`""` for none) |
 
-### Live preview
+All startup-only. The frame bus is how other programs on the machine get `eeye`'s
+video — autonomy code included — with capture timestamps on every frame; its layout and
+how to read it from C or Python are in [docs/bus.md](docs/bus.md).
 
-`"stream_frame_interval"` — send every Nth frame to a connected viewer. `0`
-disables the tap entirely and no JPEG work happens at all. `"stream_quality"` is
-JPEG quality 1–100.
-
-`"stream_raw"` (default `false`) sends the **untouched** camera frame to the
-preview instead of the processed one, so you can tell a real object from a
-filter artifact without dismantling your chain. Preview only — the virtual
-camera and the recording tap are unaffected.
-
-This is a lossy, throttled preview, independent of `record_path`'s full-quality
-local recording. Nothing valuable rides on it, so push quality and rate down hard
-over a constrained link.
+`stream_frame_interval`, `stream_quality` and `stream_raw` fed the old preview tap that
+`hellion` replaces; they still work for now and will go away.
 
 ## How it works
 
 ```
- camera                                                  v4l2loopback
-    │                                                          ▲
-    ▼                                                          │
-┌─────────────┐   raw    ┌──────────────┐   work    ┌──────────────────┐
-│ producer    │ ───────► │ effects      │ ────────► │ consumer         │
-│ (v4l2_in /  │  frame   │ (effect_chain│  frame    │ (v4l2_out, plus  │
-│  rpicam_in) │  pool    │  /conv/      │  pool     │  record + stream │
-└─────────────┘          │  point_opps) │           │  taps)           │
-                         └──────────────┘           └──────────────────┘
-                                ▲                            │
-                                │ snapshot, once per frame   │ JPEG, throttled
-                         ┌──────────────┐      inotify       ▼
-                         │ config watch │ ◄──── eeye_config.json   TCP :9000
-                         └──────────────┘
+ camera ──► eeye: capture ─► effects ─► publish ──► frame bus: "pilot", "raw"
+                                      └──────────► v4l2loopback webcam (optional)
+
+ frame bus ──► hellion pipelines ──► H.264/RTP over the tether ──► hellion ──►
+              (one source, many       (ffmpeg encodes;             relay to QGC,
+               sinks, each on its      hellion moves every          decode to the bus,
+               own thread)             packet and counts loss)      record, page
 ```
 
-Three threads pass frames through lock-free ring buffers. Each `VideoFrame` carries
-`raw` (untouched camera frame), `work` (what the chain writes), and `spare` (so
-chained neighborhood ops can ping-pong without a filter consuming its own output).
-Consecutive point ops fuse into one lookup-table pass. A config-watch thread
-publishes snapshots atomically; the effects loop reads one per frame, so a config
-push can never split a frame.
+Inside `eeye`, three threads pass frames through lock-free ring buffers; consecutive
+point ops fuse into one lookup-table pass; a config-watch thread hot-reloads the JSON
+file, and the effects loop reads one snapshot per frame, so a config push never splits a
+frame. Nothing slow runs on the thread that feeds the pilot's picture.
 
-Topside, `web_ui.py` proxies config reads/writes to `config_agent.py`
-server-to-server (no CORS, and the drone's ports needn't be reachable from the
-browser's network) and holds a single stream connection regardless of how many
-browsers are watching.
+The **frame bus** is shared memory: one file per stream in `/dev/shm`, a ring of frames
+under a seqlock. The writer never waits for a reader, so a slow reader — or a crashed
+one — can never stall the pilot's picture; readers sleep on a futex until a frame lands.
 
-**No authentication on any port.** Fine on a private point-to-point tether; not
-fine on a shared network.
+`hellion` runs **pipelines**: one source (a camera, a frame bus stream, or RTP from the
+tether) feeding up to eight sinks (the frame bus, a webcam device, RTP), each sink on its
+own thread behind a one-slot mailbox, so a slow sink drops its own frames and holds up
+nothing else. ffmpeg does H.264 and RTP in child processes; `hellion` carries every
+packet through its own relay, which is what lets it report each link's bitrate and loss
+and keep QGC fed while a decoder restarts.
+
+More in [docs/](docs/README.md): [architecture](docs/architecture.md),
+[the frame bus](docs/bus.md), [hellion](docs/hellion.md).
+
+**No authentication on any port.** Fine on a private point-to-point tether; not fine on
+a shared network.
 
 ## Known limitations
 
-- **Single-viewer stream.** `stream_server` accepts one connection at a time, last
-  one wins. `web_ui.py` fans out to multiple browsers from that one connection.
-- **Framerate and device paths are compile-time constants** in `src/eeye.c` and
-  `src/video_threads.c`. Resolution is configurable.
-- **Resolution is negotiated once, at startup.** A *different* camera plugged in
-  later is held to the original size. Replugging the same one is fine.
-- **The web UI shows the config's geometry, not the negotiated one.** Check
-  `eeye`'s startup log for what is actually in use.
-- **Onboard recording is uncompressed** (~190 GB/hour), so it is for short clips.
-  `tools/eeye-record` encodes topside at ~1.2 GB/hour for anything longer — at
-  the preview's framerate and quality, not the camera's.
-- **Camera controls on the Pi camera backend need a restart to apply.**
-  `rpicam-vid` takes them as command-line arguments, so changing one respawns
-  the child — a ~1s gap in the video, announced in the log. The V4L2 backend
-  applies them instantly. The Pi-side mapping is **unverified on real CSI
-  hardware**; only its argument construction is tested.
-- **Snapshots and topside recordings capture the preview**, so they inherit
-  `stream_frame_interval`, `stream_quality`, and `stream_raw`.
-- **Recording from the UI needs `ffmpeg` on the topside machine.** The Record
-  button disables itself and says so when it is missing; everything else,
-  snapshots included, works without it.
-- **Verified on real Pi hardware with a USB camera.** The Pi camera module backend,
-  the web UI over a real tether, and the stale-link/recording-failure indicators
-  have not been.
+- **`install.sh` does not set up `hellion` yet**, and the old Python tools are still in
+  the tree. Both change in the next update.
+- **Latency through the tether is about two frame periods inside ffmpeg** — 70 ms at
+  30fps, 37 ms at 60fps, measured bus to bus on one machine — before camera, tether and
+  display. Which ffmpeg stages hold the frames is not yet established.
+- **Recordings' timing assumes `framerate`** (default 30): frames are stamped at the
+  nominal rate. `hellion` warns when a source runs more than 10% off it.
+- **Cockpit cannot show the processed picture** (it takes video from BlueOS over WebRTC).
+- **Resolution is negotiated once, at startup.** A *different* camera plugged in later
+  is held to the original size. Replugging the same one is fine.
+- **Camera controls on the Pi camera backend need a restart to apply** — a ~1s gap,
+  announced in the log. The V4L2 backend applies them instantly. The Pi-side mapping is
+  unverified on real CSI hardware.
+- **Not yet run on the vehicle.** Everything above is tested on one x86 machine with
+  test patterns, loopback devices and a simulated lossy link; the Pi, a real camera and
+  the Fathom-X tether are next.
 
 ## Development
 
 ```sh
-make                       # builddir/eeye
-make -j check              # 14 suites
-make BUILD=debug           # builddir/eeye-d, unoptimized
+make                       # builddir/eeye, builddir/hellion
+make -j check              # the test suites
+make BUILD=debug           # unoptimized, eeye-d and hellion-d
+make fuzz-http             # fuzz hellion's HTTP parsers (clang)
 ```
 
 **[`docs/`](docs/) has the internal documentation** — architecture, both capture
-backends, the effect chain, the config system, the topside tooling, and recipes for
-adding an operator or a config key. Start at [docs/README.md](docs/README.md), or go
-straight to [docs/extending.md](docs/extending.md) if you are here to change one thing.
+backends, the effect chain, the config system, the frame bus, `hellion`, testing, and
+recipes for adding an operator or a config key. Start at
+[docs/README.md](docs/README.md), or go straight to [docs/extending.md](docs/extending.md)
+if you are here to change one thing.
 
-`src/` is a flat set of translation units: capture (`v4l2_in`, `rpicam_in`, shared
-MJPEG decode in `jpeg_decode`), output (`v4l2_out`), preview tap (`stream_server`),
-optional webcam output with retry (`virtual_cam`), the frame bus between programs
-(`fbus`, read back by the `bus_in` capture backend; see [docs/bus.md](docs/bus.md)),
-child processes (`child_proc`), ring buffer, frame pool, effects (`conv.c` for
-sobel/blur, `point_opps.c` for contrast), the chain runner (`effect_chain.c` —
-where grayscale/invert/threshold/tint/light live, fused into LUTs), and config
-hot-reload (`config.c`), wired together in `video_threads.c` / `eeye.c`.
-
-`pi/`, `topside/`, and `tools/` are standalone Python — stdlib only, not part of
-the C build.
+`src/` is `eeye` and the modules both programs share: capture (`v4l2_in`, `rpicam_in`,
+shared MJPEG decode in `jpeg_decode`, `bus_in`), output (`v4l2_out`, the optional webcam
+`virtual_cam`), the frame bus (`fbus`), child processes (`child_proc`), effects
+(`conv.c`, `point_opps.c`, the chain runner `effect_chain.c`), config hot-reload
+(`config.c`), wired together in `video_threads.c` / `eeye.c`. `hellion/` is the second
+binary; [docs/hellion.md](docs/hellion.md) maps it.

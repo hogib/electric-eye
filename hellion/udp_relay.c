@@ -19,6 +19,7 @@ enum { max_dests = 8, max_packet = 65536 };
 static const uint64_t window_ns = 1000000000ull;
 
 typedef struct {
+  bool used;
   struct sockaddr_storage addr;
   socklen_t len;
   int fd; // a socket of the destination's family
@@ -27,8 +28,10 @@ typedef struct {
 struct UdpRelay {
   int fd;
   int port;
+  // Destinations can come and go while packets flow (a recording starts),
+  // so they have their own lock, held while a packet is forwarded.
+  pthread_mutex_t dest_lock;
   Dest dests[max_dests];
-  int dest_count;
 
   pthread_t thread;
   bool started;
@@ -156,22 +159,20 @@ UdpRelay *udp_relay_open(const char *bind_spec, char *err, size_t err_cap) {
                 ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port)
                 : ntohs(((struct sockaddr_in *)&ss)->sin_port);
   pthread_mutex_init(&r->lock, NULL);
+  pthread_mutex_init(&r->dest_lock, NULL);
   return r;
 }
 
 int udp_relay_port(const UdpRelay *r) { return r ? r->port : 0; }
 
-bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
-                        size_t err_cap) {
-  if (r->dest_count >= max_dests) {
-    snprintf(err, err_cap, "more than %d destinations", max_dests);
-    return false;
-  }
+// Resolves `dest` and opens a socket for it in a free slot. Returns the
+// slot, or -1 with *err filled.
+static int attach(UdpRelay *r, const char *dest, char *err, size_t err_cap) {
   char host[128], port[16];
   if (!split_host_port(dest, host, sizeof host, port, sizeof port) ||
       !host[0]) {
     snprintf(err, err_cap, "bad destination \"%s\" (want host:port)", dest);
-    return false;
+    return -1;
   }
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof hints);
@@ -180,23 +181,59 @@ bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
   if (rc != 0 || !res) {
     snprintf(err, err_cap, "cannot resolve \"%s\": %s", host,
              gai_strerror(rc));
-    return false;
+    return -1;
   }
-  Dest *d = &r->dests[r->dest_count];
-  memcpy(&d->addr, res->ai_addr, res->ai_addrlen);
-  d->len = res->ai_addrlen;
   // Its own socket, so the family always matches the destination and
   // sends are never refused for that.
-  d->fd = socket(res->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  freeaddrinfo(res);
-  if (d->fd < 0) {
+  int fd = socket(res->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
     snprintf(err, err_cap, "socket: %s", strerror(errno));
-    return false;
+    freeaddrinfo(res);
+    return -1;
   }
   int snd = 4 << 20;
-  setsockopt(d->fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
-  r->dest_count++;
-  return true;
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
+
+  pthread_mutex_lock(&r->dest_lock);
+  int slot = -1;
+  for (int i = 0; i < max_dests && slot < 0; i++)
+    if (!r->dests[i].used)
+      slot = i;
+  if (slot >= 0) {
+    Dest *d = &r->dests[slot];
+    memcpy(&d->addr, res->ai_addr, res->ai_addrlen);
+    d->len = res->ai_addrlen;
+    d->fd = fd;
+    d->used = true;
+  }
+  pthread_mutex_unlock(&r->dest_lock);
+  freeaddrinfo(res);
+  if (slot < 0) {
+    close(fd);
+    snprintf(err, err_cap, "more than %d destinations", max_dests);
+  }
+  return slot;
+}
+
+bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
+                        size_t err_cap) {
+  return attach(r, dest, err, err_cap) >= 0;
+}
+
+int udp_relay_attach(UdpRelay *r, const char *dest, char *err,
+                     size_t err_cap) {
+  return attach(r, dest, err, err_cap);
+}
+
+void udp_relay_detach(UdpRelay *r, int id) {
+  if (!r || id < 0 || id >= max_dests)
+    return;
+  pthread_mutex_lock(&r->dest_lock);
+  if (r->dests[id].used) {
+    close(r->dests[id].fd);
+    r->dests[id].used = false;
+  }
+  pthread_mutex_unlock(&r->dest_lock);
 }
 
 // RTP bookkeeping for one packet; called with the lock held.
@@ -272,12 +309,14 @@ static void *relay_loop(void *arg) {
       if (n < 0)
         break;
       uint64_t errors = 0;
-      for (int i = 0; i < r->dest_count; i++) {
+      pthread_mutex_lock(&r->dest_lock);
+      for (int i = 0; i < max_dests; i++) {
         Dest *d = &r->dests[i];
-        if (sendto(d->fd, buf, (size_t)n, MSG_DONTWAIT,
-                   (struct sockaddr *)&d->addr, d->len) < 0)
+        if (d->used && sendto(d->fd, buf, (size_t)n, MSG_DONTWAIT,
+                              (struct sockaddr *)&d->addr, d->len) < 0)
           errors++;
       }
+      pthread_mutex_unlock(&r->dest_lock);
       pthread_mutex_lock(&r->lock);
       account(r, buf, (size_t)n, now);
       r->totals.send_errors += errors;
@@ -319,8 +358,10 @@ void udp_relay_close(UdpRelay *r) {
   if (r->started)
     pthread_join(r->thread, NULL);
   close(r->fd);
-  for (int i = 0; i < r->dest_count; i++)
-    close(r->dests[i].fd);
+  for (int i = 0; i < max_dests; i++)
+    if (r->dests[i].used)
+      close(r->dests[i].fd);
+  pthread_mutex_destroy(&r->dest_lock);
   pthread_mutex_destroy(&r->lock);
   free(r);
 }

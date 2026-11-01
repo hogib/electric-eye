@@ -9,6 +9,7 @@
 #include "hlog.h"
 #include "hstatus.h"
 #include "pipeline.h"
+#include "hrecord.h"
 #include "udp_relay.h"
 #include "test_harness.h"
 #include <dirent.h>
@@ -584,6 +585,100 @@ static void test_rtp_round_trip(void) {
   free(dst.buf);
 }
 
+// True if the file contains `tag` (an MP4 box type) anywhere.
+static bool file_has(const char *path, const char *tag) {
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return false;
+  static char buf[1 << 20];
+  size_t n = fread(buf, 1, sizeof buf, f);
+  fclose(f);
+  for (size_t i = 0; i + 4 <= n; i++)
+    if (memcmp(buf + i, tag, 4) == 0)
+      return true;
+  return false;
+}
+
+// Recording the RTP arriving at a pipeline: a fragmented MP4 (ftyp, then
+// moof fragments, which is what makes a cut-off recording still play),
+// one at a time, and stop refusing when nothing is recording.
+static void test_recorder(void) {
+  if (!ff_available()) {
+    printf("    (skipped: ffmpeg is not installed)\n");
+    return;
+  }
+  int port = udp_free_port_pair();
+  char json[1024];
+  snprintf(json, sizeof json,
+           "{\"record_dir\":\"%s/rec\",\"pipelines\":["
+           "{\"name\":\"down\",\"source\":\"rtp:%d\",\"width\":320,"
+           "\"height\":240,\"sinks\":[\"bus:rec-out\"]},"
+           "{\"name\":\"up\",\"source\":\"bus:rec-in\",\"gop\":10,"
+           "\"sinks\":[\"rtp:127.0.0.1:%d\"]}]}",
+           bus_dir, port, port);
+  HellionConfig c;
+  CHECK(parse(json, &c));
+  FbusWriter *in = fbus_writer_open("rec-in", 320, 240);
+  Pipeline *pipes[2] = {pipeline_start(&c.pipelines[0]),
+                        pipeline_start(&c.pipelines[1])};
+  HRec *rec = hrec_create(&c, pipes, 2);
+
+  Img src;
+  img_init(&src, 320, 240);
+  char detail[256];
+  bool started = false;
+  // Publish until the receiving side is up, then record ~3s.
+  for (int i = 0; i < 300; i++) {
+    img_pattern(&src, i);
+    fbus_writer_publish(in, (const uint8_t *const *)src.planes, i, 0);
+    sleep_ms(33);
+    if (!started && i > 30 && pipeline_rtp_relay(pipes[0])) {
+      started = hrec_start(rec, detail, sizeof detail);
+      CHECK(started);
+      CHECK(!hrec_start(rec, detail, sizeof detail)); // one at a time
+      CHECK(strstr(detail, "already recording") != NULL);
+    }
+    if (started && i > 120)
+      break;
+  }
+  char status[1200];
+  hrec_status_json(rec, status, sizeof status);
+  CHECK(strstr(status, "\"recording\":true") != NULL);
+
+  CHECK(hrec_stop(rec, detail, sizeof detail));
+  char path[512];
+  snprintf(path, sizeof path, "%s/rec/%s", bus_dir, detail);
+  struct stat st;
+  CHECK(stat(path, &st) == 0 && st.st_size > 10000);
+  CHECK(file_has(path, "ftyp"));
+  CHECK(file_has(path, "moof")); // fragmented
+  hrec_status_json(rec, status, sizeof status);
+  CHECK(strstr(status, "\"recording\":false") != NULL);
+  CHECK(strstr(status, "\"error\":\"\"") != NULL); // stopped cleanly
+  CHECK(!hrec_stop(rec, detail, sizeof detail));
+  unlink(path);
+  char dir[300];
+  snprintf(dir, sizeof dir, "%s/rec", bus_dir);
+  rmdir(dir);
+
+  hrec_destroy(rec);
+  pipeline_stop(pipes[1]);
+  pipeline_stop(pipes[0]);
+  fbus_writer_close(in);
+  free(src.buf);
+
+  // Nothing to record: unavailable, with the reason.
+  CHECK(parse("{\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+              "\"sinks\":[\"bus:b\"]}]}",
+              &c));
+  rec = hrec_create(&c, NULL, 0);
+  hrec_status_json(rec, status, sizeof status);
+  CHECK(strstr(status, "\"available\":false") != NULL);
+  CHECK(!hrec_start(rec, detail, sizeof detail));
+  CHECK(strstr(detail, "no RTP source") != NULL);
+  hrec_destroy(rec);
+}
+
 // ---- Status file ----------------------------------------------------------
 
 static void test_status_round_trip(void) {
@@ -703,6 +798,7 @@ int main(void) {
   RUN_TEST(test_example_configs_load);
   RUN_TEST(test_udp_relay);
   RUN_TEST(test_rtp_round_trip);
+  RUN_TEST(test_recorder);
   RUN_TEST(test_status_round_trip);
   RUN_TEST(test_log_capture);
 

@@ -49,6 +49,29 @@ static void check_instance(const char *name) {
   }
   say(0, "hellion \"%s\" (%s) responding", b.name, b.role);
 
+  // The other end of the tether: without it, config changes and the far
+  // end's state go nowhere, though the video may still flow.
+  if (b.peer_configured) {
+    struct timespec ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+    uint64_t now = (uint64_t)ts_now.tv_sec * 1000000000ull +
+                   (uint64_t)ts_now.tv_nsec;
+    double age = b.peer_contact_mono_ns
+                     ? (double)(now - b.peer_contact_mono_ns) / 1e9
+                     : -1;
+    char what[320];
+    if (age >= 0 && age <= 5) {
+      snprintf(what, sizeof what, "%s, last contact %.1fs ago",
+               b.peer_addr, age);
+      say(0, "peer: %s%s", what, "");
+    } else {
+      snprintf(what, sizeof what, "%s %s (%s)", b.peer_addr,
+               age < 0 ? "never reached" : "not reached for a while",
+               b.peer_error[0] ? b.peer_error : "no error recorded");
+      say(1, "peer: %s%s", what, "");
+    }
+  }
+
   for (uint32_t i = 0; i < b.pipeline_count; i++) {
     const HsPipeline *pb = &b.pipelines[i];
     const HsPipeline *pa = &a.pipelines[i];

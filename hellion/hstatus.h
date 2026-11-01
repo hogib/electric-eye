@@ -19,13 +19,14 @@
  */
 
 enum {
-  hs_version = 2,
+  hs_version = 3,
   hs_max_pipelines = 8,
   hs_max_sinks = 8,
   hs_spec_len = 64,
   hs_state_len = 16,
   hs_detail_len = 112,
   hs_name_len = 32,
+  hs_peer_lines = 16,
 };
 
 // One end of a pipeline: its source or one of its sinks.
@@ -71,6 +72,18 @@ typedef struct {
 
   uint32_t pipeline_count;
   HsPipeline pipelines[hs_max_pipelines];
+
+  // Recording, one line ("" when idle and fine).
+  char recording[hs_detail_len];
+
+  // The hellion at the other end of the tether, as it last described
+  // itself -- whichever side started the exchange (see control.c).
+  bool peer_configured;            // this side has "peer" and calls it
+  char peer_addr[64];              // who, as configured or as seen
+  uint64_t peer_contact_mono_ns;   // 0 = never
+  char peer_error[hs_detail_len];  // the last failed attempt, if any
+  uint32_t peer_line_count;
+  char peer_lines[hs_peer_lines][hs_detail_len];
 
   uint64_t log_total; // lines ever logged
   uint32_t log_count; // lines below, oldest first

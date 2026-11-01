@@ -1,6 +1,7 @@
 #pragma once
 #include "hconfig.h"
 #include "hstatus.h"
+#include "hrecord.h"
 #include <stdbool.h>
 
 /*
@@ -24,12 +25,16 @@
 
 typedef struct Control Control;
 
-// Starts listening on cfg->control. NULL (with a message) on failure;
-// hellion runs on without its page then.
-Control *control_start(const HellionConfig *cfg);
+// Starts listening on cfg->control, and talking to cfg->peer if set.
+// `rec` serves /record (owned by the caller). NULL (with a message) on
+// failure, or when cfg->control is ""; hellion runs on without its page.
+Control *control_start(const HellionConfig *cfg, HRec *rec);
 
-// The latest status snapshot, for /api/status and the page. Called by the
-// status loop after each publish.
+// Fills the status snapshot's peer view. Safe on NULL.
+void control_fill(Control *c, HsStatus *s);
+
+// The latest status snapshot, for /api/status, /api/peer and the page.
+// Called by the status loop after each publish.
 void control_set_status(Control *c, const HsStatus *s);
 
 void control_stop(Control *c);

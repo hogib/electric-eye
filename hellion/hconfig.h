@@ -110,6 +110,10 @@ typedef struct {
   char peer[hcfg_max_spec];
   char preview[hcfg_max_name];
   char snapshot_dir[256];
+  // Recording (topside): the RTP source pipeline whose stream is copied to
+  // MP4 ("" = the first pipeline with an rtp source), and where.
+  char record_from[hcfg_max_name];
+  char record_dir[256];
   size_t pipeline_count;
   PipelineConfig pipelines[hcfg_max_pipelines];
 } HellionConfig;

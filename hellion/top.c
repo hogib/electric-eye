@@ -347,6 +347,36 @@ static void draw_instance(const HsStatus *s) {
     for (uint32_t k = 0; k < p->sink_count; k++)
       draw_endpoint("sink", &p->sinks[k], true);
   }
+
+  if (s->recording[0]) {
+    seg(C_HEAD, " recording");
+    seg(strncmp(s->recording, "recording ", 10) == 0 ? C_OK : C_BAD, "  %s",
+        s->recording);
+    line_end();
+  }
+
+  // The other end of the tether, as it last described itself.
+  if (s->peer_configured || s->peer_contact_mono_ns) {
+    double age = s->peer_contact_mono_ns
+                     ? (double)(mono_ns() - s->peer_contact_mono_ns) / 1e9
+                     : -1;
+    seg(C_HEAD, " peer");
+    seg(C_NONE, " %s  ", s->peer_addr);
+    if (age < 0)
+      seg(C_WARN, "never reached");
+    else if (age > 3)
+      seg(C_BAD, "last contact %.0fs ago", age);
+    else
+      seg(C_OK, "in contact");
+    if (s->peer_error[0] && (age < 0 || age > 3))
+      seg(C_BAD, "  %s", s->peer_error);
+    line_end();
+    for (uint32_t i = 0; i < s->peer_line_count; i++) {
+      seg(C_DIM, "   | ");
+      seg(age >= 0 && age <= 3 ? C_NONE : C_DIM, "%s", s->peer_lines[i]);
+      line_end();
+    }
+  }
 }
 
 static void draw_log(const HsStatus *s, int rows) {
@@ -378,6 +408,10 @@ static int count_lines(const HsStatus *s) {
     for (uint32_t k = 0; k < p->sink_count; k++)
       n += p->sinks[k].net ? 1 : 0;
   }
+  if (s->recording[0])
+    n++;
+  if (s->peer_configured || s->peer_contact_mono_ns)
+    n += 1 + (int)s->peer_line_count;
   return n;
 }
 

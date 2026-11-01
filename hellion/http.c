@@ -472,7 +472,13 @@ static void *accept_loop(void *arg) {
     else if (ss.ss_family == AF_INET)
       inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, host,
                 sizeof host);
-    snprintf(c->addr, sizeof c->addr, "%s", host);
+    // An IPv4 client on the dual-stack socket arrives as ::ffff:a.b.c.d;
+    // show it as the IPv4 address it is.
+    const char *shown = strncmp(host, "::ffff:", 7) == 0 &&
+                                strchr(host + 7, '.')
+                            ? host + 7
+                            : host;
+    snprintf(c->addr, sizeof c->addr, "%s", shown);
 
     if (__atomic_add_fetch(&s->active, 1, __ATOMIC_ACQ_REL) > s->max_conns) {
       plain_error(c, 503, "too many connections\n");

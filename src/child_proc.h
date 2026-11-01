@@ -136,6 +136,14 @@ bool child_set_pipe_size(int fd, int bytes);
 int child_stop(ChildProc *c, int grace_ms);
 
 /*
+ * Sends `sig` to the child's process group. For a child that needs its own
+ * stop: ffmpeg writing an MP4 finalizes it on SIGINT, so a recorder is
+ * stopped with child_signal(SIGINT) and child_wait() before child_stop().
+ * False if there is no child.
+ */
+bool child_signal(ChildProc *c, int sig);
+
+/*
  * Waits up to timeout_ms for the child to exit by itself, reaping it.
  * Returns true and fills *status (if non-NULL) once it has; false if it
  * is still running. timeout_ms 0 just checks.

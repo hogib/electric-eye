@@ -12,8 +12,24 @@ hellion check [-n name]                  # health check: exit 0 ok, 1 degraded, 
 
 **Status:** pipelines with camera, frame bus and RTP sources; frame bus, v4l2loopback
 and RTP sinks (H.264 to the other end of the tether, or to QGroundControl); the browser
-page with preview, snapshots and `eeye`'s config (here or across the tether); `top`
-and `check`. Recording and the ROV↔topside status exchange come next.
+page with preview, snapshots, recording and `eeye`'s config (here or across the
+tether); the ROV↔topside status exchange; `top` and `check`. `install.sh` does not set
+`hellion` up yet — see [Running it by hand](#running-it-by-hand).
+
+## Running it by hand
+
+Until `install.sh` installs it (next on the list), on each machine:
+
+```sh
+make                                              # builddir/eeye and builddir/hellion
+sudo mkdir -p /etc/hellion /var/lib/hellion
+sudo cp hellion/examples/b-topside.json /etc/hellion/hellion.json   # or a-/b-, rov/topside
+sudo chown -R $USER /var/lib/hellion
+builddir/hellion                                  # reads /etc/hellion/hellion.json
+```
+
+`hellion` needs `ffmpeg` (`apt install ffmpeg`) for anything RTP, and the `video`
+group for cameras and v4l2loopback. It needs no root.
 
 ## Config
 
@@ -42,6 +58,8 @@ unknown key or bad value stops startup with the reason.
 | `peer` | `""` | The other `hellion`'s `control`, as `"host:port"`. Where `eeye`'s config and health come from when `eeye` is not on this machine |
 | `preview` | `"pilot"` | The frame bus stream the page previews by default |
 | `snapshot_dir` | `/var/lib/hellion/snapshots` | Where the page's snapshots are saved |
+| `record_dir` | `/var/lib/hellion/recordings` | Where recordings are saved |
+| `record_from` | first `rtp:` source | The pipeline whose arriving stream is recorded |
 | `pipelines` | — | 1 to 8; see below |
 
 A **pipeline** moves frames from one source to up to 8 sinks:
@@ -186,7 +204,9 @@ by `hellion/embed.c`), so there is nothing to install beside it.
 | `GET /health?src=S` | `link` (is `S` alive, how old its newest frame), `drone` (`eeye`'s health file, plus its age), `recorder` |
 | `GET /api/streams` | The frame bus streams on this machine |
 | `GET /api/drone` | `eeye`'s health file here, with `age_s` |
+| `POST /record` | `{"action":"start"}` / `{"action":"stop"}` — see [Recording](#recording) |
 | `GET /api/status` | This `hellion`'s pipelines as JSON, for scripts |
+| `POST /api/peer` | The status exchange between the two ends — see [ROV ↔ topside status](#rov--topside-status) |
 
 The preview is **any frame bus stream** on the topside machine, chosen in the page:
 `pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. Each
@@ -209,6 +229,71 @@ half-supported), one request per connection, CRLF line endings only, no header
 folding, a deadline on every read and write, at most 32 connections. The parsers are
 pure functions, unit-tested case by case (`tests/test_http.c`) and fuzzed with
 libFuzzer under ASan and UBSan (`make fuzz-http`; 5M inputs in two minutes, clean).
+
+## Recording
+
+Topside, from the page's **Record** button (`POST /record` with
+`{"action":"start"}` / `{"action":"stop"}`): the H.264 stream **exactly as it arrives
+over the tether**, copied into an MP4 by an ffmpeg child — no decode, no re-encode, no
+quality lost, almost no CPU. At the default 4 Mbit/s that is ~1.8 GB/hour.
+
+- **What it records.** `record_from`, the first pipeline with an `rtp:` source by
+  default. In placement B that is the pilot's picture as the ROV sent it; in placement
+  A it is the ROV's camera, *before* effects.
+- **How.** Starting attaches a local port to that pipeline's UDP relay, so the recorder
+  gets the same packets as the decoder and QGC and takes nothing from them.
+- **Fragmented MP4.** Every keyframe closes a fragment that plays on its own, so a
+  recording cut off by a crash or a power loss **plays up to its last keyframe** (tested:
+  `kill -9` mid-recording left a file that plays to within a second of the kill). An
+  earlier recorder used `+faststart` "so the file still plays if the boat loses power";
+  that does the opposite — it writes the index only at the end, so an interrupted file
+  has none.
+- **Stopping** sends ffmpeg SIGINT while packets are still flowing (it only notices the
+  signal when its next read returns) and takes about half a second.
+- **Refused** when under 500 MB is free in `record_dir`, when already recording, or
+  before the pipeline is receiving. One recording at a time.
+- **If the stream stops** (the ROV goes off), ffmpeg's RTP input gives up after ~20s,
+  the file is finalized, and the page shows the recording as stopped with the reason.
+
+The page shows elapsed time and size while recording. `eeye`'s own raw recording
+(`record_path`, full quality, before effects, enormous) is separate and still on its
+config.
+
+## ROV ↔ topside status
+
+Once a second the side with `peer` set POSTs a few lines describing itself to
+`/api/peer` on the other side, and gets the other side's lines back. Both keep what they
+received, so **`hellion top` on either machine shows the far end** — on the ROV that
+includes what the topside actually receives (bitrate and loss), which the ROV has no
+other way to know:
+
+```
+HELLION "rov"  role rov  pid 3999433  up 2m  responding
+ pipeline pilot-up  640x480
+  source bus:pilot                  running      30.0 fps      3412 frames
+  sink   rtp:192.168.2.1:5610       sending      30.0 fps      3411 frames      0 dropped  libx264 4000k
+           link out                    4066 kbit/s    0.0% loss  ...
+ peer 192.168.2.1  in contact
+   | topside (topside), pid 3999434
+   | pilot-in: rtp:5610 running 30 fps, 4036 kbit/s 0.0% loss
+   |   -> bus:pilot-top publishing 30 fps
+   | recording dive-20261101-191900.mp4, 16s, 2 MB
+```
+
+Plain text lines, not JSON: they are for people, nothing parses them, and the receiver
+keeps only printable ASCII (16 lines of 111 characters at most). `hellion check`
+warns when a configured peer has not answered for 5s, with the reason.
+
+## Child processes and crashes
+
+Every ffmpeg `hellion` runs is in its own process group, closes inherited descriptors,
+and is stopped in order (see `src/child_proc.c`). If `hellion` itself dies, its children
+do not outlive it for long: encoders read their frames from `hellion` and see EOF;
+decoders and the recorder lose their packets and ffmpeg's RTP input gives up after
+~20s (finalizing the recording). The decoder's and recorder's stderr go through
+`hellion`, which drops the H.264 parser's per-frame complaints (counted for the
+decoder, see [Decoder damage](#rtp-how-the-video-crosses-the-tether)) and logs anything
+else.
 
 ## `hellion top`
 
@@ -265,8 +350,8 @@ Degraded: see the WARN lines.
 ```
 
 Exit **0** healthy, **1** degraded (a sink waiting or failing, a stream without recent
-frames, a receiving link losing 1% or more of its packets), **2** down (no `hellion`
-responding, or a pipeline with no video at all).
+frames, a receiving link losing 1% or more of its packets, a peer not answering),
+**2** down (no `hellion` responding, or a pipeline with no video at all).
 
 ## Status file and logs
 

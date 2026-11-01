@@ -321,6 +321,9 @@ static void decoder_line(Pipeline *p, const char *line) {
     pthread_mutex_unlock(&p->lock);
     return;
   }
+  // Its ~20s no-packets timeout, already shown as "no packets" on the link.
+  if (strstr(line, "Connection timed out"))
+    return;
   if (line[0])
     printf("hellion: pipeline \"%s\": decoder: %s\n", p->cfg.name, line);
 }
@@ -513,9 +516,15 @@ static CaptureResult rtp_capture(Pipeline *p, Source *src, VideoFrame *vf) {
       continue;
     }
     if (r != CHILD_IO_TIMEOUT) {
-      printf("hellion: pipeline \"%s\": the ffmpeg decoder exited (see "
-             "log); restarting it\n",
-             p->cfg.name);
+      // ffmpeg's RTP input gives up after ~20s without packets ("Connection
+      // timed out") -- normal while the ROV is off, and restarting it is
+      // all there is to do, so that case is not worth a log line each time.
+      RelayStats rs;
+      udp_relay_stats(p->rtp_relay, &rs);
+      if (rs.idle_s >= 0 && rs.idle_s < 15.0)
+        printf("hellion: pipeline \"%s\": the ffmpeg decoder exited (see "
+               "log); restarting it\n",
+               p->cfg.name);
       return CAP_LOST;
     }
     // Nothing for a while. If packets are still arriving the decoder is
@@ -739,6 +748,19 @@ void pipeline_status(Pipeline *p, HsPipeline *out) {
     pthread_mutex_unlock(&s->lock);
   }
   pthread_mutex_unlock(&p->lock);
+}
+
+UdpRelay *pipeline_rtp_relay(Pipeline *p) {
+  if (!p)
+    return NULL;
+  pthread_mutex_lock(&p->lock);
+  UdpRelay *r = p->rtp_relay;
+  pthread_mutex_unlock(&p->lock);
+  return r;
+}
+
+const PipelineConfig *pipeline_config(const Pipeline *p) {
+  return p ? &p->cfg : NULL;
 }
 
 void pipeline_stop(Pipeline *p) {

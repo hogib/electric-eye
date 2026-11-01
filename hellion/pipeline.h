@@ -27,5 +27,12 @@ Pipeline *pipeline_start(const PipelineConfig *cfg);
 // Fills `out` for the status file, including fps since the last call.
 void pipeline_status(Pipeline *p, HsPipeline *out);
 
+// The relay an RTP source receives through (NULL for other sources, or
+// before it is set up). Valid until pipeline_stop(); the recorder attaches
+// to it.
+struct UdpRelay *pipeline_rtp_relay(Pipeline *p);
+
+const PipelineConfig *pipeline_config(const Pipeline *p);
+
 // Stops every thread and releases the source and sinks.
 void pipeline_stop(Pipeline *p);

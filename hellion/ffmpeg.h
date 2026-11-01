@@ -50,6 +50,10 @@ bool ff_available(void);
 void ff_encoder_args(const FfEncoder *e, FfArgs *a);
 void ff_decoder_args(const FfDecoder *d, FfArgs *a);
 
+// Copies an RTP stream (described by sdp_path) into a fragmented MP4 at
+// out_path, without re-encoding.
+void ff_recorder_args(const char *sdp_path, const char *out_path, FfArgs *a);
+
 // Writes an SDP describing H.264 over RTP (payload type 96, which is what
 // ffmpeg sends and QGC expects) arriving at 127.0.0.1:port.
 bool ff_write_sdp(const char *path, int port);

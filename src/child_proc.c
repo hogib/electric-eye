@@ -427,6 +427,13 @@ static void signal_child(const ChildProc *c, int sig) {
     kill(c->pid, sig);
 }
 
+bool child_signal(ChildProc *c, int sig) {
+  if (c->pid <= 0)
+    return false;
+  signal_child(c, sig);
+  return true;
+}
+
 int child_stop(ChildProc *c, int grace_ms) {
   int status = -1;
   bool had_stdin = c->in_fd >= 0;

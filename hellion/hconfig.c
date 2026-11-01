@@ -388,6 +388,8 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
   snprintf(cfg.preview, sizeof cfg.preview, "pilot");
   snprintf(cfg.snapshot_dir, sizeof cfg.snapshot_dir,
            "/var/lib/hellion/snapshots");
+  snprintf(cfg.record_dir, sizeof cfg.record_dir,
+           "/var/lib/hellion/recordings");
 
   Cursor c = {.s = buf, .len = len, .pos = 0};
   skip_ws(&c);
@@ -454,6 +456,18 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
                  "path\n");
           return false;
         }
+      } else if (strcmp(key, "record_dir") == 0) {
+        if (!parse_string(&c, cfg.record_dir, sizeof cfg.record_dir) ||
+            cfg.record_dir[0] != '/') {
+          printf("hellion config: \"record_dir\" must be an absolute path\n");
+          return false;
+        }
+      } else if (strcmp(key, "record_from") == 0) {
+        if (!parse_string(&c, cfg.record_from, sizeof cfg.record_from) ||
+            (cfg.record_from[0] && !fbus_valid_name(cfg.record_from))) {
+          printf("hellion config: \"record_from\" must be a pipeline name\n");
+          return false;
+        }
       } else if (strcmp(key, "eeye_config") == 0) {
         if (!parse_string(&c, cfg.eeye_config, sizeof cfg.eeye_config)) {
           printf("hellion config: bad \"eeye_config\"\n");
@@ -493,6 +507,24 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
                cfg.pipelines[i].name);
         return false;
       }
+  if (cfg.record_from[0]) {
+    bool found = false;
+    for (size_t i = 0; i < cfg.pipeline_count; i++)
+      if (strcmp(cfg.pipelines[i].name, cfg.record_from) == 0) {
+        found = true;
+        if (cfg.pipelines[i].source != SRC_RTP) {
+          printf("hellion config: \"record_from\": pipeline \"%s\" has no "
+                 "rtp source to record\n",
+                 cfg.record_from);
+          return false;
+        }
+      }
+    if (!found) {
+      printf("hellion config: \"record_from\": no pipeline named \"%s\"\n",
+             cfg.record_from);
+      return false;
+    }
+  }
 
   *out = cfg;
   return true;

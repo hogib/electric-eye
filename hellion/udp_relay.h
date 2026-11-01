@@ -47,6 +47,14 @@ int udp_relay_port(const UdpRelay *r);
 bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
                         size_t err_cap);
 
+// Adds a destination while packets are flowing (a recording starting).
+// Returns an id for udp_relay_detach, or -1 with *err filled.
+int udp_relay_attach(UdpRelay *r, const char *dest, char *err,
+                     size_t err_cap);
+
+// Stops forwarding to a destination added by udp_relay_attach.
+void udp_relay_detach(UdpRelay *r, int id);
+
 // Starts the forwarding thread.
 bool udp_relay_start(UdpRelay *r);
 

@@ -11,6 +11,7 @@
 #include "hlog.h"
 #include "hstatus.h"
 #include "pipeline.h"
+#include "hrecord.h"
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,11 +61,12 @@ static int run(const char *config_path) {
          cfg.pipeline_count == 1 ? "" : "s", config_path);
 
   HsWriter *status = hs_writer_open(cfg.name);
-  Control *control = control_start(&cfg);
 
   Pipeline *pipes[hcfg_max_pipelines] = {0};
   for (size_t i = 0; i < cfg.pipeline_count; i++)
     pipes[i] = pipeline_start(&cfg.pipelines[i]);
+  HRec *rec = hrec_create(&cfg, pipes, cfg.pipeline_count);
+  Control *control = control_start(&cfg, rec);
 
   // The status snapshot is big (the log alone is 10KB): static, and only
   // this thread touches it.
@@ -92,6 +94,8 @@ static int run(const char *config_path) {
                  "pipeline did not start (see log)");
       }
     }
+    hrec_summary(rec, snap.recording, sizeof snap.recording);
+    control_fill(control, &snap);
     hs_writer_publish(status, &snap);
     control_set_status(control, &snap);
 
@@ -100,9 +104,12 @@ static int run(const char *config_path) {
   }
 
   printf("hellion \"%s\" stopping\n", cfg.name);
+  // The page first (no new requests), then the recording (finalized while
+  // its pipeline still exists), then the pipelines.
+  control_stop(control);
+  hrec_destroy(rec);
   for (size_t i = 0; i < cfg.pipeline_count; i++)
     pipeline_stop(pipes[i]);
-  control_stop(control);
   hs_writer_close(status);
   printf("hellion \"%s\" stopped\n", cfg.name);
   if (capturing)

@@ -125,6 +125,7 @@ HSRC := \
 	hellion/jpeg.c \
 	hellion/main.c \
 	hellion/pipeline.c \
+	hellion/hrecord.c \
 	hellion/sinks.c \
 	hellion/top.c \
 	hellion/udp_relay.c \
@@ -199,7 +200,8 @@ test_fbus_SRC :=
 test_http_SRC :=
 test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
 	hellion/hstatus.c hellion/http.c hellion/jpeg.c hellion/udp_relay.c \
-	hellion/pipeline.c hellion/sinks.c src/camera_ctrl.c src/child_proc.c \
+	hellion/pipeline.c hellion/hrecord.c hellion/sinks.c src/camera_ctrl.c \
+	src/child_proc.c \
 	src/fbus.c src/jpeg_decode.c src/rpicam_in.c src/v4l2_in.c src/v4l2_out.c \
 	src/video_frame.c src/virtual_cam.c
 test_virtual_cam_SRC := src/child_proc.c src/v4l2_out.c src/video_frame.c

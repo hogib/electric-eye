@@ -178,6 +178,32 @@ void ff_decoder_args(const FfDecoder *d, FfArgs *a) {
   add(a, "-");
 }
 
+void ff_recorder_args(const char *sdp_path, const char *out_path, FfArgs *a) {
+  common(a, "warning");
+  add(a, "-protocol_whitelist");
+  add(a, "file,udp,rtp");
+  add(a, "-i");
+  add(a, "%s", sdp_path);
+  add(a, "-map");
+  add(a, "0:v");
+  // The tether's H.264 as it arrived: no decode, no re-encode, no quality
+  // lost, almost no CPU.
+  add(a, "-c");
+  add(a, "copy");
+  // Fragmented MP4: every keyframe closes a fragment that plays on its own.
+  // A recording cut off by a crash or a power loss plays up to its last
+  // keyframe, and stopping is instant. (+faststart, which an earlier
+  // recorder used "so the file still plays if the boat loses power", does
+  // the opposite: it writes the index only at the end, so a recording that
+  // never reaches the end has none and will not open at all.)
+  add(a, "-movflags");
+  add(a, "+frag_keyframe+empty_moov+default_base_moof");
+  add(a, "-f");
+  add(a, "mp4");
+  add(a, "-y");
+  add(a, "%s", out_path);
+}
+
 bool ff_write_sdp(const char *path, int port) {
   FILE *f = fopen(path, "we");
   if (!f)

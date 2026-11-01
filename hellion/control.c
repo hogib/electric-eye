@@ -4,6 +4,7 @@
 #include "fbus.h"
 #include "http.h"
 #include "jpeg.h"
+#include "hrecord.h"
 #include "json_out.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -32,14 +33,31 @@ static const int snapshot_quality = 92;
 static const int verdict_wait_ms = 3000;
 static const int peer_timeout_ms = 3000;
 
+// How often the side with "peer" set talks to the other side, and how
+// long it waits for an answer.
+static const int peer_period_ms = 1000;
+static const int peer_exchange_timeout_ms = 1500;
+
 struct Control {
   HellionConfig cfg;
   HttpServer *http;
+  HRec *rec;
   int previews; // atomic (see compat.h)
 
-  pthread_mutex_t lock;
-  HsStatus status; // the latest snapshot, under lock
+  pthread_mutex_t lock; // the status snapshot and the peer view
+  HsStatus status;      // the latest snapshot
   bool have_status;
+
+  // The other end of the tether as it last described itself.
+  char peer_addr[64];
+  uint64_t peer_contact_ns;
+  char peer_error[hs_detail_len];
+  uint32_t peer_line_count;
+  char peer_lines[hs_peer_lines][hs_detail_len];
+
+  pthread_t peer_thread;
+  bool peer_started;
+  bool stop; // atomic (see compat.h)
 };
 
 static uint64_t mono_ns(void) {
@@ -439,16 +457,16 @@ static void serve_health(Control *ctl, HttpConn *conn, const char *src) {
     snprintf(drone, sizeof drone, "{\"error\":\"eeye does not run here\"}");
   }
 
+  char rec[1200];
+  hrec_status_json(ctl->rec, rec, sizeof rec);
   http_respond_json(conn, 200,
                     "{\"link\":{\"stream\":\"%s\",\"connected\":%s,"
                     "\"have_frame\":%s,\"age_s\":%s,\"frames\":%llu},"
-                    "\"recorder\":{\"available\":false,\"why\":\"recording "
-                    "is not set up on this hellion\"},"
-                    "\"drone\":%s}\n",
+                    "\"recorder\":%s,\"drone\":%s}\n",
                     src, connected ? "true" : "false",
                     have_frame ? "true" : "false", age,
                     (unsigned long long)(r == FBUS_OPEN_OK ? st.frames : 0),
-                    drone);
+                    rec, drone);
 }
 
 typedef struct {
@@ -520,6 +538,155 @@ static void serve_status(Control *ctl, HttpConn *conn) {
   http_respond(conn, 200, "application/json", out, n < sizeof out ? n : 0);
 }
 
+// ---- Recording ----------------------------------------------------------------
+
+static void serve_record(Control *ctl, HttpConn *conn, const char *body) {
+  // The page sends {"action":"start"} or {"action":"stop"}.
+  bool start = body && strstr(body, "\"start\"");
+  bool stop = body && strstr(body, "\"stop\"");
+  if (start == stop) {
+    http_respond_json(conn, 400,
+                      "{\"ok\":false,\"detail\":\"action must be start or "
+                      "stop\"}\n");
+    return;
+  }
+  char detail[256], esc[512];
+  bool ok = start ? hrec_start(ctl->rec, detail, sizeof detail)
+                  : hrec_stop(ctl->rec, detail, sizeof detail);
+  json_escape(detail, esc, sizeof esc);
+  http_respond_json(conn, ok ? 200 : 409, "{\"ok\":%s,\"detail\":\"%s\"}\n",
+                    ok ? "true" : "false", esc);
+}
+
+// ---- The other end of the tether ------------------------------------------
+//
+// Once a second the side with "peer" set POSTs a few lines describing
+// itself to /api/peer on the other side, and gets the other side's lines
+// back. Both keep what they received, so `hellion top` on either machine
+// shows the far end -- on the ROV that includes what the topside actually
+// receives, which the ROV cannot otherwise know. Plain text lines, not
+// JSON: they are for people, and nothing has to parse them.
+
+// This side in a few lines, from the latest status snapshot.
+static size_t own_summary(Control *ctl, char *out, size_t cap) {
+  static __thread HsStatus s;
+  pthread_mutex_lock(&ctl->lock);
+  bool have = ctl->have_status;
+  if (have)
+    s = ctl->status;
+  pthread_mutex_unlock(&ctl->lock);
+  if (!have)
+    return (size_t)snprintf(out, cap, "%s (%s): starting\n", ctl->cfg.name,
+                            ctl->cfg.role);
+
+  size_t n = (size_t)snprintf(out, cap, "%s (%s), pid %d\n", s.name, s.role,
+                              s.pid);
+  for (uint32_t i = 0; i < s.pipeline_count && n < cap; i++) {
+    const HsPipeline *p = &s.pipelines[i];
+    for (uint32_t e = 0; e <= p->sink_count && n < cap; e++) {
+      const HsEndpoint *ep = e == 0 ? &p->source : &p->sinks[e - 1];
+      char link[64] = "";
+      if (ep->net)
+        snprintf(link, sizeof link, ", %.0f kbit/s %.1f%% loss", ep->kbps,
+                 ep->loss_pct);
+      n += (size_t)snprintf(out + n, cap - n, "%s%s %s %s %.0f fps%s\n",
+                            e == 0 ? p->name : "  ", e == 0 ? ":" : "->",
+                            ep->spec, ep->state, ep->fps, link);
+    }
+  }
+  if (s.recording[0] && n < cap)
+    n += (size_t)snprintf(out + n, cap - n, "%s\n", s.recording);
+  return n < cap ? n : cap - 1;
+}
+
+// Stores what the other side said about itself. Untrusted text: only
+// printable ASCII is kept, a line at most hs_detail_len - 1 long, at most
+// hs_peer_lines of them.
+static void store_peer_view(Control *ctl, const char *addr, const char *text,
+                            size_t len) {
+  char lines[hs_peer_lines][hs_detail_len];
+  uint32_t count = 0;
+  size_t col = 0;
+  memset(lines, 0, sizeof lines);
+  for (size_t i = 0; i < len && count < hs_peer_lines; i++) {
+    char ch = text[i];
+    if (ch == '\n') {
+      count++;
+      col = 0;
+    } else if (ch >= 0x20 && ch < 0x7f && col < hs_detail_len - 1) {
+      lines[count][col++] = ch;
+    }
+  }
+  if (col && count < hs_peer_lines)
+    count++;
+
+  pthread_mutex_lock(&ctl->lock);
+  snprintf(ctl->peer_addr, sizeof ctl->peer_addr, "%.63s", addr);
+  ctl->peer_contact_ns = mono_ns();
+  ctl->peer_error[0] = '\0';
+  memcpy(ctl->peer_lines, lines, sizeof lines);
+  ctl->peer_line_count = count;
+  pthread_mutex_unlock(&ctl->lock);
+}
+
+// POST /api/peer: the caller's lines in, ours out.
+static void serve_peer(Control *ctl, HttpConn *conn, const char *body,
+                       size_t len) {
+  if (body)
+    store_peer_view(ctl, http_client_addr(conn), body, len);
+  char out[4096];
+  size_t n = own_summary(ctl, out, sizeof out);
+  http_respond(conn, 200, "text/plain", out, n);
+}
+
+static void *peer_loop(void *arg) {
+  Control *ctl = (Control *)arg;
+  char mine[4096];
+  static __thread char theirs[8192];
+  while (!__atomic_load_n(&ctl->stop, __ATOMIC_ACQUIRE)) {
+    size_t n = own_summary(ctl, mine, sizeof mine);
+    size_t got = 0;
+    char err[200];
+    int status = http_call(ctl->cfg.peer, "POST", "/api/peer", mine, n,
+                           theirs, sizeof theirs, &got,
+                           peer_exchange_timeout_ms, err, sizeof err);
+    if (status == 200) {
+      store_peer_view(ctl, ctl->cfg.peer, theirs, got);
+    } else {
+      pthread_mutex_lock(&ctl->lock);
+      if (status > 0)
+        snprintf(ctl->peer_error, sizeof ctl->peer_error,
+                 "%.60s answered %d (an older hellion?)", ctl->cfg.peer,
+                 status);
+      else
+        snprintf(ctl->peer_error, sizeof ctl->peer_error, "%.*s",
+                 hs_detail_len - 1, err);
+      pthread_mutex_unlock(&ctl->lock);
+    }
+    for (int waited = 0; waited < peer_period_ms &&
+                         !__atomic_load_n(&ctl->stop, __ATOMIC_ACQUIRE);
+         waited += 50) {
+      struct timespec ts = {0, 50000000L};
+      nanosleep(&ts, NULL);
+    }
+  }
+  return NULL;
+}
+
+void control_fill(Control *c, HsStatus *s) {
+  if (!c)
+    return;
+  pthread_mutex_lock(&c->lock);
+  s->peer_configured = c->cfg.peer[0] != '\0';
+  snprintf(s->peer_addr, sizeof s->peer_addr, "%.63s",
+           c->peer_addr[0] ? c->peer_addr : c->cfg.peer);
+  s->peer_contact_mono_ns = c->peer_contact_ns;
+  snprintf(s->peer_error, sizeof s->peer_error, "%s", c->peer_error);
+  s->peer_line_count = c->peer_line_count;
+  memcpy(s->peer_lines, c->peer_lines, sizeof s->peer_lines);
+  pthread_mutex_unlock(&c->lock);
+}
+
 // ---- Dispatch -----------------------------------------------------------------
 
 static void handle(HttpConn *conn, const HttpRequest *req, const char *body,
@@ -550,9 +717,9 @@ static void handle(HttpConn *conn, const HttpRequest *req, const char *body,
     else
       serve_health(ctl, conn, src);
   } else if (post && strcmp(req->path, "/record") == 0) {
-    http_respond_json(conn, 409,
-                      "{\"ok\":false,\"detail\":\"recording is not set up "
-                      "on this hellion\"}\n");
+    serve_record(ctl, conn, body);
+  } else if (post && strcmp(req->path, "/api/peer") == 0) {
+    serve_peer(ctl, conn, body, len);
   } else if (get && strcmp(req->path, "/api/streams") == 0) {
     char list[4096];
     StreamList l = {list, sizeof list, 0, 0};
@@ -574,13 +741,14 @@ static void handle(HttpConn *conn, const HttpRequest *req, const char *body,
   }
 }
 
-Control *control_start(const HellionConfig *cfg) {
+Control *control_start(const HellionConfig *cfg, HRec *rec) {
   if (!cfg->control[0])
     return NULL;
   Control *ctl = (Control *)calloc(1, sizeof *ctl);
   if (!ctl)
     return NULL;
   ctl->cfg = *cfg;
+  ctl->rec = rec;
   pthread_mutex_init(&ctl->lock, NULL);
   char err[200];
   ctl->http = http_start(cfg->control, max_connections, handle, ctl, err,
@@ -594,6 +762,9 @@ Control *control_start(const HellionConfig *cfg) {
   printf("hellion: web page and API on port %d%s%s%s\n", http_port(ctl->http),
          cfg->peer[0] ? "; peer " : "", cfg->peer,
          cfg->eeye_config[0] ? "; eeye config here" : "");
+  if (cfg->peer[0])
+    ctl->peer_started =
+        pthread_create(&ctl->peer_thread, NULL, peer_loop, ctl) == 0;
   return ctl;
 }
 
@@ -609,6 +780,9 @@ void control_set_status(Control *c, const HsStatus *s) {
 void control_stop(Control *c) {
   if (!c)
     return;
+  __atomic_store_n(&c->stop, true, __ATOMIC_RELEASE);
+  if (c->peer_started)
+    pthread_join(c->peer_thread, NULL);
   http_stop(c->http);
   pthread_mutex_destroy(&c->lock);
   free(c);
