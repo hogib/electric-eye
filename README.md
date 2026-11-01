@@ -9,6 +9,12 @@ control.
 Runs on a Raspberry Pi with either a USB webcam or a Pi camera module. Nothing in
 `src/` is Pi-specific beyond `install.sh`'s package manager.
 
+Being split into two programs: `eeye`, the effects pipeline, and `hellion`, which
+moves video over the tether and has `hellion top`, a live dashboard for SSH sessions,
+and `hellion check` ([docs/hellion.md](docs/hellion.md)). They share frames through
+the frame bus ([docs/bus.md](docs/bus.md)). The Python tools described below are
+being replaced along the way.
+
 - [Quick start](#quick-start) · [Field checklist](#field-checklist) ·
   [Troubleshooting](#troubleshooting) · [Config reference](#config-reference)
 

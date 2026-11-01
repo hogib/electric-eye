@@ -26,12 +26,15 @@ PYTHON ?= python3
 ifeq ($(BUILD),debugoptimized)
 OPTFLAGS := -O2 -g
 EXE := eeye
+HEXE := hellion
 else ifeq ($(BUILD),release)
 OPTFLAGS := -O3
 EXE := eeye
+HEXE := hellion
 else ifeq ($(BUILD),debug)
 OPTFLAGS := -O0 -g
 EXE := eeye-d
+HEXE := hellion-d
 else
 $(error BUILD must be debugoptimized, release or debug, not '$(BUILD)')
 endif
@@ -106,13 +109,39 @@ SRC := \
 	src/video_threads.c \
 	src/virtual_cam.c
 
+# hellion: its own sources, plus the shared modules from src/ it reuses
+# (the frame bus, child processes, camera capture, the loopback output).
+HSRC := \
+	hellion/check.c \
+	hellion/hconfig.c \
+	hellion/hlog.c \
+	hellion/hstatus.c \
+	hellion/main.c \
+	hellion/pipeline.c \
+	hellion/sinks.c \
+	hellion/top.c \
+	src/camera_ctrl.c \
+	src/child_proc.c \
+	src/fbus.c \
+	src/jpeg_decode.c \
+	src/rpicam_in.c \
+	src/v4l2_in.c \
+	src/v4l2_out.c \
+	src/video_frame.c \
+	src/virtual_cam.c
+
 obj = $(patsubst %.c,$(OBJDIR)/%.o,$(1))
 
 .PHONY: all check clean
-all: $(BUILDDIR)/$(EXE)
+all: $(BUILDDIR)/$(EXE) $(BUILDDIR)/$(HEXE)
 
 $(BUILDDIR)/$(EXE): $(call obj,$(SRC))
 	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ $^ $(ALL_LDLIBS)
+
+$(BUILDDIR)/$(HEXE): $(call obj,$(HSRC))
+	$(CC) $(ALL_CFLAGS) $(ALL_LDFLAGS) -o $@ $^ $(ALL_LDLIBS)
+
+$(OBJDIR)/hellion/%.o: EE_CPPFLAGS += -Ihellion
 
 # -MMD -MP: each object also writes a .d file listing the headers it read,
 # included below, so editing a header rebuilds exactly what uses it.
@@ -126,7 +155,7 @@ $(OBJDIR)/%.o: %.c
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
 	canny health camera_ctrl recorder stream_server effect_chain child_proc \
-	virtual_cam fbus
+	virtual_cam fbus hellion
 
 # Extra translation units each test needs beyond the one it includes:
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
@@ -145,11 +174,15 @@ test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
 test_stream_server_SRC := src/video_frame.c
 test_child_proc_SRC :=
 test_fbus_SRC :=
+test_hellion_SRC := hellion/hconfig.c hellion/hlog.c hellion/hstatus.c \
+	hellion/pipeline.c hellion/sinks.c src/camera_ctrl.c src/child_proc.c \
+	src/fbus.c src/jpeg_decode.c src/rpicam_in.c src/v4l2_in.c src/v4l2_out.c \
+	src/video_frame.c src/virtual_cam.c
 test_virtual_cam_SRC := src/child_proc.c src/v4l2_out.c src/video_frame.c
 test_effect_chain_SRC := src/camera_ctrl.c src/config.c src/conv.c src/fbus.c \
 	src/point_opps.c src/video_frame.c
 
-$(OBJDIR)/tests/%.o: EE_CPPFLAGS += -Itests
+$(OBJDIR)/tests/%.o: EE_CPPFLAGS += -Itests -Ihellion
 
 define test_rule
 $(TESTDIR)/test_$(1): $(OBJDIR)/tests/test_$(1).o $(call obj,$(test_$(1)_SRC))

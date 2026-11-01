@@ -1,6 +1,6 @@
 # Testing
 
-17 suites, ~225 tests, run with `make check` (`-j` runs them in parallel).
+18 suites, ~235 tests, run with `make check` (`-j` runs them in parallel).
 
 ## The suites
 
@@ -20,6 +20,7 @@
 | `health` | Health file contents and escaping |
 | `child_proc` | Spawning helpers: no leaked descriptors, default signals in the child, the stdin-first stop, escalation to SIGKILL, grandchildren stopped with the group |
 | `virtual_cam` | The optional webcam output: quiet checks for a missing device, back-off for one that will not open. `EEYE_TEST_LOOPBACK=/dev/videoN` also writes to a real one |
+| `hellion` | Config parsing and errors; pipelines driven end to end over the bus (byte-exact forwarding, size changes, a failing sink not starving its neighbour, a missing source); the status file; log capture of own and child output |
 | `fbus` | Frame bus across real processes: whole frames under a writer lapping the ring (and a deterministic lap), several readers, futex wake-up, writer restart, a killed writer detected by its heartbeat, bad files |
 | `topside` | Python: link staleness, health relay, recorder |
 | `record` | Python: duration parsing, ffmpeg command construction |

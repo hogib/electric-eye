@@ -29,6 +29,7 @@ Two things shape almost every design decision in the codebase:
 | [effects.md](effects.md) | The effect chain, every operator, LUT fusion, the buffer ping-pong |
 | [output.md](output.md) | Virtual camera, preview stream, recording, health reporting |
 | [bus.md](bus.md) | The frame bus: streams between programs, its byte layout, reading it from C or Python |
+| [hellion.md](hellion.md) | The tether relay: pipelines, `hellion top`, `hellion check` |
 | [config.md](config.md) | Every config key, the hot-reload contract, the parser |
 | [topside.md](topside.md) | Web UI, config agent, network tooling, tether addressing |
 | [testing.md](testing.md) | Test suites, and the bit-exactness harness for SIMD work |
@@ -92,7 +93,11 @@ namespacing C gives you.
 | `recorder.c` | Recording tap: owns the file, on its own thread |
 | `health.c` | Runtime health snapshot for topside |
 
-Python lives outside the C build: `pi/` (drone side), `topside/`, `tools/`.
+`hellion/` is the second binary, the tether relay ([hellion.md](hellion.md)); it
+reuses the bus, capture and output modules from `src/`.
+
+Python lives outside the C build: `pi/` (drone side), `topside/`, `tools/`. It is
+being replaced by `hellion` and goes once `hellion` covers it.
 
 ## Conventions worth knowing before you edit
 
