@@ -22,7 +22,9 @@
 #   --topside-ip IP      the topside machine's address, which the ROV sends to
 #   --rov-ip IP          the ROV's, which the topside talks to
 #                        Written into /etc/hellion/hellion.json (the old one
-#                        kept as .bak) and remembered for later runs.
+#                        kept as .bak) and remembered for later runs. "auto"
+#                        un-pins a remembered one (installs before 0.3.0
+#                        pinned theirs): --topside-ip auto --rov-ip auto.
 #   --pair NAME          only pair with a hellion installed with the same NAME
 #                        (default "default"). Give each vehicle its own when
 #                        several share a network. Not a password: anyone on
@@ -82,7 +84,8 @@ while [ $# -gt 0 ]; do
     --pair=*) PAIR="${1#*=}"; shift ;;
     --reset-config) RESET_CONFIG=1; shift ;;
     --no-packages) INSTALL_PACKAGES=0; shift ;;
-    -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # The whole header comment, however long it grows.
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die "Unknown option: $1 (try --help)" ;;
   esac
 done
@@ -103,6 +106,10 @@ if [ -r "$STATE_FILE" ]; then
   [ -n "$ROV_IP" ] || ROV_IP=$(prev ROV_IP)
   [ -n "$PAIR" ] || PAIR=$(prev PAIR)
 fi
+# "auto" un-pins an address remembered from an earlier run (installs from
+# before discovery all pinned theirs): found by discovery again.
+[ "$TOPSIDE_IP" = auto ] && TOPSIDE_IP=""
+[ "$ROV_IP" = auto ] && ROV_IP=""
 # No addresses: the ends find each other (discovery). Given, they pin it.
 for ip in "$TOPSIDE_IP" "$ROV_IP"; do
   [ -z "$ip" ] && continue

@@ -81,6 +81,10 @@ trust.
 
 ### Updating, changing, removing
 
+- **Upgrading from 0.2.x to plug and play:** installs before 0.3.0 kept fixed
+  addresses. `git pull && sudo ./install.sh --topside-ip auto --rov-ip auto` on both
+  machines switches them to finding each other (or leave them pinned: that still
+  works).
 - **Update:** `git pull && sudo ./install.sh`. It remembers the role, placement and
   addresses, keeps your configs, and restarts the services on the new build.
 - **Pin or change addresses, or the pair:** re-run with `--topside-ip`/`--rov-ip` or
