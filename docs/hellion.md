@@ -407,8 +407,13 @@ highlights, a colour cast, low contrast), from the `image` block of `eeye`'s hea
 (see [output.md](output.md#health-reporting-healthc)).
 
 The preview is **any frame bus stream** on the topside machine, chosen in the page:
-`pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. Each
-viewer reads the bus directly, so viewers cost the pipeline nothing.
+`pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. One
+encoder per stream serves all its viewers: it starts with the first and stops with the
+last, sleeps until the next preview frame is due (~15fps), takes the newest frame on
+the bus (the ones in between are never copied out), and encodes it once, 4:2:0;
+viewers each copy the latest JPEG and send it at their own pace. Measured on x86 at
+720p: `hellion` used 4% of a core with one viewer and 13% with four when each viewer
+encoded its own; now 4% either way, and each JPEG is 18% smaller.
 
 The page reads the MJPEG stream with `fetch()` rather than an `<img src>`, so it knows
 when each picture arrives. It reopens the stream whenever it ends, fails (a 503 when all

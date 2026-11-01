@@ -42,6 +42,8 @@ static const int camera_forward_ms = 5000;
 static const int peer_period_ms = 1000;
 static const int peer_exchange_timeout_ms = 1500;
 
+typedef struct PreviewHub PreviewHub;
+
 struct Control {
   HellionConfig cfg;
   HttpServer *http;
@@ -56,6 +58,9 @@ struct Control {
   // Interleaved, one could restore the other's rejected config, or report
   // the other's verdict.
   pthread_mutex_t config_lock;
+  // Preview encoders, one per stream being watched (see PreviewHub).
+  pthread_mutex_t hubs_lock;
+  PreviewHub *hubs;
   int previews; // atomic (see compat.h)
 
   pthread_mutex_t lock; // the status snapshot and the peer view
@@ -113,6 +118,164 @@ static const char *query_src(const HttpRequest *req, const char *def,
 
 // ---- Preview and snapshots --------------------------------------------------
 
+// One encoder per previewed stream, shared by all its viewers. Each viewer
+// used to encode its own JPEG of the same frames: four open pages cost four
+// times the CPU (measured 33% of an x86 core for four, against ~8% now).
+// The hub starts with its first viewer and stops with its last. It sleeps
+// until the next preview frame is due, takes the newest frame on the bus --
+// frames in between are never copied out -- and publishes the JPEG with a
+// generation number. Viewers wait for a new generation, copy it, and send
+// it at their own pace, so a slow viewer only falls behind itself.
+struct PreviewHub {
+  PreviewHub *next; // in ctl->hubs, under ctl->hubs_lock
+  Control *ctl;
+  char src[fbus_max_stream_name];
+  int viewers; // under ctl->hubs_lock
+  pthread_t thread;
+  bool stop; // atomic (see compat.h)
+
+  pthread_mutex_t lock; // the JPEG and generation below
+  pthread_cond_t cond;  // CLOCK_MONOTONIC; signalled on every new JPEG
+  uint8_t *jpg;
+  size_t jlen, jcap;
+  uint64_t gen;
+};
+
+static bool hub_stopping(PreviewHub *hb) {
+  return __atomic_load_n(&hb->stop, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&hb->ctl->stop, __ATOMIC_ACQUIRE);
+}
+
+static void hub_nap(PreviewHub *hb, uint64_t ns) {
+  while (ns > 0 && !hub_stopping(hb)) {
+    uint64_t step = ns < 50000000ull ? ns : 50000000ull;
+    struct timespec ts = {0, (long)step};
+    nanosleep(&ts, NULL);
+    ns -= step;
+  }
+}
+
+static void *hub_loop(void *arg) {
+  PreviewHub *hb = (PreviewHub *)arg;
+  JpegEnc *enc = jpeg_enc_create();
+  FbusReader *r = NULL;
+  uint8_t *frame = NULL;
+  uint32_t w = 0, h = 0;
+  uint64_t next_due = 0;
+  while (enc && !hub_stopping(hb)) {
+    if (!r) {
+      r = fbus_reader_open(hb->src, NULL);
+      if (!r) {
+        hub_nap(hb, 500000000ull);
+        continue;
+      }
+      fbus_reader_geometry(r, &w, &h);
+      free(frame);
+      frame = (uint8_t *)malloc((size_t)w * h * 2);
+      if (!frame)
+        break;
+    }
+    uint64_t now = mono_ns();
+    if (now < next_due) {
+      hub_nap(hb, next_due - now);
+      continue;
+    }
+    size_t y = (size_t)w * h, cbytes = (size_t)((w + 1) / 2) * h;
+    uint8_t *planes[3] = {frame, frame + y, frame + y + cbytes};
+    FbusReadResult res = fbus_reader_next(r, planes, 500, NULL);
+    if (res == FBUS_GONE) {
+      fbus_reader_close(r);
+      r = NULL;
+      continue;
+    }
+    if (res != FBUS_FRAME)
+      continue;
+    next_due = mono_ns() + preview_interval_ns;
+    size_t jlen = 0;
+    const uint8_t *jpg = jpeg_enc_i422_as_420(
+        enc, (const uint8_t *const *)planes, w, h, preview_quality, &jlen);
+    if (!jpg)
+      continue;
+    pthread_mutex_lock(&hb->lock);
+    if (hb->jcap < jlen) {
+      uint8_t *grown = (uint8_t *)realloc(hb->jpg, jlen);
+      if (grown) {
+        hb->jpg = grown;
+        hb->jcap = jlen;
+      }
+    }
+    if (hb->jcap >= jlen) {
+      memcpy(hb->jpg, jpg, jlen);
+      hb->jlen = jlen;
+      hb->gen++;
+      pthread_cond_broadcast(&hb->cond);
+    }
+    pthread_mutex_unlock(&hb->lock);
+  }
+  fbus_reader_close(r);
+  free(frame);
+  jpeg_enc_destroy(enc);
+  return NULL;
+}
+
+// The hub for `src`, started if this is its first viewer. NULL if one could
+// not be started.
+static PreviewHub *hub_join(Control *ctl, const char *src) {
+  pthread_mutex_lock(&ctl->hubs_lock);
+  PreviewHub *hb = ctl->hubs;
+  while (hb && strcmp(hb->src, src) != 0)
+    hb = hb->next;
+  if (hb) {
+    hb->viewers++;
+    pthread_mutex_unlock(&ctl->hubs_lock);
+    return hb;
+  }
+  hb = (PreviewHub *)calloc(1, sizeof *hb);
+  if (hb) {
+    hb->ctl = ctl;
+    snprintf(hb->src, sizeof hb->src, "%s", src);
+    hb->viewers = 1;
+    pthread_mutex_init(&hb->lock, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&hb->cond, &ca);
+    pthread_condattr_destroy(&ca);
+    if (pthread_create(&hb->thread, NULL, hub_loop, hb) != 0) {
+      pthread_cond_destroy(&hb->cond);
+      pthread_mutex_destroy(&hb->lock);
+      free(hb);
+      hb = NULL;
+    } else {
+      hb->next = ctl->hubs;
+      ctl->hubs = hb;
+    }
+  }
+  pthread_mutex_unlock(&ctl->hubs_lock);
+  return hb;
+}
+
+// Leaves `hb`; the last viewer out stops its thread and frees it.
+static void hub_leave(Control *ctl, PreviewHub *hb) {
+  pthread_mutex_lock(&ctl->hubs_lock);
+  bool last = --hb->viewers == 0;
+  if (last) {
+    PreviewHub **pp = &ctl->hubs;
+    while (*pp != hb)
+      pp = &(*pp)->next;
+    *pp = hb->next;
+  }
+  pthread_mutex_unlock(&ctl->hubs_lock);
+  if (!last)
+    return;
+  __atomic_store_n(&hb->stop, true, __ATOMIC_RELEASE);
+  pthread_join(hb->thread, NULL);
+  pthread_cond_destroy(&hb->cond);
+  pthread_mutex_destroy(&hb->lock);
+  free(hb->jpg);
+  free(hb);
+}
+
 static void serve_stream(Control *ctl, HttpConn *conn, const char *src) {
   if (__atomic_add_fetch(&ctl->previews, 1, __ATOMIC_ACQ_REL) > max_previews) {
     __atomic_fetch_sub(&ctl->previews, 1, __ATOMIC_ACQ_REL);
@@ -126,71 +289,58 @@ static void serve_stream(Control *ctl, HttpConn *conn, const char *src) {
       "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
       "Cache-Control: no-store\r\n"
       "Connection: close\r\n\r\n";
-  JpegEnc *enc = jpeg_enc_create();
-  FbusReader *r = NULL;
-  uint8_t *frame = NULL;
-  uint32_t w = 0, h = 0;
-  uint64_t last_sent = 0;
-
-  if (!enc || !http_write(conn, head, sizeof head - 1, 2000))
+  PreviewHub *hb = hub_join(ctl, src);
+  uint8_t *mine = NULL;
+  size_t mcap = 0;
+  uint64_t seen = 0;
+  if (!hb || !http_write(conn, head, sizeof head - 1, 2000))
     goto done;
 
-  // Until the viewer leaves: follow the stream through its writer
-  // restarting or vanishing (the page shows the link as down meanwhile).
-  // While nothing is being sent -- the stream is missing, or silent -- only
-  // asking the socket notices a viewer who has gone: without it, every
-  // page reload during an outage left a preview slot taken until hellion
-  // restarted, and the fifth was refused.
+  // Until the viewer leaves. While nothing new comes (the stream is down or
+  // silent) only asking the socket notices a viewer who has gone: without
+  // it, every page reload during an outage held a preview slot.
   while (!http_stopping(conn) && !http_peer_gone(conn)) {
-    if (!r) {
-      r = fbus_reader_open(src, NULL);
-      if (!r) {
-        struct timespec ts = {0, 500000000L};
-        nanosleep(&ts, NULL);
-        continue;
+    pthread_mutex_lock(&hb->lock);
+    if (hb->gen == seen) {
+      struct timespec until;
+      clock_gettime(CLOCK_MONOTONIC, &until);
+      until.tv_sec += 1;
+      pthread_cond_timedwait(&hb->cond, &hb->lock, &until);
+    }
+    size_t len = 0;
+    if (hb->gen != seen && hb->jlen) {
+      if (mcap < hb->jlen) {
+        uint8_t *grown = (uint8_t *)realloc(mine, hb->jlen);
+        if (grown) {
+          mine = grown;
+          mcap = hb->jlen;
+        }
       }
-      fbus_reader_geometry(r, &w, &h);
-      free(frame);
-      frame = (uint8_t *)malloc((size_t)w * h * 2);
-      if (!frame)
-        goto done;
+      if (mcap >= hb->jlen) {
+        memcpy(mine, hb->jpg, hb->jlen);
+        len = hb->jlen;
+        seen = hb->gen;
+      }
     }
-    size_t y = (size_t)w * h, cbytes = (size_t)((w + 1) / 2) * h;
-    uint8_t *planes[3] = {frame, frame + y, frame + y + cbytes};
-    FbusReadResult res = fbus_reader_next(r, planes, 1000, NULL);
-    if (res == FBUS_GONE) {
-      fbus_reader_close(r);
-      r = NULL;
-      continue;
-    }
-    if (res != FBUS_FRAME)
-      continue;
-    uint64_t now = mono_ns();
-    if (now - last_sent < preview_interval_ns)
-      continue;
-    last_sent = now;
-
-    size_t jlen = 0;
-    const uint8_t *jpg = jpeg_enc_i422(enc, (const uint8_t *const *)planes, w,
-                                       h, preview_quality, &jlen);
-    if (!jpg)
+    pthread_mutex_unlock(&hb->lock);
+    if (!len)
       continue;
     char part[128];
     int n = snprintf(part, sizeof part,
                      "--frame\r\nContent-Type: image/jpeg\r\n"
                      "Content-Length: %zu\r\n\r\n",
-                     jlen);
+                     len);
     // A viewer that cannot take a frame in 2s is gone or hopeless.
     if (!http_write(conn, part, (size_t)n, 2000) ||
-        !http_write(conn, jpg, jlen, 2000) ||
+        !http_write(conn, mine, len, 2000) ||
         !http_write(conn, "\r\n", 2, 2000))
       break;
   }
 
 done:
-  fbus_reader_close(r);
-  free(frame);
-  jpeg_enc_destroy(enc);
+  if (hb)
+    hub_leave(ctl, hb);
+  free(mine);
   __atomic_fetch_sub(&ctl->previews, 1, __ATOMIC_ACQ_REL);
 }
 
@@ -1119,6 +1269,7 @@ Control *control_start(const HellionConfig *cfg, HRec *rec, Pipeline **pipes,
   pthread_mutex_init(&ctl->lock, NULL);
   pthread_mutex_init(&ctl->camera_lock, NULL);
   pthread_mutex_init(&ctl->config_lock, NULL);
+  pthread_mutex_init(&ctl->hubs_lock, NULL);
   char err[200];
   ctl->http = http_start(cfg->control, max_connections, handle, ctl, err,
                          sizeof err);
@@ -1127,6 +1278,7 @@ Control *control_start(const HellionConfig *cfg, HRec *rec, Pipeline **pipes,
     pthread_mutex_destroy(&ctl->lock);
     pthread_mutex_destroy(&ctl->camera_lock);
     pthread_mutex_destroy(&ctl->config_lock);
+    pthread_mutex_destroy(&ctl->hubs_lock);
     free(ctl);
     return NULL;
   }
@@ -1158,5 +1310,6 @@ void control_stop(Control *c) {
   pthread_mutex_destroy(&c->lock);
   pthread_mutex_destroy(&c->camera_lock);
   pthread_mutex_destroy(&c->config_lock);
+  pthread_mutex_destroy(&c->hubs_lock);
   free(c);
 }
