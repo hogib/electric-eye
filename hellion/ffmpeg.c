@@ -84,7 +84,9 @@ static void passthrough(FfArgs *a) {
 
 void ff_encoder_args(const FfEncoder *e, FfArgs *a) {
   common(a, "warning");
-  // Input: raw I422 from hellion, stamped at the pipeline's nominal frame
+  // Input: raw I420, limited range, from hellion (sinks.c converts it
+  // from the bus's full-range I422, cheaper than a scale filter here),
+  // stamped at the pipeline's nominal frame
   // rate. Arrival-time stamps were tried and rejected, measured with
   // ffmpeg 9 and libx264 at 640x480:
   // - wall clock at the rawvideo default time base (1/25s): arrivals 33ms
@@ -100,14 +102,14 @@ void ff_encoder_args(const FfEncoder *e, FfArgs *a) {
   add(a, "-f");
   add(a, "rawvideo");
   add(a, "-pix_fmt");
-  add(a, "yuv422p");
+  add(a, "yuv420p");
+  add(a, "-color_range");
+  add(a, "tv"); // so ffmpeg inserts no conversion of its own
   add(a, "-s");
   add(a, "%ux%u", e->width, e->height);
   add(a, "-i");
   add(a, "-");
 
-  add(a, "-vf");
-  add(a, "scale=in_range=pc:out_range=tv,format=yuv420p");
   add(a, "-c:v");
   add(a, "%s", e->encoder);
   if (strcmp(e->encoder, "libx264") == 0) {

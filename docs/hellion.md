@@ -223,9 +223,18 @@ returns (an earlier version killed it the moment packets resumed, and the pictur
 back ~8s late after a cable pull; it now returns ~1.1s after the packets do).
 
 **Colour range.** The frame bus is full range (0–255, what the effects assume); H.264
-for QGC and every player is limited (16–235). The encoder converts full→limited and
-the decoder limited→full, explicitly. The round-trip test checks it: uniform Y=40 and
-Y=200 frames come back at 40.0 and 200.0 (without the conversion, 40 comes back 28).
+for QGC and every player is limited (16–235). Sending, `hellion` converts the bus's
+full-range I422 to limited-range I420 itself (`to_i420` in `sinks.c`: fixed-point,
+vectorisable, ~0.2ms at 720p) and hands ffmpeg `yuv420p` marked `-color_range tv`, so
+ffmpeg inserts no conversion of its own. A `scale` filter in the encoder used to do it:
+measured at 720p30 on an idle x86 laptop, the encoder's CPU fell from 2.68s to 1.90s
+over the same 9s run (29%), and the pipe carries 25% fewer bytes. On a Pi, where the
+encode is slower, the share is to be measured; with a hardware encoder the conversion
+was most of what remained. The pipe to the encoder is sized to hold at most one frame
+(a larger one is a queue nobody drops from), and each frame is one write with one 2s
+timeout. Receiving, the decoder converts limited→full. The round-trip test checks the
+pair: uniform Y=40 and Y=200 frames come back at 40.0 and 200.0 (without the
+conversion, 40 comes back 28).
 
 **Late joiners.** SPS/PPS go out before every keyframe (`dump_extra`), whatever the
 encoder, so QGC opened mid-dive gets a picture within one `gop`.

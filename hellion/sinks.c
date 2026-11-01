@@ -33,6 +33,9 @@ struct SinkImpl {
   // RTP: ffmpeg encodes to a local port; the relay sends that on.
   UdpRelay *relay;
   ChildProc enc;
+  // The frame as the encoder gets it: I420, limited range (see to_i420).
+  uint8_t *i420;
+  size_t i420_bytes;
   FfEncoder enc_cfg;
   char encoder[32];
   uint64_t enc_started_ns;
@@ -67,6 +70,55 @@ static void report(SinkReport *rep, const char *state, const char *fmt, ...) {
 
 // ---- RTP ------------------------------------------------------------------
 
+// The bus frame (I422, full range) as the encoder wants it (I420, limited
+// range), converted here rather than by ffmpeg: on the encoder's input a
+// "scale" filter did the same at about 3ms of the encoder's CPU per 720p
+// frame on x86 -- 40% of the whole process with libx264, more with a
+// hardware encoder, where the conversion is most of what is left -- and
+// this costs ~0.2ms. It also sends 25% fewer bytes through the pipe.
+//
+// Full range to limited, in 16-bit fixed point: Y' = 16 + Y*219/255 and
+// C' = 128 + (C-128)*224/255, rounded, written so every term stays
+// positive (no signed shifts) and the compiler can vectorise the loops.
+// 4:2:2 to 4:2:0 averages each pair of chroma rows.
+static inline uint8_t y_to_tv(uint32_t y) {
+  return (uint8_t)((y * 56284u + 16u * 65536u + 32768u) >> 16);
+}
+static inline uint8_t c_to_tv(uint32_t c) {
+  return (uint8_t)((c * 57570u + 1019648u + 32768u) >> 16);
+}
+
+static void to_i420(const SinkFrame *f, uint32_t w, uint32_t h,
+                    uint8_t *out) {
+  uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+  const uint8_t *y = f->planes[0];
+  for (size_t i = 0, n = (size_t)w * h; i < n; i++)
+    out[i] = y_to_tv(y[i]);
+  uint8_t *dst = out + (size_t)w * h;
+  for (int p = 1; p <= 2; p++) {
+    const uint8_t *src = f->planes[p]; // cw x h
+    for (uint32_t r = 0; r < ch; r++) {
+      const uint8_t *a = src + (size_t)(2 * r) * cw;
+      const uint8_t *b = 2 * r + 1 < h ? a + cw : a;
+      for (uint32_t x = 0; x < cw; x++)
+        dst[x] = c_to_tv(((uint32_t)a[x] + b[x] + 1) >> 1);
+      dst += cw;
+    }
+  }
+}
+
+// The largest power of two not above `bytes`, between 64KB and 1MB. The
+// kernel rounds a pipe size up to a power of two, and a pipe that holds
+// more than one frame is a queue nobody drops from: a slow encoder would
+// be fed a frame behind, behind the sink's mailbox that is meant to keep
+// only the newest. (At 640x480, the old fixed 1MB held 1.7 frames.)
+static int encoder_pipe_size(size_t bytes) {
+  int size = 1 << 20;
+  while (size > (64 << 10) && (size_t)size > bytes)
+    size >>= 1;
+  return size;
+}
+
 static bool encoder_start(SinkImpl *s, SinkReport *rep) {
   FfArgs args;
   ff_encoder_args(&s->enc_cfg, &args);
@@ -74,8 +126,8 @@ static bool encoder_start(SinkImpl *s, SinkReport *rep) {
     report(rep, "error", "could not start ffmpeg (see log)");
     return false;
   }
-  // A raw 720p frame is ~1.8MB; a bigger pipe takes it in fewer writes.
-  child_set_pipe_size(s->enc.in_fd, 1 << 20);
+  // Big enough to take a frame in few writes, never more than one frame.
+  child_set_pipe_size(s->enc.in_fd, encoder_pipe_size(s->i420_bytes));
   s->enc_started_ns = mono_ns();
   printf("hellion: rtp sink %s: encoding %ux%u with %s at %uk, gop %u "
          "(ffmpeg pid %d)\n",
@@ -175,16 +227,18 @@ static bool rtp_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep) {
     }
   }
 
-  for (int p = 0; p < 3; p++) {
-    ChildIo r = child_write_all(s->enc.in_fd, f->planes[p], f->plane_bytes[p],
-                                encoder_write_timeout_ms);
-    if (r != CHILD_IO_OK) {
-      encoder_failed(s, r == CHILD_IO_EOF       ? "exited (see log)"
-                        : r == CHILD_IO_TIMEOUT ? "stopped taking frames"
-                                                : "pipe error");
-      report(rep, "waiting", "encoder restarting");
-      return false;
-    }
+  // One write for the whole frame, so one timeout: three plane writes,
+  // each with its own, took up to three times as long to notice an
+  // encoder that had stopped reading.
+  to_i420(f, s->width, s->height, s->i420);
+  ChildIo r = child_write_all(s->enc.in_fd, s->i420, s->i420_bytes,
+                              encoder_write_timeout_ms);
+  if (r != CHILD_IO_OK) {
+    encoder_failed(s, r == CHILD_IO_EOF       ? "exited (see log)"
+                      : r == CHILD_IO_TIMEOUT ? "stopped taking frames"
+                                              : "pipe error");
+    report(rep, "waiting", "encoder restarting");
+    return false;
   }
   check_rate(s, now);
   report(rep, "sending", "%s %uk%s%s", s->encoder, s->enc_cfg.bitrate_kbps,
@@ -222,7 +276,16 @@ SinkImpl *sink_impl_open(const SinkConfig *cfg, const PipelineConfig *pc,
     report(rep, "waiting", "not opened yet");
     break;
   case SINK_RTP:
+    s->i420_bytes = (size_t)width * height +
+                    2 * (size_t)((width + 1) / 2) * ((height + 1) / 2);
+    s->i420 = (uint8_t *)malloc(s->i420_bytes);
+    if (!s->i420) {
+      report(rep, "error", "out of memory");
+      free(s);
+      return NULL;
+    }
     if (!rtp_open(s, pc, rep)) {
+      free(s->i420);
       free(s);
       return NULL;
     }
@@ -281,5 +344,6 @@ void sink_impl_close(SinkImpl *s) {
     child_stop(&s->enc, 2000);
     udp_relay_close(s->relay);
   }
+  free(s->i420);
   free(s);
 }
