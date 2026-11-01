@@ -454,7 +454,9 @@ static void rechoose(Disc *d, uint64_t now) {
 }
 
 static void receive(Disc *d, int fd) {
-  for (;;) {
+  // Bounded: a flood on the port (anything on the network can send to it)
+  // must not keep this thread here, unable to announce or re-choose.
+  for (int i = 0; i < 64; i++) {
     char buf[disc_beacon_max + 2];
     struct sockaddr_storage from;
     socklen_t fl = sizeof from;
