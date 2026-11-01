@@ -101,10 +101,14 @@ output row is written as soon as its five inputs exist, instead of writing the w
 horizontal result to memory and reading it back. All planes and passes of one
 `gaussian_blur` run inside a single `#pragma omp parallel`, where the old structure
 opened a region per horizontal pass and per vertical pass for each plane (six for the
-default chain). Repeated passes blur in place: each thread first blurs the two rows on
-either side of its band, a barrier lets everyone start writing, and from then on a
-thread only reads rows inside its own band that it has not yet written. The arithmetic
-is unchanged, so the result is bit-identical.
+default chain). Repeated passes alternate between the destination and a scratch plane
+(full- or half-resolution), ordered so the last one writes the destination: a pass
+between two different buffers needs one team barrier, where a pass in place needs two
+(each thread first blurs the rows on either side of its band, a barrier, then it only
+reads rows inside its own band it has not yet written — still how a pass with no
+scratch runs). Fewer barriers matter beyond their own cost: each makes every thread
+wait for the slowest. At 720p on 4 x86 threads, strength 8 went 1.06–1.15→0.84ms and
+strength 20 2.07–2.11→1.56ms; byte-identical (294 cases, x86 and both ARMs).
 
 The horizontal NEON loop loads 16 pixels' 5-tap window with two loads and `vextq_u8`
 instead of five overlapping loads.

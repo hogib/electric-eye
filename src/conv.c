@@ -400,6 +400,12 @@ static uint8_t *blur_rows;    // team_size * blur_rows_per_thread rows
 static size_t blur_rows_cap;
 static uint8_t *halfres_scratch;  // one half-resolution plane
 static size_t halfres_scratch_cap;
+// Ping-pong partners for repeated passes (see blur_plane_repeated_team):
+// one full plane (luma-sized, so chroma fits), one half-resolution plane.
+static uint8_t *pingpong_scratch;
+static size_t pingpong_scratch_cap;
+static uint8_t *halfres_pingpong;
+static size_t halfres_pingpong_cap;
 static uint8_t *upsample_scratch; // full width x half height
 static size_t upsample_scratch_cap;
 
@@ -461,7 +467,8 @@ static inline uint32_t clamp_row(int64_t r, uint32_t height) {
 //    has been overwritten yet.
 //  - After the second: the next pass, or the caller, may read any row.
 static void blur_plane_team(const uint8_t *src, uint8_t *dst, uint32_t width,
-                            uint32_t height, size_t stride, uint8_t *rows) {
+                            uint32_t height, size_t stride, uint8_t *rows,
+                            bool in_place) {
   const uint32_t nt = (uint32_t)team_size();
   const uint32_t t = (uint32_t)team_index();
   const uint32_t y0 = (uint32_t)((uint64_t)height * t / nt);
@@ -477,7 +484,11 @@ static void blur_plane_team(const uint8_t *src, uint8_t *dst, uint32_t width,
       blur_row_h(src + (size_t)r * stride, below + (size_t)(r - y1) * width,
                  width);
   }
+  // Only needed in place: with src and dst apart, nobody writes what the
+  // others read.
+  if (in_place) {
 #pragma omp barrier
+  }
 
   uint32_t next = y0; // next own row still to blur horizontally
   for (uint32_t y = y0; y < y1; ++y) {
@@ -497,16 +508,31 @@ static void blur_plane_team(const uint8_t *src, uint8_t *dst, uint32_t width,
 #pragma omp barrier
 }
 
-// `passes` repetitions of blur_plane_team(). The first pass reads src
-// (untouched by this function) into dst; every pass after that blurs dst
-// in place -- see blur_plane_team for why that is safe.
+// `passes` repetitions of blur_plane_team(), from src (untouched unless it
+// is dst) into dst. With a `scratch` plane of dst's size, the passes
+// alternate between dst and scratch, ordered so the last one writes dst:
+// a pass between two different buffers needs one team barrier, where a
+// pass in place needs two -- at blur strength 20 on three planes, 60
+// barriers fewer per frame. Without scratch, every pass after the first
+// blurs dst in place (see blur_plane_team for why that is safe). The
+// arithmetic is the same either way, so is every output byte.
 static void blur_plane_repeated_team(const uint8_t *src, uint8_t *dst,
                                      uint32_t width, uint32_t height,
                                      size_t stride, uint32_t passes,
-                                     uint8_t *rows) {
-  blur_plane_team(src, dst, width, height, stride, rows);
-  for (uint32_t p = 1; p < passes; ++p)
-    blur_plane_team(dst, dst, width, height, stride, rows);
+                                     uint8_t *rows, uint8_t *scratch) {
+  if (!scratch) {
+    blur_plane_team(src, dst, width, height, stride, rows, src == dst);
+    for (uint32_t p = 1; p < passes; ++p)
+      blur_plane_team(dst, dst, width, height, stride, rows, true);
+    return;
+  }
+  const uint8_t *from = src;
+  for (uint32_t p = 1; p <= passes; ++p) {
+    // Pass p of `passes` writes dst when passes - p is even.
+    uint8_t *to = ((passes - p) % 2 == 0) ? dst : scratch;
+    blur_plane_team(from, to, width, height, stride, rows, from == to);
+    from = to;
+  }
 }
 
 // --- Half-resolution fast path for higher blur_strength values --------
@@ -656,7 +682,8 @@ static void blur_plane_auto_team(const uint8_t *src, uint8_t *dst,
                                  size_t stride, uint32_t passes, bool halfres,
                                  uint8_t *rows) {
   if (!halfres) {
-    blur_plane_repeated_team(src, dst, width, height, stride, passes, rows);
+    blur_plane_repeated_team(src, dst, width, height, stride, passes, rows,
+                             passes > 1 ? pingpong_scratch : NULL);
     return;
   }
   uint32_t half_w = width / 2, half_h = height / 2;
@@ -664,7 +691,7 @@ static void blur_plane_auto_team(const uint8_t *src, uint8_t *dst,
   // halfres_scratch is tightly packed, so its own stride is half_w, and
   // blurring it in place is the same aliasing pass 2+ always relies on.
   blur_plane_repeated_team(halfres_scratch, halfres_scratch, half_w, half_h,
-                           half_w, passes, rows);
+                           half_w, passes, rows, halfres_pingpong);
   upsample_bilinear2x_team(halfres_scratch, half_w, half_h, dst, width, height,
                            stride);
 }
@@ -681,8 +708,16 @@ static bool blur_prepare(uint32_t width, uint32_t height, bool halfres) {
   if (halfres &&
       (!grow(&halfres_scratch, &halfres_scratch_cap,
              (size_t)(width / 2) * (height / 2)) ||
+       !grow(&halfres_pingpong, &halfres_pingpong_cap,
+             (size_t)(width / 2) * (height / 2)) ||
        !grow(&upsample_scratch, &upsample_scratch_cap,
              (size_t)width * (height / 2))))
+    return false;
+  // Full-resolution repeated passes ping-pong through this; luma-sized
+  // (stride == width for every plane a frame has), so chroma fits too.
+  // Grown even when luma goes half-resolution: a plane too small for the
+  // half-resolution path (chroma 1px wide) still takes the full one.
+  if (!grow(&pingpong_scratch, &pingpong_scratch_cap, (size_t)width * height))
     return false;
   return true;
 }
@@ -734,7 +769,8 @@ static bool blur_luma_into(const uint8_t *src, uint8_t *dst, uint32_t width,
   {
     uint8_t *rows = blur_rows + (size_t)team_index() * blur_rows_per_thread *
                                     (size_t)width;
-    blur_plane_repeated_team(src, dst, width, height, stride, passes, rows);
+    blur_plane_repeated_team(src, dst, width, height, stride, passes, rows,
+                             passes > 1 ? pingpong_scratch : NULL);
   }
   return true;
 }
