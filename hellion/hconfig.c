@@ -392,6 +392,8 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
            "/var/lib/hellion/recordings");
   snprintf(cfg.camera_file, sizeof cfg.camera_file,
            "/var/lib/hellion/camera.json");
+  cfg.discovery = true;
+  snprintf(cfg.pair, sizeof cfg.pair, "default");
 
   Cursor c = {.s = buf, .len = len, .pos = 0};
   skip_ws(&c);
@@ -440,9 +442,31 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
         }
       } else if (strcmp(key, "peer") == 0) {
         if (!parse_string(&c, cfg.peer, sizeof cfg.peer) ||
-            (cfg.peer[0] && !valid_host_port(cfg.peer))) {
+            (cfg.peer[0] && strcmp(cfg.peer, "auto") != 0 &&
+             !valid_host_port(cfg.peer))) {
           printf("hellion config: \"peer\" must be \"host:port\" (the "
-                 "other hellion's \"control\"), or \"\"\n");
+                 "other hellion's \"control\"), \"auto\" (found on the "
+                 "network), or \"\"\n");
+          return false;
+        }
+      } else if (strcmp(key, "discovery") == 0) {
+        if (!parse_bool(&c, &cfg.discovery)) {
+          printf("hellion config: \"discovery\" must be true or false\n");
+          return false;
+        }
+      } else if (strcmp(key, "pair") == 0) {
+        if (!parse_string(&c, cfg.pair, sizeof cfg.pair) ||
+            !fbus_valid_name(cfg.pair)) {
+          printf("hellion config: \"pair\" must be a name (letters, "
+                 "digits, '-' and '_')\n");
+          return false;
+        }
+      } else if (strcmp(key, "placement") == 0) {
+        if (!parse_string(&c, cfg.placement, sizeof cfg.placement) ||
+            (cfg.placement[0] && strcmp(cfg.placement, "a") != 0 &&
+             strcmp(cfg.placement, "b") != 0)) {
+          printf("hellion config: \"placement\" must be \"a\", \"b\" or "
+                 "\"\"\n");
           return false;
         }
       } else if (strcmp(key, "preview") == 0) {
@@ -541,6 +565,15 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
     }
   }
 
+  bool any_auto = hcfg_peer_is_auto(&cfg);
+  for (size_t i = 0; i < cfg.pipeline_count; i++)
+    for (size_t j = 0; j < cfg.pipelines[i].sink_count; j++)
+      any_auto |= hcfg_sink_is_auto(&cfg.pipelines[i].sinks[j]);
+  if (any_auto && !cfg.discovery) {
+    printf("hellion config: \"auto\" addresses need \"discovery\": true\n");
+    return false;
+  }
+
   if (strcmp(cfg.camera_controls, "peer") == 0 && !cfg.peer[0]) {
     printf("hellion config: \"camera_controls\": \"peer\" needs \"peer\" "
            "set\n");
@@ -549,6 +582,14 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
 
   *out = cfg;
   return true;
+}
+
+bool hcfg_sink_is_auto(const SinkConfig *s) {
+  return s->kind == SINK_RTP && strncmp(s->arg, "auto:", 5) == 0;
+}
+
+bool hcfg_peer_is_auto(const HellionConfig *c) {
+  return strcmp(c->peer, "auto") == 0;
 }
 
 bool hconfig_load(const char *path, HellionConfig *out) {

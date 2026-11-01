@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "sinks.h"
+#include "discovery.h"
 #include "child_proc.h"
 #include "fbus.h"
 #include "ffmpeg.h"
@@ -32,6 +33,12 @@ struct SinkImpl {
 
   // RTP: ffmpeg encodes to a local port; the relay sends that on.
   UdpRelay *relay;
+  // "rtp:auto:<port>": the destination is whichever topside discovery
+  // finds, re-targeted live (dest_id is its relay slot, -1 for none).
+  bool auto_dest;
+  int auto_port;
+  int dest_id;
+  char dest_now[hcfg_max_spec];
   ChildProc enc;
   // The frame as the encoder gets it: I420, limited range (see to_i420).
   uint8_t *i420;
@@ -190,8 +197,15 @@ static bool rtp_open(SinkImpl *s, const PipelineConfig *pc, SinkReport *rep) {
     return false;
   }
   char err[160];
+  s->auto_dest = strncmp(s->arg, "auto:", 5) == 0; // see hcfg_sink_is_auto
+  s->auto_port = s->auto_dest ? atoi(s->arg + 5) : 0;
+  s->dest_id = -1;
   s->relay = udp_relay_open("127.0.0.1:0", err, sizeof err);
-  if (!s->relay || !udp_relay_add_dest(s->relay, s->arg, err, sizeof err) ||
+  // An auto destination is attached when discovery finds one (see
+  // retarget); the encoder does not start before that.
+  if (!s->relay ||
+      (!s->auto_dest &&
+       !udp_relay_add_dest(s->relay, s->arg, err, sizeof err)) ||
       !udp_relay_start(s->relay)) {
     printf("hellion: rtp sink %s: %s\n", s->arg, err);
     report(rep, "error", "%s", err);
@@ -213,7 +227,49 @@ static bool rtp_open(SinkImpl *s, const PipelineConfig *pc, SinkReport *rep) {
   return true;
 }
 
+// "rtp:auto:<port>": follows discovery's choice of topside. False (with
+// the reason reported) while there is none: frames are not encoded then.
+static bool retarget(SinkImpl *s, SinkReport *rep) {
+  char target[hcfg_max_spec];
+  if (!disc_peer_hostport(s->auto_port, target, sizeof target)) {
+    if (s->dest_id >= 0) {
+      printf("hellion: rtp sink %s: lost the topside (%s); not sending\n",
+             s->arg, s->dest_now);
+      udp_relay_detach(s->relay, s->dest_id);
+      s->dest_id = -1;
+      s->dest_now[0] = '\0';
+    }
+    DiscView v;
+    disc_view(&v);
+    report(rep, "waiting", "no topside: %.90s",
+           v.state == DISC_OFF ? "discovery is not running" : v.detail);
+    return false;
+  }
+  if (strcmp(target, s->dest_now) != 0) {
+    char err[160];
+    if (s->dest_id >= 0)
+      udp_relay_detach(s->relay, s->dest_id);
+    s->dest_id = udp_relay_attach(s->relay, target, err, sizeof err);
+    if (s->dest_id < 0) {
+      s->dest_now[0] = '\0';
+      report(rep, "error", "%.100s", err);
+      return false;
+    }
+    snprintf(s->dest_now, sizeof s->dest_now, "%s", target);
+    DiscView v;
+    disc_view(&v);
+    printf("hellion: rtp sink %s: sending to %s (topside \"%s\"%s)\n",
+           s->arg, target, v.peer.name,
+           v.peer.tether && v.peer.tether != s->auto_port
+               ? ", which says it receives on another port"
+               : "");
+  }
+  return true;
+}
+
 static bool rtp_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep) {
+  if (s->auto_dest && !retarget(s, rep))
+    return false;
   uint64_t now = mono_ns();
   if (s->enc.pid <= 0) {
     if (now < s->next_start_ns) {
@@ -241,7 +297,9 @@ static bool rtp_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep) {
     return false;
   }
   check_rate(s, now);
-  report(rep, "sending", "%s %uk%s%s", s->encoder, s->enc_cfg.bitrate_kbps,
+  report(rep, "sending", "%s %uk%s%s%s%s", s->encoder,
+         s->enc_cfg.bitrate_kbps, s->auto_dest ? " to " : "",
+         s->auto_dest ? s->dest_now : "",
          s->restarts ? ", encoder restarted" : "",
          s->warned_rate ? ", framerate mismatch (see log)" : "");
   return true;

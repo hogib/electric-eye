@@ -35,6 +35,7 @@
  *   sinks    "bus:<stream>"   publish to the frame bus
  *            "v4l2:<device>"  a v4l2loopback device (optional, retried)
  *            "rtp:<host>:<port>"  encode to H.264, send over RTP
+ *            "rtp:auto:<port>"    the same, to the topside discovery finds
  * Camera and RTP sources take "width"/"height" (default 1280x720; an RTP
  * source scales what it decodes to that) and camera sources "format"
  * ("auto", "mjpeg", "yuyv"; "yuv420" for rpicam). An RTP source takes
@@ -123,9 +124,23 @@ typedef struct {
   // sent, so a restart puts them back (default
   // /var/lib/hellion/camera.json).
   char camera_file[256];
+  // Plug and play (discovery.h). "discovery" (default true) announces this
+  // hellion on the local network and listens for the others; "peer":
+  // "auto" and RTP sinks to "rtp:auto:<port>" use what it finds. "pair"
+  // (default "default") must match the other end's; "placement" ("a",
+  // "b", or "" unknown) is announced, and a peer of the other placement is
+  // refused.
+  bool discovery;
+  char pair[hcfg_max_name];
+  char placement[2];
   size_t pipeline_count;
   PipelineConfig pipelines[hcfg_max_pipelines];
 } HellionConfig;
+
+// Whether a sink sends to the discovered topside ("rtp:auto:<port>"), and
+// "peer": "auto".
+bool hcfg_sink_is_auto(const SinkConfig *s);
+bool hcfg_peer_is_auto(const HellionConfig *c);
 
 // Parses `buf`. On failure prints why and returns false.
 bool hconfig_parse(const char *buf, size_t len, HellionConfig *out);

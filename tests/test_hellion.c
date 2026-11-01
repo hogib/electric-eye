@@ -3,6 +3,7 @@
 // the log capture. Streams live in a private EEYE_BUS_DIR.
 #define _POSIX_C_SOURCE 200809L
 #include "child_proc.h"
+#include "discovery.h"
 #include "ffmpeg.h"
 #include "fbus.h"
 #include "hconfig.h"
@@ -901,6 +902,240 @@ static void remove_dir(const char *dir) {
   rmdir(dir);
 }
 
+// ---- Discovery ----------------------------------------------------------------
+
+static Beacon beacon(const char *role, const char *name, const char *pair,
+                     char placement, uint32_t id) {
+  Beacon b;
+  memset(&b, 0, sizeof b);
+  snprintf(b.role, sizeof b.role, "%s", role);
+  snprintf(b.name, sizeof b.name, "%s", name);
+  snprintf(b.pair, sizeof b.pair, "%s", pair);
+  b.placement = placement;
+  b.control = 8091;
+  b.tether = 0;
+  b.id = id;
+  return b;
+}
+
+// A beacon reads back as written; anything that is not a well-formed
+// version-1 beacon is refused, and keys from a later version are ignored.
+static void test_discovery_beacons(void) {
+  Beacon a = beacon("rov", "rov-1", "dive_team", 'b', 0x1a2b3c4d), b;
+  char text[300];
+  CHECK(disc_beacon_format(&a, text, sizeof text));
+  CHECK(strcmp(text, "HELLION/1 role=rov name=rov-1 pair=dive_team "
+                     "placement=b control=8091 tether=0 id=1a2b3c4d") == 0);
+  CHECK(disc_beacon_parse(text, strlen(text), &b));
+  CHECK(strcmp(b.role, "rov") == 0 && strcmp(b.name, "rov-1") == 0);
+  CHECK(strcmp(b.pair, "dive_team") == 0 && b.placement == 'b');
+  CHECK(b.control == 8091 && b.tether == 0 && b.id == 0x1a2b3c4d);
+
+  const char *ok[] = {
+      "HELLION/1 role=topside pair=default id=00000001\n", // minimal, newline
+      "HELLION/1 role=rov pair=p id=ffffffff later=1 x=y", // unknown keys
+  };
+  for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++)
+    CHECK(disc_beacon_parse(ok[i], strlen(ok[i]), &b));
+  CHECK(b.placement == '?' && b.name[0] == '\0' && b.id == 0xffffffffu);
+
+  const char *bad[] = {
+      "",
+      "HELLION/2 role=rov pair=p id=00000001",      // a different version
+      "HELLION/10 role=rov pair=p id=00000001",
+      "HELLO role=rov pair=p id=00000001",
+      "HELLION/1 pair=p id=00000001",               // no role
+      "HELLION/1 role=rov id=00000001",             // no pair
+      "HELLION/1 role=rov pair=p",                  // no id
+      "HELLION/1 role=boat pair=p id=00000001",     // bad role
+      "HELLION/1 role=rov pair=p id=123",           // id not 8 hex digits
+      "HELLION/1 role=rov pair=p id=0000000g",
+      "HELLION/1 role=rov pair=a.b id=00000001",    // bad name characters
+      "HELLION/1 role=rov pair=p control=70000 id=00000001",
+      "HELLION/1 role=rov pair=p placement=c id=00000001",
+      "HELLION/1 role=rov pair=p\x01 id=00000001",  // control byte
+  };
+  for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+    bool parsed = disc_beacon_parse(bad[i], strlen(bad[i]), &b);
+    if (parsed)
+      printf("    accepted: \"%s\"\n", bad[i]);
+    CHECK(!parsed);
+  }
+  // Oversize: a valid beacon padded past disc_beacon_max.
+  char big[400];
+  memset(big, 'x', sizeof big);
+  memcpy(big, "HELLION/1 role=rov pair=p id=00000001 pad=", 42);
+  big[sizeof big - 1] = '\0';
+  CHECK(!disc_beacon_parse(big, strlen(big), &b));
+}
+
+static Candidate cand(Beacon b, const char *v4, uint64_t seen4,
+                      const char *v6, uint64_t seen6) {
+  Candidate c;
+  memset(&c, 0, sizeof c);
+  c.b = b;
+  snprintf(c.addr4, sizeof c.addr4, "%s", v4);
+  snprintf(c.addr6, sizeof c.addr6, "%s", v6);
+  c.seen4_ns = seen4;
+  c.seen6_ns = seen6;
+  c.seen_ns = seen4 > seen6 ? seen4 : seen6;
+  return c;
+}
+
+// Choosing: the one matching hellion; never a guess between two; nothing
+// stale, of our own role, another pair or another placement.
+static void test_discovery_choice(void) {
+  const uint64_t s = 1000000000ull, now = 100 * s;
+  DiscWant rov = {"rov", "default", 'b'};
+  Beacon top1 = beacon("topside", "top-1", "default", 'b', 1);
+  Beacon top2 = beacon("topside", "top-2", "default", '?', 2);
+  DiscView v;
+
+  Candidate one[] = {cand(top1, "192.168.2.1", now - s, "", 0)};
+  memset(&v, 0, sizeof v);
+  disc_choose(one, 1, &rov, now, &v);
+  CHECK_EQ_INT(v.state, DISC_FOUND);
+  CHECK(strcmp(v.addr, "192.168.2.1") == 0 && v.peer.id == 1);
+
+  // IPv4 preferred while it is fresh; IPv6 link-local once it is not.
+  Candidate both[] = {cand(top1, "192.168.2.1", now - s, "fe80::1%eth0",
+                           now - s)};
+  disc_choose(both, 1, &rov, now, &v);
+  CHECK(strcmp(v.addr, "192.168.2.1") == 0);
+  both[0].seen4_ns = now - 9 * s;
+  disc_choose(both, 1, &rov, now, &v);
+  CHECK(strcmp(v.addr, "fe80::1%eth0") == 0);
+
+  // Two answering the same pair: refused, and the status says what to do.
+  Candidate two[] = {cand(top1, "192.168.1.10", now - s, "", 0),
+                     cand(top2, "192.168.1.11", now - s, "", 0)};
+  disc_choose(two, 2, &rov, now, &v);
+  CHECK_EQ_INT(v.state, DISC_AMBIGUOUS);
+  CHECK(strstr(v.detail, "2 topsides answer pair \"default\"") != NULL);
+  CHECK(strstr(v.detail, "192.168.1.10") && strstr(v.detail, "192.168.1.11"));
+  CHECK(strstr(v.detail, "--pair") != NULL);
+  // ...unless one of them has gone quiet for longer than the timeout.
+  two[1].seen4_ns = two[1].seen_ns = now - 6 * s;
+  disc_choose(two, 2, &rov, now, &v);
+  CHECK_EQ_INT(v.state, DISC_FOUND);
+  CHECK(v.peer.id == 1);
+
+  // Stale, own role, other pair, other placement: none chosen, and why.
+  Candidate none[] = {
+      cand(top1, "10.0.0.1", now - 6 * s, "", 0),
+      cand(beacon("rov", "rov-2", "default", 'b', 3), "10.0.0.2", now, "", 0),
+      cand(beacon("topside", "t", "other", 'b', 4), "10.0.0.3", now, "", 0),
+      cand(beacon("topside", "t", "default", 'a', 5), "10.0.0.4", now, "", 0),
+  };
+  disc_choose(none, 4, &rov, now, &v);
+  CHECK_EQ_INT(v.state, DISC_SEARCHING);
+  CHECK(strstr(v.detail, "10.0.0.3 has pair \"other\"") != NULL);
+  CHECK(strstr(v.detail, "10.0.0.4 is placement a") != NULL);
+  CHECK(strstr(v.detail, "10.0.0.1") == NULL); // stale: not even listed
+
+  disc_choose(NULL, 0, &rov, now, &v);
+  CHECK_EQ_INT(v.state, DISC_SEARCHING);
+  CHECK(strstr(v.detail, "no topside heard") != NULL);
+
+  // Unknown placement on either side does not refuse.
+  DiscWant anyp = {"rov", "default", '?'};
+  Candidate a_top[] = {cand(beacon("topside", "t", "default", 'a', 6),
+                            "10.0.0.5", now, "", 0)};
+  disc_choose(a_top, 1, &anyp, now, &v);
+  CHECK_EQ_INT(v.state, DISC_FOUND);
+}
+
+static void test_config_discovery(void) {
+  HellionConfig c;
+  const char *pipe = "\"pipelines\":[{\"name\":\"p\",\"source\":\"bus:a\","
+                     "\"sinks\":[\"rtp:auto:5610\"]}]";
+  char json[512];
+  snprintf(json, sizeof json, "{%s}", pipe);
+  CHECK(parse(json, &c));
+  CHECK(c.discovery && strcmp(c.pair, "default") == 0 && !c.placement[0]);
+  CHECK(hcfg_sink_is_auto(&c.pipelines[0].sinks[0]));
+  CHECK(!hcfg_peer_is_auto(&c));
+  snprintf(json, sizeof json,
+           "{\"peer\":\"auto\",\"pair\":\"team-2\",\"placement\":\"b\",%s}",
+           pipe);
+  CHECK(parse(json, &c));
+  CHECK(hcfg_peer_is_auto(&c) && strcmp(c.pair, "team-2") == 0);
+  CHECK(strcmp(c.placement, "b") == 0);
+  snprintf(json, sizeof json, "{\"discovery\":false,%s}", pipe);
+  CHECK(!parse(json, &c)); // an auto sink with nothing to find it
+  snprintf(json, sizeof json, "{\"pair\":\"a b\",%s}", pipe);
+  CHECK(!parse(json, &c));
+  snprintf(json, sizeof json, "{\"placement\":\"c\",%s}", pipe);
+  CHECK(!parse(json, &c));
+  snprintf(json, sizeof json, "{\"peer\":\"automatic\",%s}", pipe);
+  CHECK(!parse(json, &c));
+}
+
+// Two processes find each other: a "topside" child and this process as
+// the "rov", each sending its beacons to the other's port (broadcast does
+// not work on loopback, hence the test-only unicast override). The rov
+// picks the topside, then drops it once it has been silent 5s.
+static void test_discovery_two_processes(void) {
+  int pa = 0, pb = 0;
+  int fa = udp_listener(&pa), fb = udp_listener(&pb); // two free ports
+  close(fa);
+  close(fb);
+  char to[64];
+  pid_t child = fork();
+  if (child == 0) {
+    snprintf(to, sizeof to, "%d", pa);
+    setenv("HELLION_DISCOVERY_PORT", to, 1);
+    snprintf(to, sizeof to, "127.0.0.1:%d", pb);
+    setenv("HELLION_DISCOVERY_TO", to, 1);
+    DiscConfig dc;
+    memset(&dc, 0, sizeof dc);
+    dc.self = beacon("topside", "test-top", "default", 'b', 0);
+    dc.self.control = 18080;
+    dc.self.tether = 18610;
+    if (!disc_start(&dc))
+      _exit(1);
+    for (;;)
+      pause();
+  }
+  snprintf(to, sizeof to, "%d", pb);
+  setenv("HELLION_DISCOVERY_PORT", to, 1);
+  snprintf(to, sizeof to, "127.0.0.1:%d", pa);
+  setenv("HELLION_DISCOVERY_TO", to, 1);
+  DiscConfig dc;
+  memset(&dc, 0, sizeof dc);
+  dc.self = beacon("rov", "test-rov", "default", 'b', 0);
+  CHECK(disc_start(&dc));
+
+  DiscView v;
+  memset(&v, 0, sizeof v);
+  for (int i = 0; i < 40 && v.state != DISC_FOUND; i++) {
+    sleep_ms(100);
+    disc_view(&v);
+  }
+  CHECK_EQ_INT(v.state, DISC_FOUND);
+  CHECK(strcmp(v.addr, "127.0.0.1") == 0);
+  CHECK(strcmp(v.peer.name, "test-top") == 0 && v.peer.tether == 18610);
+  char hp[128];
+  CHECK(disc_peer_hostport(0, hp, sizeof hp) &&
+        strcmp(hp, "127.0.0.1:18080") == 0);
+  CHECK(disc_peer_hostport(5610, hp, sizeof hp) &&
+        strcmp(hp, "127.0.0.1:5610") == 0);
+
+  kill(child, SIGKILL);
+  waitpid(child, NULL, 0);
+  for (int i = 0; i < 80 && v.state == DISC_FOUND; i++) {
+    sleep_ms(100);
+    disc_view(&v);
+  }
+  CHECK_EQ_INT(v.state, DISC_SEARCHING);
+  CHECK(!disc_peer_hostport(0, hp, sizeof hp));
+  disc_stop();
+  disc_view(&v);
+  CHECK_EQ_INT(v.state, DISC_OFF);
+  unsetenv("HELLION_DISCOVERY_PORT");
+  unsetenv("HELLION_DISCOVERY_TO");
+}
+
 int main(void) {
   snprintf(bus_dir, sizeof bus_dir, "/dev/shm/eeye-test-hellion-XXXXXX");
   if (!mkdtemp(bus_dir)) {
@@ -919,6 +1154,10 @@ int main(void) {
   RUN_TEST(test_pipeline_waits_for_missing_source);
   RUN_TEST(test_config_rtp);
   RUN_TEST(test_config_camera);
+  RUN_TEST(test_config_discovery);
+  RUN_TEST(test_discovery_beacons);
+  RUN_TEST(test_discovery_choice);
+  RUN_TEST(test_discovery_two_processes);
   RUN_TEST(test_example_configs_load);
   RUN_TEST(test_udp_relay);
   RUN_TEST(test_udp_relay_frame_ends);

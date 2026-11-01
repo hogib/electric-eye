@@ -140,6 +140,7 @@ SRC := \
 HSRC := \
 	hellion/check.c \
 	hellion/control.c \
+	hellion/discovery.c \
 	hellion/ffmpeg.c \
 	hellion/hconfig.c \
 	hellion/hlog.c \
@@ -221,7 +222,7 @@ test_child_proc_SRC :=
 test_fbus_SRC :=
 test_http_SRC :=
 test_auto_vis_SRC := src/img_stats.c
-test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
+test_hellion_SRC := hellion/discovery.c hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
 	hellion/hstatus.c hellion/http.c hellion/jpeg.c hellion/udp_relay.c \
 	hellion/pipeline.c hellion/hrecord.c hellion/sinks.c src/camera_ctrl.c \
 	src/child_proc.c \

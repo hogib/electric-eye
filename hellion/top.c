@@ -412,6 +412,21 @@ static void draw_instance(const HsStatus *s) {
       line_end();
     }
   }
+  // Discovery: what it found, or why nothing. Amber when this hellion
+  // depends on it (an "auto" peer or sink) and has nothing; red when it
+  // refused to choose between several.
+  if (s->discovery[0]) {
+    Color c = C_DIM;
+    if (s->discovery_state == 2) // DISC_FOUND
+      c = C_OK;
+    else if (s->discovery_state == 3) // DISC_AMBIGUOUS
+      c = C_BAD;
+    else if (s->discovery_needed)
+      c = C_WARN;
+    seg(C_HEAD, " discovery");
+    seg(c, " %s", s->discovery);
+    line_end();
+  }
 }
 
 static void draw_log(const HsStatus *s, int rows) {
@@ -447,6 +462,8 @@ static int count_lines(const HsStatus *s) {
     n++;
   if (s->peer_configured || s->peer_contact_mono_ns)
     n += 1 + (int)s->peer_line_count;
+  if (s->discovery[0])
+    n++;
   return n;
 }
 

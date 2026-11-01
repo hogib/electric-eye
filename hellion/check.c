@@ -72,6 +72,14 @@ static void check_instance(const char *name) {
     }
   }
 
+  // Discovery: an "auto" peer or sink with nothing found means video or
+  // config goes nowhere; several candidates means it refused to guess.
+  if (b.discovery_needed && b.discovery_state != 2)
+    say(1, "discovery: %s%s", b.discovery,
+        b.discovery_state == 3 ? "" : " (an \"auto\" address needs it)");
+  else if (b.discovery_needed)
+    say(0, "discovery: %s%s", b.discovery, "");
+
   for (uint32_t i = 0; i < b.pipeline_count; i++) {
     const HsPipeline *pb = &b.pipelines[i];
     const HsPipeline *pa = &a.pipelines[i];

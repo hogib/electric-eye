@@ -19,7 +19,7 @@
  */
 
 enum {
-  hs_version = 3,
+  hs_version = 4,
   hs_max_pipelines = 8,
   hs_max_sinks = 8,
   hs_spec_len = 64,
@@ -84,6 +84,11 @@ typedef struct {
   char peer_error[hs_detail_len];  // the last failed attempt, if any
   uint32_t peer_line_count;
   char peer_lines[hs_peer_lines][hs_detail_len];
+  // Discovery (discovery.h): its state as a DiscState (0 = off), whether
+  // this hellion relies on it (an "auto" peer or sink), and one line.
+  uint32_t discovery_state;
+  bool discovery_needed;
+  char discovery[hs_detail_len];
 
   uint64_t log_total; // lines ever logged
   uint32_t log_count; // lines below, oldest first

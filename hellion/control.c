@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "control.h"
+#include "discovery.h"
 #include "fbus.h"
 #include "http.h"
 #include "jpeg.h"
@@ -329,6 +330,33 @@ static const char *wait_verdict(const char *status_path, uint64_t before) {
 
 static void forward_camera(Control *ctl, const char *body, size_t len,
                            char *out, size_t cap);
+
+// The peer to talk to right now: "peer" as configured, or with "auto" the
+// hellion discovery has found, at its control port. False when there is
+// none (yet), with why in `why`.
+static bool peer_now(const Control *ctl, char *out, size_t cap, char *why,
+                     size_t why_cap) {
+  out[0] = '\0';
+  if (why_cap)
+    why[0] = '\0';
+  if (!hcfg_peer_is_auto(&ctl->cfg)) {
+    snprintf(out, cap, "%s", ctl->cfg.peer);
+    if (!out[0])
+      snprintf(why, why_cap, "no peer is configured");
+    return out[0] != '\0';
+  }
+  if (disc_peer_hostport(0, out, cap))
+    return true;
+  DiscView v;
+  disc_view(&v);
+  if (v.state == DISC_FOUND)
+    snprintf(why, why_cap, "%.60s at %.70s announces no control port",
+             v.peer.name, v.addr);
+  else
+    snprintf(why, why_cap, "not found: %.140s",
+             v.state == DISC_OFF ? "discovery is not running" : v.detail);
+  return false;
+}
 static void cached_peer_drone(Control *ctl, char *out, size_t cap);
 
 // Writes eeye's config the way eeye's watcher expects (a temp file in the
@@ -613,8 +641,15 @@ static void forward_camera(Control *ctl, const char *body, size_t len,
   }
   char resp[512];
   size_t rlen = 0;
-  int status = http_call(ctl->cfg.peer, "POST", "/camera", json, strlen(json),
-                         resp, sizeof resp - 1, &rlen, camera_forward_ms, err,
+  char peer[hcfg_max_spec], nowhy[200];
+  if (!peer_now(ctl, peer, sizeof peer, nowhy, sizeof nowhy)) {
+    char esc[300];
+    json_escape(nowhy, esc, sizeof esc);
+    snprintf(out, cap, ",\"camera\":{\"error\":\"ROV %s\"}", esc);
+    return;
+  }
+  int status = http_call(peer, "POST", "/camera", json, strlen(json), resp,
+                         sizeof resp - 1, &rlen, camera_forward_ms, err,
                          sizeof err);
   while (rlen > 0 && (resp[rlen - 1] == '\n' || resp[rlen - 1] == ' '))
     rlen--;
@@ -625,10 +660,10 @@ static void forward_camera(Control *ctl, const char *body, size_t len,
   }
   char why[512], esc[700];
   if (status < 0)
-    snprintf(why, sizeof why, "ROV (%.100s): %.200s", ctl->cfg.peer, err);
+    snprintf(why, sizeof why, "ROV (%.100s): %.200s", peer, err);
   else
-    snprintf(why, sizeof why, "ROV (%.100s) answered %d: %.200s",
-             ctl->cfg.peer, status, resp);
+    snprintf(why, sizeof why, "ROV (%.100s) answered %d: %.200s", peer,
+             status, resp);
   json_escape(why, esc, sizeof esc);
   printf("hellion: camera controls did not reach the camera: %s\n", why);
   snprintf(out, cap, ",\"camera\":{\"error\":\"%s\"}", esc);
@@ -638,14 +673,22 @@ static void proxy_to_peer(Control *ctl, HttpConn *conn, const char *method,
                           const char *path, const char *body, size_t len) {
   static __thread char resp[http_max_body];
   size_t rlen = 0;
-  char err[200];
-  int status = http_call(ctl->cfg.peer, method, path, body, len, resp,
-                         sizeof resp, &rlen, peer_timeout_ms, err, sizeof err);
-  if (status < 0) {
+  char err[200], peer[hcfg_max_spec];
+  if (!peer_now(ctl, peer, sizeof peer, err, sizeof err)) {
     char esc[300];
     json_escape(err, esc, sizeof esc);
-    http_respond_json(conn, 502, "{\"error\":\"peer %s: %s\"}\n",
-                      ctl->cfg.peer, esc);
+    http_respond_json(conn, 503, "{\"error\":\"the other hellion: %s\"}\n",
+                      esc);
+    return;
+  }
+  int status = http_call(peer, method, path, body, len, resp, sizeof resp,
+                         &rlen, peer_timeout_ms, err, sizeof err);
+  if (status < 0) {
+    char esc[300], pesc[200];
+    json_escape(err, esc, sizeof esc);
+    json_escape(peer, pesc, sizeof pesc);
+    http_respond_json(conn, 502, "{\"error\":\"peer %s: %s\"}\n", pesc,
+                      esc);
     return;
   }
   http_respond(conn, status, "application/json", resp, rlen);
@@ -776,7 +819,21 @@ static void serve_status(Control *ctl, HttpConn *conn) {
     }
     n += (size_t)snprintf(out + n, sizeof out - n, "]}");
   }
-  n += (size_t)snprintf(out + n, sizeof out - n, "]}\n");
+  // Discovery: off/searching/found/ambiguous, the peer it chose, and why.
+  static const char *const states[] = {"off", "searching", "found",
+                                       "ambiguous"};
+  DiscView dv;
+  disc_view(&dv);
+  char ddetail[2 * disc_detail_len], daddr[2 * disc_addr_len];
+  json_escape(dv.detail, ddetail, sizeof ddetail);
+  json_escape(dv.state == DISC_FOUND ? dv.addr : "", daddr, sizeof daddr);
+  n += (size_t)snprintf(out + n, sizeof out - n,
+                        "],\"discovery\":{\"state\":\"%s\",\"needed\":%s,"
+                        "\"peer\":\"%s\",\"peer_name\":\"%s\",\"detail\":\"%s\""
+                        "}}\n",
+                        states[dv.state <= DISC_AMBIGUOUS ? dv.state : 0],
+                        s.discovery_needed ? "true" : "false", daddr,
+                        dv.state == DISC_FOUND ? dv.peer.name : "", ddetail);
   http_respond(conn, 200, "application/json", out, n < sizeof out ? n : 0);
 }
 
@@ -885,8 +942,10 @@ static void serve_peer(Control *ctl, HttpConn *conn, const char *body,
 static void fetch_peer_drone(Control *ctl) {
   static __thread char buf[2600];
   size_t got = 0;
-  char err[200];
-  int status = http_call(ctl->cfg.peer, "GET", "/api/drone", NULL, 0, buf,
+  char err[200], peer[hcfg_max_spec];
+  if (!peer_now(ctl, peer, sizeof peer, err, sizeof err))
+    return;
+  int status = http_call(peer, "GET", "/api/drone", NULL, 0, buf,
                          sizeof buf - 1, &got, peer_exchange_timeout_ms, err,
                          sizeof err);
   while (got > 0 && (buf[got - 1] == '\n' || buf[got - 1] == ' '))
@@ -942,20 +1001,21 @@ static void *peer_loop(void *arg) {
   while (!__atomic_load_n(&ctl->stop, __ATOMIC_ACQUIRE)) {
     size_t n = own_summary(ctl, mine, sizeof mine);
     size_t got = 0;
-    char err[200];
-    int status = http_call(ctl->cfg.peer, "POST", "/api/peer", mine, n,
-                           theirs, sizeof theirs, &got,
-                           peer_exchange_timeout_ms, err, sizeof err);
+    char err[200], peer[hcfg_max_spec];
+    int status = -1;
+    if (peer_now(ctl, peer, sizeof peer, err, sizeof err))
+      status = http_call(peer, "POST", "/api/peer", mine, n, theirs,
+                         sizeof theirs, &got, peer_exchange_timeout_ms, err,
+                         sizeof err);
     if (status == 200) {
-      store_peer_view(ctl, ctl->cfg.peer, theirs, got);
+      store_peer_view(ctl, peer, theirs, got);
       if (!ctl->cfg.eeye_config[0])
         fetch_peer_drone(ctl);
     } else {
       pthread_mutex_lock(&ctl->lock);
       if (status > 0)
         snprintf(ctl->peer_error, sizeof ctl->peer_error,
-                 "%.60s answered %d (an older hellion?)", ctl->cfg.peer,
-                 status);
+                 "%.60s answered %d (an older hellion?)", peer, status);
       else
         snprintf(ctl->peer_error, sizeof ctl->peer_error, "%.*s",
                  hs_detail_len - 1, err);
@@ -977,7 +1037,9 @@ void control_fill(Control *c, HsStatus *s) {
   pthread_mutex_lock(&c->lock);
   s->peer_configured = c->cfg.peer[0] != '\0';
   snprintf(s->peer_addr, sizeof s->peer_addr, "%.63s",
-           c->peer_addr[0] ? c->peer_addr : c->cfg.peer);
+           c->peer_addr[0]               ? c->peer_addr
+           : hcfg_peer_is_auto(&c->cfg) ? "(auto: not found yet)"
+                                        : c->cfg.peer);
   s->peer_contact_mono_ns = c->peer_contact_ns;
   snprintf(s->peer_error, sizeof s->peer_error, "%s", c->peer_error);
   s->peer_line_count = c->peer_line_count;

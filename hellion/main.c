@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "control.h"
+#include "discovery.h"
 #include "hconfig.h"
 #include "hellion.h"
 #include "hlog.h"
@@ -62,6 +63,35 @@ static int run(const char *config_path) {
 
   HsWriter *status = hs_writer_open(cfg.name);
 
+  // Plug and play: announce this hellion, and find the other end for an
+  // "auto" peer or sink (discovery.h). Before the pipelines, so an auto
+  // sink's first look finds it running.
+  bool needs_discovery = hcfg_peer_is_auto(&cfg);
+  for (size_t i = 0; i < cfg.pipeline_count; i++)
+    for (size_t j = 0; j < cfg.pipelines[i].sink_count; j++)
+      needs_discovery |= hcfg_sink_is_auto(&cfg.pipelines[i].sinks[j]);
+  if (cfg.discovery) {
+    DiscConfig dc;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.self.role, sizeof dc.self.role, "%s", cfg.role);
+    snprintf(dc.self.name, sizeof dc.self.name, "%s", cfg.name);
+    snprintf(dc.self.pair, sizeof dc.self.pair, "%s", cfg.pair);
+    dc.self.placement = cfg.placement[0] ? cfg.placement[0] : '?';
+    // The port of "control" ("8080" or "addr:8080"); 0 without one.
+    const char *cport = cfg.control;
+    for (const char *c = cfg.control; *c; c++)
+      if (*c == ':')
+        cport = c + 1;
+    dc.self.control = atoi(cport);
+    // Where this side receives the tether's video: its first RTP source.
+    for (size_t i = 0; i < cfg.pipeline_count && !dc.self.tether; i++)
+      if (cfg.pipelines[i].source == SRC_RTP)
+        dc.self.tether = atoi(cfg.pipelines[i].source_arg);
+    if (!disc_start(&dc) && needs_discovery)
+      printf("hellion: WARNING: \"auto\" addresses will find nothing "
+             "without discovery\n");
+  }
+
   // Camera controls for camera sources: what POST /camera last kept, so a
   // restart (or a crash) puts the camera back as it was. Only read when
   // there is a camera here.
@@ -114,6 +144,15 @@ static int run(const char *config_path) {
       }
     }
     hrec_summary(rec, snap.recording, sizeof snap.recording);
+    DiscView dv;
+    disc_view(&dv);
+    snap.discovery_state = (uint32_t)dv.state;
+    snap.discovery_needed = needs_discovery;
+    snprintf(snap.discovery, sizeof snap.discovery, "%.*s",
+             (int)sizeof snap.discovery - 1,
+             dv.state == DISC_OFF ? (cfg.discovery ? "could not start"
+                                                   : "off in the config")
+                                  : dv.detail);
     control_fill(control, &snap);
     hs_writer_publish(status, &snap);
     control_set_status(control, &snap);
@@ -129,6 +168,7 @@ static int run(const char *config_path) {
   hrec_destroy(rec);
   for (size_t i = 0; i < cfg.pipeline_count; i++)
     pipeline_stop(pipes[i]);
+  disc_stop();
   hs_writer_close(status);
   printf("hellion \"%s\" stopped\n", cfg.name);
   if (capturing)
