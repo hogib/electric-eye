@@ -47,6 +47,17 @@ int udp_relay_port(const UdpRelay *r);
 bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
                         size_t err_cap);
 
+// Adds the local H.264 decoder as a destination. It gets the same packets,
+// plus one more after each frame's last (RTP marker bit): a 2-byte access
+// unit delimiter (AUD). ffmpeg's H.264 parser only knows a frame has
+// ended when something after it arrives; without the AUD that is the next
+// frame, a whole frame period later (33ms at 30fps), on every frame.
+// Sequence numbers to this destination are shifted to make room, so the
+// stream stays gap-free; other destinations (QGC, the recorder) get the
+// stream unchanged. Before start.
+bool udp_relay_add_decoder(UdpRelay *r, const char *dest, char *err,
+                           size_t err_cap);
+
 // Adds a destination while packets are flowing (a recording starting).
 // Returns an id for udp_relay_detach, or -1 with *err filled.
 int udp_relay_attach(UdpRelay *r, const char *dest, char *err,

@@ -411,7 +411,7 @@ static bool rtp_prepare(Pipeline *p, char *err, size_t err_cap) {
     return false;
   char dest[64];
   snprintf(dest, sizeof dest, "127.0.0.1:%d", p->dec_port);
-  bool ok = udp_relay_add_dest(r, dest, err, err_cap);
+  bool ok = udp_relay_add_decoder(r, dest, err, err_cap);
   for (size_t i = 0; ok && i < p->cfg.relay_count; i++)
     ok = udp_relay_add_dest(r, p->cfg.relays[i], err, err_cap);
   if (!ok || !udp_relay_start(r)) {

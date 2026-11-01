@@ -23,6 +23,10 @@ typedef struct {
   struct sockaddr_storage addr;
   socklen_t len;
   int fd; // a socket of the destination's family
+  // The local decoder (udp_relay_add_decoder): gets an AUD after each
+  // frame, and sequence numbers shifted by aud_count to fit them in.
+  bool frame_ends;
+  uint16_t aud_count;
 } Dest;
 
 struct UdpRelay {
@@ -204,6 +208,8 @@ static int attach(UdpRelay *r, const char *dest, char *err, size_t err_cap) {
     memcpy(&d->addr, res->ai_addr, res->ai_addrlen);
     d->len = res->ai_addrlen;
     d->fd = fd;
+    d->frame_ends = false;
+    d->aud_count = 0;
     d->used = true;
   }
   pthread_mutex_unlock(&r->dest_lock);
@@ -223,6 +229,59 @@ bool udp_relay_add_dest(UdpRelay *r, const char *dest, char *err,
 int udp_relay_attach(UdpRelay *r, const char *dest, char *err,
                      size_t err_cap) {
   return attach(r, dest, err, err_cap);
+}
+
+bool udp_relay_add_decoder(UdpRelay *r, const char *dest, char *err,
+                           size_t err_cap) {
+  int slot = attach(r, dest, err, err_cap);
+  if (slot < 0)
+    return false;
+  pthread_mutex_lock(&r->dest_lock);
+  r->dests[slot].frame_ends = true;
+  pthread_mutex_unlock(&r->dest_lock);
+  return true;
+}
+
+// Sends an RTP packet to the decoder destination: renumbered past the AUDs
+// already inserted, then, if it ends a frame, followed by one more AUD.
+// `pkt` is restored before returning; the other destinations share it.
+static int send_to_decoder(Dest *d, uint8_t *pkt, size_t n) {
+  int errors = 0;
+  if (n < 12 || (pkt[0] >> 6) != 2) { // not RTP: pass it on untouched
+    if (sendto(d->fd, pkt, n, MSG_DONTWAIT, (struct sockaddr *)&d->addr,
+               d->len) < 0)
+      errors++;
+    return errors;
+  }
+  uint16_t seq = (uint16_t)(((pkt[2] << 8) | pkt[3]) + d->aud_count);
+  uint8_t orig[2] = {pkt[2], pkt[3]};
+  pkt[2] = (uint8_t)(seq >> 8);
+  pkt[3] = (uint8_t)seq;
+  if (sendto(d->fd, pkt, n, MSG_DONTWAIT, (struct sockaddr *)&d->addr,
+             d->len) < 0)
+    errors++;
+  if (pkt[1] & 0x80) {
+    // Same header as the frame's last packet (payload type, timestamp,
+    // SSRC), with no CSRCs, extension, padding or marker, the next
+    // sequence number, and a single NAL: type 9, access unit delimiter,
+    // primary_pic_type 7 ("any slice type") plus its stop bit.
+    uint8_t aud[14];
+    memcpy(aud, pkt, 12);
+    aud[0] = 0x80;
+    aud[1] &= 0x7f;
+    uint16_t aseq = (uint16_t)(seq + 1);
+    aud[2] = (uint8_t)(aseq >> 8);
+    aud[3] = (uint8_t)aseq;
+    aud[12] = 0x09;
+    aud[13] = 0xf0;
+    if (sendto(d->fd, aud, sizeof aud, MSG_DONTWAIT,
+               (struct sockaddr *)&d->addr, d->len) < 0)
+      errors++;
+    d->aud_count++;
+  }
+  pkt[2] = orig[0];
+  pkt[3] = orig[1];
+  return errors;
 }
 
 void udp_relay_detach(UdpRelay *r, int id) {
@@ -323,8 +382,12 @@ static void *relay_loop(void *arg) {
       pthread_mutex_lock(&r->dest_lock);
       for (int i = 0; i < max_dests; i++) {
         Dest *d = &r->dests[i];
-        if (d->used && sendto(d->fd, buf, (size_t)n, MSG_DONTWAIT,
-                              (struct sockaddr *)&d->addr, d->len) < 0)
+        if (!d->used)
+          continue;
+        if (d->frame_ends)
+          errors += (uint64_t)send_to_decoder(d, buf, (size_t)n);
+        else if (sendto(d->fd, buf, (size_t)n, MSG_DONTWAIT,
+                        (struct sockaddr *)&d->addr, d->len) < 0)
           errors++;
       }
       pthread_mutex_unlock(&r->dest_lock);

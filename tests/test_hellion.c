@@ -473,6 +473,90 @@ static int drain(int fd) {
   return n;
 }
 
+static void send_rtp_marked(int fd, int port, uint16_t seq, bool marker) {
+  uint8_t pkt[100];
+  memset(pkt, 0xAB, sizeof pkt);
+  pkt[0] = 0x80;
+  pkt[1] = (uint8_t)(96 | (marker ? 0x80 : 0));
+  pkt[2] = (uint8_t)(seq >> 8);
+  pkt[3] = (uint8_t)seq;
+  memset(pkt + 4, 0x11, 4); // timestamp
+  memset(pkt + 8, 0x22, 4); // SSRC
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  a.sin_port = htons((uint16_t)port);
+  sendto(fd, pkt, sizeof pkt, 0, (struct sockaddr *)&a, sizeof a);
+}
+
+// The decoder destination gets an access unit delimiter after each
+// frame's last packet, with the sequence numbers shifted so the stream it
+// sees has no gaps; an ordinary destination gets the packets unchanged.
+static void test_udp_relay_frame_ends(void) {
+  char err[160];
+  int pd, pq;
+  int dec = udp_listener(&pd), qgc = udp_listener(&pq);
+  UdpRelay *r = udp_relay_open("127.0.0.1:0", err, sizeof err);
+  CHECK(r != NULL);
+  if (!r)
+    return;
+  char dest[64];
+  snprintf(dest, sizeof dest, "127.0.0.1:%d", pd);
+  CHECK(udp_relay_add_decoder(r, dest, err, sizeof err));
+  snprintf(dest, sizeof dest, "127.0.0.1:%d", pq);
+  CHECK(udp_relay_add_dest(r, dest, err, sizeof err));
+  CHECK(udp_relay_start(r));
+  int in = socket(AF_INET, SOCK_DGRAM, 0);
+  int port = udp_relay_port(r);
+  // Two frames of two packets, then one of one; seq wraps in the middle.
+  uint16_t seqs[] = {65534, 65535, 0, 1, 2};
+  bool marks[] = {false, true, false, true, true};
+  for (int i = 0; i < 5; i++)
+    send_rtp_marked(in, port, seqs[i], marks[i]);
+  sleep_ms(200);
+
+  // Decoder: 5 packets + 3 AUDs, consecutive sequence numbers from 65534.
+  uint8_t buf[2048];
+  uint16_t want = 65534;
+  int got = 0, auds = 0;
+  ssize_t n;
+  while ((n = recv(dec, buf, sizeof buf, 0)) > 0) {
+    uint16_t seq = (uint16_t)((buf[2] << 8) | buf[3]);
+    CHECK_EQ_INT(seq, want);
+    want++;
+    got++;
+    if (n == 14) {
+      auds++;
+      CHECK(buf[0] == 0x80 && (buf[1] & 0x80) == 0 && (buf[1] & 0x7f) == 96);
+      CHECK(buf[12] == 0x09 && buf[13] == 0xf0);
+      CHECK(buf[4] == 0x11 && buf[8] == 0x22); // the frame's timestamp, SSRC
+    }
+  }
+  CHECK_EQ_INT(got, 8);
+  CHECK_EQ_INT(auds, 3);
+
+  // QGC: exactly what was sent.
+  int i = 0;
+  while ((n = recv(qgc, buf, sizeof buf, 0)) > 0) {
+    CHECK_EQ_INT(n, 100);
+    if (i < 5)
+      CHECK_EQ_INT((buf[2] << 8) | buf[3], seqs[i]);
+    i++;
+  }
+  CHECK_EQ_INT(i, 5);
+
+  // Loss is measured on the stream as received, not the decoder's copy.
+  RelayStats st;
+  udp_relay_stats(r, &st);
+  CHECK_EQ_INT(st.lost, 0);
+  CHECK_EQ_INT(st.packets, 5);
+  udp_relay_close(r);
+  close(in);
+  close(dec);
+  close(qgc);
+}
+
 // Every packet reaches every destination unchanged, and the RTP stats see
 // through to what the link did: gaps are loss, late arrivals are not, and
 // a new sender (SSRC) is not a gap.
@@ -837,6 +921,7 @@ int main(void) {
   RUN_TEST(test_config_camera);
   RUN_TEST(test_example_configs_load);
   RUN_TEST(test_udp_relay);
+  RUN_TEST(test_udp_relay_frame_ends);
   RUN_TEST(test_rtp_round_trip);
   RUN_TEST(test_recorder);
   RUN_TEST(test_status_round_trip);

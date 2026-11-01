@@ -171,6 +171,14 @@ void ff_decoder_args(const FfDecoder *d, FfArgs *a) {
   add(a, "scale=w=%u:h=%u:in_range=tv:out_range=pc,format=yuv422p", d->width,
       d->height);
   passthrough(a);
+  // The rawvideo *encoder* (a plain copy) runs frame-threaded on ffmpeg
+  // 5.1 and later, which hands each frame back only once the next one is
+  // in: one frame period of delay (33ms at 30fps) for nothing. Measured:
+  // a raw -> scale -> raw ffmpeg holds 34ms at 30fps, 1ms with this. Slice
+  // threading rather than -threads 1: on an output, -threads also sets the
+  // filter graph's threads, which would make the scale single-threaded.
+  add(a, "-thread_type");
+  add(a, "slice");
   add(a, "-f");
   add(a, "rawvideo");
   add(a, "-flush_packets");
