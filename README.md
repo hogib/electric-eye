@@ -15,50 +15,122 @@ GNU/Linux machine. Two programs:
 Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (for
 `hellion`'s video) `ffmpeg`.
 
-- [Quick start](#quick-start) · [Where eeye runs](#where-eeye-runs) ·
-  [In the field](#in-the-field) · [Troubleshooting](#troubleshooting) ·
-  [Config reference](#config-reference)
+- [Installing](#installing) · [Using it](#using-it) ·
+  [Where eeye runs](#where-eeye-runs) · [In the field](#in-the-field) ·
+  [Troubleshooting](#troubleshooting) · [Config reference](#config-reference) ·
+  [Building by hand](#building-by-hand)
 
-## Quick start
+## Installing
 
-Pick a [placement](#where-eeye-runs) — **b** runs the effects on the ROV, **a** runs them
-topside — and install both ends of the tether with it. On the ROV's Pi:
+Two machines, each installed once: the **ROV** (the vehicle's Pi, or whatever has the
+camera) and **topside** (the laptop the pilot uses). Both are installed with the same
+**placement** — `b` runs the effects on the ROV and is the one to use; `a` runs them
+topside (see [Where eeye runs](#where-eeye-runs)).
+
+`install.sh` installs the packages (`ffmpeg` among them), builds, puts `eeye` and
+`hellion` in `/usr/local/bin`, writes their configs, and starts them as **systemd
+services** that come back on every boot. It needs Debian, Ubuntu or Raspberry Pi OS
+(`apt-get`); elsewhere install the packages it lists and add `--no-packages`.
+
+### On a BlueROV
+
+The tether uses the BlueROV's fixed addresses — topside 192.168.2.1, ROV 192.168.2.2 —
+which are the defaults, so there is nothing to type but the role. On the ROV:
 
 ```sh
-git clone <this repo> && cd electric-eye
+git clone https://github.com/hogib/electric-eye && cd electric-eye
 sudo ./install.sh --role rov --placement b
 ```
 
-and on the topside machine (`--tether` names the interface the tether is plugged into,
-and gives it the BlueROV topside address, 192.168.2.1/24; leave it out to configure the
-network yourself):
+Topside, `--tether` names the network port the tether is plugged into and gives it the
+topside address (find the name with `ip link`; it is rarely `eth0` nowadays):
 
 ```sh
-git clone <this repo> && cd electric-eye
-sudo ./install.sh --role topside --placement b --tether eth0
+git clone https://github.com/hogib/electric-eye && cd electric-eye
+sudo ./install.sh --role topside --placement b --tether enp5s0
 ```
 
-That installs the packages (including `ffmpeg`), builds, puts `eeye` and `hellion` in
-`/usr/local/bin`, writes `/etc/hellion/hellion.json` for the role (and `eeye`'s effects
-config, `/var/lib/eeye/effects.json`, on the machine that runs it), loads v4l2loopback
-topside, and starts the systemd services. To update: `git pull && sudo ./install.sh` —
-it remembers the role and placement, keeps your configs, and restarts the services on
-the new binaries. `sudo ./install.sh --help` has the rest. The ROV's network is never
-touched: on a BlueROV it belongs to BlueOS.
+Leave `--tether` out to set the address yourself. **Never point it at the port your
+LAN or internet comes in on**: that port becomes the tether from its next reconnect.
+The ROV's network is never touched — on a BlueROV it belongs to BlueOS.
 
-Then open **`http://<topside>:8080/`** for the live picture and the controls, and point
-QGroundControl at UDP 5600 as usual.
+### Two machines on a LAN (testing on the bench)
+
+Any two Linux machines on the same network work — a laptop with a webcam stands in for
+the ROV. Give both machines' addresses, the **same command on both**:
 
 ```sh
-hellion top                       # live dashboard (q quits); works over SSH
-hellion check                     # pre-dive: exit 0 healthy, 1 degraded, 2 down
+# on the "ROV" (the one with the camera), here 192.168.1.105:
+sudo ./install.sh --role rov --placement b --topside-ip 192.168.1.117 --rov-ip 192.168.1.105
+
+# topside, here 192.168.1.117:
+sudo ./install.sh --role topside --placement b --topside-ip 192.168.1.117 --rov-ip 192.168.1.105
+```
+
+No `--tether` here: the LAN already connects them. Use IP addresses, not hostnames.
+
+### Updating, changing, removing
+
+- **Update:** `git pull && sudo ./install.sh`. It remembers the role, placement and
+  addresses, keeps your configs, and restarts the services on the new build.
+- **New addresses:** re-run with `--topside-ip`/`--rov-ip`; the config is rewritten and
+  the old one kept as `/etc/hellion/hellion.json.bak`.
+- **Start over:** `sudo ./install.sh --reset-config` puts back fresh configs (old ones
+  kept as `.bak`). `sudo ./install.sh --help` lists everything.
+- **Remove:** copy any recordings out of `/var/lib/hellion/recordings` first, then:
+  ```sh
+  sudo systemctl disable --now hellion eeye
+  sudo rm -rf /etc/systemd/system/{hellion,eeye}.service /usr/local/bin/{eeye,hellion} \
+      /etc/hellion /var/lib/{eeye,hellion} /etc/modules-load.d/v4l2loopback.conf \
+      /etc/modprobe.d/v4l2loopback.conf
+  sudo userdel eeye
+  sudo nmcli connection delete hellion-tether   # only if you used --tether
+  ```
+
+### From the release binaries
+
+The [releases](https://github.com/hogib/electric-eye/releases) have static `eeye` and
+`hellion` builds for arm64, armv7 and amd64 that need no libraries. `install.sh` is
+still the easy way in: it builds from source, but the result is the same program. To use
+the binaries instead, copy them to `/usr/local/bin` as `eeye` and `hellion`, and follow
+the comments at the top of `eeye.service` and `hellion/hellion.service`.
+
+## Using it
+
+**Everything is already running** once `install.sh` finishes. Do not start `eeye` or
+`hellion` yourself — a second copy finds the ports taken (`8080 already in use`) and
+fights the first for the camera and the tether. What you run by hand is only:
+
+```sh
+hellion top                       # live dashboard, either machine (q quits); fine over SSH
+hellion check                     # pre-dive check: exit 0 healthy, 1 degraded, 2 down
 journalctl -u hellion -u eeye -f  # the logs
-ffplay /dev/video10               # the pilot's picture as a webcam, topside
 ```
 
-If you were not in the `video` group before, log out and back in for `hellion top`.
+Topside, open **`http://localhost:8080/`** (or `http://<topside>:8080/` from another
+device) for the live picture, the **AUTO VISIBILITY** button, effects, camera controls,
+recording and snapshots. Point QGroundControl at **UDP 5600** as usual. `/dev/video10`
+is the pilot's picture as a webcam, for OBS or a browser (`ffplay /dev/video10`).
 
-### Manual build
+If `hellion top` says permission denied, you were not in the `video` group before the
+install: log out and back in.
+
+**The services**, on either machine:
+
+```sh
+systemctl status hellion eeye          # running? (eeye only exists where it runs)
+sudo systemctl restart hellion         # after editing /etc/hellion/hellion.json
+sudo systemctl stop hellion eeye       # stop until the next boot or start
+```
+
+| What | Where |
+|---|---|
+| `hellion`'s config (pipelines, addresses, ports) | `/etc/hellion/hellion.json` — restart `hellion` after editing |
+| The effects and camera settings | `/var/lib/eeye/effects.json` on the machine running `eeye` — edited live by the page; no restart |
+| Recordings, snapshots | `/var/lib/hellion/recordings`, `/var/lib/hellion/snapshots` (topside) |
+| Ports | 8080 the page (topside), 8091 the ROV's control port, UDP 5610 the tether video, UDP 5600 QGroundControl |
+
+## Building by hand
 
 ```sh
 make                              # builddir/eeye and builddir/hellion
@@ -179,6 +251,16 @@ receives.
 Start with `hellion check` and `hellion top`; then the logs:
 `journalctl -u hellion -u eeye -f` (the last lines of `hellion`'s are in `top` too).
 
+### Installing and starting
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `8080 already in use` / `address already in use` when running `hellion` | It is already running, as a service. | Nothing to start: open the page, or run `hellion top`. Stop the copy you started (Ctrl-C) |
+| `systemctl status hellion` says `failed`, `start-limit-hit` | It exits at start, usually a config error; systemd gives up after 5 tries. | `journalctl -u hellion -n 20` names the bad line. Fix it (or re-run `install.sh` with `--topside-ip`/`--rov-ip`), then `sudo systemctl restart hellion` |
+| `Install failed at line N` | One step failed; the message above it says which. | Fix that and run the same command again — every step is safe to repeat |
+| `--tether eth0: no such network interface` | The port has another name. | `ip link` lists them; usually `enp…` or `eno…` |
+| Topside log: `lost rtp:5610; reconnecting` every 10s | Nothing is arriving from the ROV: normal while the ROV is off. | Check the ROV with `hellion top` there; its `rtp:` sink must name the topside's address |
+
 ### No video anywhere
 
 | What you see | Cause | Fix |
@@ -200,9 +282,14 @@ topside machine has the port.
 
 ### The picture is frozen but looks live
 
-It can't, any more: when frames stop arriving the page desaturates the picture and shows
-a pulsing banner naming how stale it is (`LINK LOST — showing a frozen frame from 4.0s
-ago`). `hellion top` shows which hop stopped.
+When frames stop arriving the page desaturates the picture and shows a pulsing banner
+naming how stale it is (`LINK LOST — showing a frozen frame from 4.0s ago`).
+`hellion top` shows which hop stopped.
+
+**Known gap:** if the page's own preview connection drops — the topside `hellion`
+restarted, or the browser fell behind — the picture does not reconnect by itself, and
+once the link is healthy again the banner clears over a frozen frame. **Reload the
+page** after restarting `hellion` or if the picture seems still. A fix is coming.
 
 ### Blocky or smeared picture
 

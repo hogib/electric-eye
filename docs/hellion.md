@@ -19,10 +19,16 @@ service by `install.sh`.
 ## Installing
 
 ```sh
-sudo ./install.sh --role rov|topside --placement a|b [--tether IFACE] [--reset-config]
+sudo ./install.sh --role rov|topside --placement a|b [--topside-ip IP --rov-ip IP]
+                  [--tether IFACE] [--reset-config]
 ```
 
-Both ends get the same placement. What it sets up:
+Both ends get the same placement, and the same addresses. The addresses default to the
+BlueROV's (topside 192.168.2.1, ROV 192.168.2.2); given, they replace those in the
+example config as it is written (the previous file kept as `.bak`) — the `peer` topside,
+the `rtp:` sink on the ROV — and are remembered in `/etc/hellion/install.conf`, which is
+read as `KEY=value` data, never sourced. They must be IPv4 addresses: the release
+binaries are static and cannot resolve names. What it sets up:
 
 | | ROV | topside |
 |---|---|---|
