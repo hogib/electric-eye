@@ -77,6 +77,13 @@ case "$PLACEMENT" in a|b) ;; *) die "--placement must be a or b (try --help)" ;;
 if [ -n "$TETHER_IF" ] && [ "$ROLE" != topside ]; then
   die "--tether is for the topside machine. On a BlueROV the ROV's network belongs to BlueOS; leave it alone."
 fi
+# Checked before anything is changed: a name that is not an interface here
+# would otherwise get a profile that never applies (and used to abort the
+# install halfway, after the units were written but before they started).
+if [ -n "$TETHER_IF" ] && [ ! -e "/sys/class/net/$TETHER_IF" ]; then
+  die "--tether $TETHER_IF: no such network interface on this machine. It has: \
+$(ls /sys/class/net | grep -vx lo | tr '\n' ' ')"
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   die "This needs root (packages, a system user, /etc, systemd units). Run: sudo $0 $ORIG_ARGS"
@@ -282,10 +289,20 @@ a reboot)."
       connection.autoconnect yes connection.autoconnect-priority 50 >/dev/null
   fi
   log "NetworkManager profile 'hellion-tether': $ifname = 192.168.2.1/24"
+  # The profile outranks the interface's other profiles (priority 50), so
+  # on the next connect it wins. Right for a port that is the tether; wrong
+  # for one that is also the machine's LAN.
+  if ip -4 -o addr show dev "$ifname" 2>/dev/null | grep -q 'inet ' &&
+     ! ip -4 -o addr show dev "$ifname" | grep -q 'inet 192\.168\.2\.'; then
+    warn "$ifname has another address right now ($(ip -4 -o addr show dev "$ifname" | \
+awk '{print $4}' | head -1)). From its next reconnect it will be the tether \
+(192.168.2.1, no DHCP), not that network. If $ifname is your LAN or internet \
+port, undo it: sudo nmcli connection delete hellion-tether"
+  fi
   # Activating drops whatever is up on that interface now, which may be
   # the very connection this script is running over.
   local state
-  state=$(nmcli -t -f GENERAL.STATE device show "$ifname" 2>/dev/null | cut -d: -f2-)
+  state=$(nmcli -t -f GENERAL.STATE device show "$ifname" 2>/dev/null | cut -d: -f2-) || state=""
   case "$state" in
     100*) warn "$ifname is connected now, so the new profile was not \
 activated (that could cut off this session). It applies on the next replug \
