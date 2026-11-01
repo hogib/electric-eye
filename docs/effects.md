@@ -278,13 +278,18 @@ several-fold and will mislead you.
 |---|---|
 | `sobel_edges` | yes |
 | `gaussian_blur` | yes |
+| `gaussian_blur` half-resolution resample (strength ≥ 4: 2×2 down, 2× up both ways) | yes — it was over half of a strength-4 blur, and GCC leaves it scalar; with it, a strength-4 blur is 69% fewer instructions on arm64 (56% armv7), byte-identical |
 | `gs_contrast_normalize` (min/max scan) | yes |
 | `log_edges` (Laplacian + zero-crossing) | yes |
 | `canny_edges` (gradient + direction) | yes |
-| `canny_edges` (NMS) | yes |
+| `canny_edges` (NMS, labelling for hysteresis) | yes |
 | `apply_lut_plane` | no, deliberately |
 | YUYV unpack | yes |
 | YUYV / yuv420 downscale | no (integer shifts, rarely used) |
+
+Without NEON (x86, so the topside in placement A), the blur's horizontal pass runs its
+interior columns as a plain clamp-free loop the compiler vectorizes; calling the
+clamped helper per pixel made strength 1 cost 2.35ms on one x86 thread, now 0.49ms.
 
 Every NEON block in `conv.c` builds on **ARMv7 as well as AArch64** (`GS_NEON`): none of
 its intrinsics is AArch64-only. But it is compiled in only when the compiler defines

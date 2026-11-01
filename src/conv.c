@@ -322,12 +322,10 @@ static inline uint8_t blur5_clamped(const uint8_t *row, uint32_t width,
 // that has nothing to do with the actual scene.
 static void blur_row_h(const uint8_t *row, uint8_t *out_row, uint32_t width) {
   uint32_t x = 0;
-#if defined(GS_NEON)
-  // x < 2 always needs the left-edge clamp, so it's left to the same
-  // clamped formula as the tail loop below rather than folded into a
-  // NEON chunk.
+  // x < 2 always needs the left-edge clamp.
   for (; x < 2 && x < width; ++x)
     out_row[x] = blur5_clamped(row, width, x);
+#if defined(GS_NEON)
   // Two loads per 16 pixels instead of five: a covers x-2..x+13 and b
   // x+14..x+29, and vext slides the window across them for the four
   // shifted taps. The rightmost lane's +2 neighbour is x+17, but b is a
@@ -348,9 +346,13 @@ static void blur_row_h(const uint8_t *row, uint8_t *out_row, uint32_t width) {
                          vld1q_u8(&row[x + 2])));
   }
 #endif
-  // Tail: whatever the NEON loop above didn't cover (a non-multiple-of-16
-  // remainder, and/or the true right edge needing its own clamp) -- or the
-  // whole row without NEON.
+  // Interior columns need no clamp: a plain loop the compiler can
+  // vectorize. Without NEON this is most of the row; calling
+  // blur5_clamped per pixel here was measured at 1.6x the time on x86 --
+  // which is where the effects run in placement A.
+  for (; x + 2 < width; ++x)
+    out_row[x] = blur5(row[x - 2], row[x - 1], row[x], row[x + 1], row[x + 2]);
+  // The right edge's 2px clamp, or the whole row when it is under 5px.
   for (; x < width; ++x)
     out_row[x] = blur5_clamped(row, width, x);
 }
@@ -533,7 +535,21 @@ static void downsample_box2x2_team(const uint8_t *src, size_t src_stride,
     const uint8_t *row0 = src + (size_t)(2 * y) * src_stride;
     const uint8_t *row1 = src + (size_t)(2 * y + 1) * src_stride;
     uint8_t *out_row = dst + (size_t)y * half_w;
-    for (uint32_t x = 0; x < half_w; ++x) {
+    uint32_t x = 0;
+#if defined(GS_NEON)
+    // 16 outputs from 32 bytes of each row: pairwise widening adds give
+    // each output's horizontal pair, the two rows' pairs are added, and
+    // vrshrn(.., 2) is exactly (sum + 2) >> 2. GCC leaves the scalar loop
+    // unvectorized, and this resample is over half of a strength-4 blur.
+    for (; x + 16 <= half_w; x += 16) {
+      const uint8_t *a = row0 + 2 * x, *b = row1 + 2 * x;
+      uint16x8_t lo = vaddq_u16(vpaddlq_u8(vld1q_u8(a)), vpaddlq_u8(vld1q_u8(b)));
+      uint16x8_t hi = vaddq_u16(vpaddlq_u8(vld1q_u8(a + 16)),
+                                vpaddlq_u8(vld1q_u8(b + 16)));
+      vst1q_u8(&out_row[x], vcombine_u8(vrshrn_n_u16(lo, 2), vrshrn_n_u16(hi, 2)));
+    }
+#endif
+    for (; x < half_w; ++x) {
       uint32_t x0 = 2 * x, x1 = x0 + 1;
       out_row[x] =
           (uint8_t)((row0[x0] + row0[x1] + row1[x0] + row1[x1] + 2) >> 2);
@@ -557,7 +573,25 @@ static void downsample_box2x2_team(const uint8_t *src, size_t src_stride,
 // replicates the last input sample rather than being left unwritten.
 static void upsample2x_row(const uint8_t *in, uint32_t half_w, uint8_t *out,
                            uint32_t out_w) {
-  for (uint32_t k = 0; k < half_w; ++k) {
+  uint32_t k = 0;
+#if defined(GS_NEON)
+  // k = 0 needs its left clamp; then 8 inputs -> 16 outputs at a time for
+  // as long as k+1 stays inside: 3*in[k] once (widening multiply), plus
+  // each neighbour, rounded by vrshrn, interleaved by vst2.
+  if (half_w > 0) {
+    out[0] = (uint8_t)((in[0] + 3 * in[0] + 2) >> 2);
+    out[1] = (uint8_t)((3 * in[0] + in[half_w > 1 ? 1 : 0] + 2) >> 2);
+    k = 1;
+  }
+  for (; k + 9 <= half_w; k += 8) {
+    uint16x8_t three = vmull_u8(vld1_u8(&in[k]), vdup_n_u8(3));
+    uint8x8x2_t pair;
+    pair.val[0] = vrshrn_n_u16(vaddw_u8(three, vld1_u8(&in[k - 1])), 2);
+    pair.val[1] = vrshrn_n_u16(vaddw_u8(three, vld1_u8(&in[k + 1])), 2);
+    vst2_u8(&out[2 * k], pair);
+  }
+#endif
+  for (; k < half_w; ++k) {
     uint32_t km1 = k == 0 ? 0 : k - 1;
     uint32_t kp1 = k + 1 >= half_w ? half_w - 1 : k + 1;
     out[2 * k] = (uint8_t)((1 * in[km1] + 3 * in[k] + 2) >> 2);
@@ -591,7 +625,15 @@ static void upsample_bilinear2x_team(const uint8_t *small, uint32_t half_w,
     const uint8_t *r_k = upsample_scratch + (size_t)k * width;
     const uint8_t *r_other = upsample_scratch + (size_t)other * width;
     uint8_t *out_row = dst + (size_t)y * dst_stride;
-    for (uint32_t x = 0; x < width; ++x) {
+    uint32_t x = 0;
+#if defined(GS_NEON)
+    for (; x + 8 <= width; x += 8) {
+      uint16x8_t sum = vaddw_u8(vmull_u8(vld1_u8(&r_k[x]), vdup_n_u8(3)),
+                                vld1_u8(&r_other[x]));
+      vst1_u8(&out_row[x], vrshrn_n_u16(sum, 2));
+    }
+#endif
+    for (; x < width; ++x) {
       out_row[x] = (uint8_t)((3 * r_k[x] + r_other[x] + 2) >> 2);
     }
   }
