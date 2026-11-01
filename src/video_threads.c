@@ -270,6 +270,12 @@ static void record_effects_time(EffectsTiming *t, const struct timespec *t0,
 
 void *effects_loop(void *arg) {
   WorkerArgs *args = (WorkerArgs *)arg;
+  // Auto visibility's smoothing state lives as long as this thread. NULL
+  // (out of memory) only means auto visibility cannot run.
+  AutoVis *av = auto_vis_create();
+  if (!av)
+    printf("Warning: auto visibility unavailable (out of memory).\n");
+  static ImgStats stats; // 1KB+; this thread is the only user
   while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST) ||
          __atomic_load_n(&args->ring_buffer_in->head, __ATOMIC_RELAXED) !=
              __atomic_load_n(&args->ring_buffer_in->tail, __ATOMIC_RELAXED)) {
@@ -290,7 +296,13 @@ void *effects_loop(void *arg) {
     const Config *cfg = config_current(args->config);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    apply_effect_chain(frame, cfg);
+    // Measured on the raw frame every time: it is a quarter of the pixels,
+    // read once, and the operator gets it whether or not auto is on.
+    const uint8_t *raw[3] = {frame->raw_planes[0], frame->raw_planes[1],
+                             frame->raw_planes[2]};
+    img_stats_compute(raw, frame->width, frame->height, frame->stride, &stats);
+    img_stats_summarize(&stats, &frame->stats);
+    apply_effect_chain_auto(frame, cfg, av, &stats);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     record_effects_time(args->timing, &t0, &t1);
 
@@ -298,6 +310,7 @@ void *effects_loop(void *arg) {
     // is_running -- abandoning it here would leak it out of the pool.
     ring_push_wait(args->ring_buffer_out, frame, NULL);
   }
+  auto_vis_destroy(av);
   return NULL;
 }
 
@@ -407,6 +420,7 @@ void *consumer_loop(void *arg) {
         health.recording_dropped = rs.dropped_frames;
       }
       health.frames_captured = (uint64_t)frame->pts;
+      health.image = frame->stats;
       health.disk_free_bytes =
           health.recording_path[0] ? health_disk_free(health.recording_path) : 0;
       health_publish(args->config_path, &health);

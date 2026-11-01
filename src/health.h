@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "img_stats.h"
+
 /*
  * Runtime health, written periodically to "<config_path>.health" for a
  * remote operator to read (hellion serves it, with its age, as /api/drone
@@ -43,6 +45,9 @@ typedef struct {
 
   uint32_t frame_width;
   uint32_t frame_height;
+  // What the camera's picture looks like (img_stats.h), and whether auto
+  // visibility processed it. Written as "image": null when not valid.
+  FrameStats image;
 } HealthSnapshot;
 
 /*

@@ -245,13 +245,33 @@ static void compute_chroma_liveness(const Config *cfg,
   }
 }
 
-void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
-  ChainBuf cur = CHAIN_RAW;
+static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur);
 
+void apply_effect_chain(VideoFrame *frame, const Config *cfg) {
+  apply_effect_chain_auto(frame, cfg, NULL, NULL);
+}
+
+void apply_effect_chain_auto(VideoFrame *frame, const Config *cfg,
+                             AutoVis *av, const ImgStats *stats) {
   // The previous trip through the pool may have left work pointing at raw
-  // (an empty chain, see the end of this function). Every stage below
-  // needs work and spare to be real buffers of their own.
+  // (an empty chain, see the end of run_chain). Every stage below needs
+  // work and spare to be real buffers of their own.
   vf_restore_roles(frame);
+
+  ChainBuf cur = CHAIN_RAW;
+  frame->stats.auto_on = false;
+  if (cfg->auto_visibility && av && stats) {
+    const uint8_t *src[3] = {frame->raw_planes[0], frame->raw_planes[1],
+                             frame->raw_planes[2]};
+    auto_vis_apply(av, stats, src, frame->planes, frame->width,
+                   frame->height, frame->stride, frame->capture_ns);
+    frame->stats.auto_on = true;
+    cur = CHAIN_WORK;
+  }
+  run_chain(frame, cfg, cur);
+}
+
+static void run_chain(VideoFrame *frame, const Config *cfg, ChainBuf cur) {
 
   bool chroma_live[max_chain_stages];
   compute_chroma_liveness(cfg, chroma_live);

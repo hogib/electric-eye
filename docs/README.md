@@ -63,7 +63,7 @@ sockets, ports and the tether's failure modes.
 
 ## Source layout
 
-`src/` is a flat set of translation units, no subdirectories. At 19 files and ~10,000
+`src/` is a flat set of translation units, no subdirectories. At 21 files and ~10,500
 lines that is easier to navigate than a hierarchy would be. Most modules use a prefix
 matching their filename (`v4l2_in_*`, `camera_ctrl_*`, `fbus_*`), which is the
 namespacing C gives you.
@@ -81,7 +81,9 @@ namespacing C gives you.
 | `camera_ctrl.c` | Portable camera controls across both backends |
 | `conv.c` | Neighborhood operators: sobel, blur, LoG, Canny |
 | `point_opps.c` | `contrast` (the one point op that inspects the frame) |
-| `effect_chain.c` | Chain runner, LUT fusion, buffer ping-pong |
+| `effect_chain.c` | Chain runner, LUT fusion, buffer ping-pong; runs auto visibility first when it is on |
+| `auto_vis.c` | Auto visibility: continuous colour cast, brightness range and haze correction |
+| `img_stats.c` | Measures each raw frame: luma histogram, colour cast; for auto visibility and the health file |
 | `v4l2_out.c` | Writes frames to the loopback device |
 | `virtual_cam.c` | The optional webcam output: opens lazily, retries, explains a missing module |
 | `child_proc.c` | Runs helper programs (rpicam-vid, mokutil, ffmpeg) safely |

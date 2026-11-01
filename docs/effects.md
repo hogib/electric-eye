@@ -189,6 +189,35 @@ range, recomputed fresh every frame from whatever the chain has produced so far.
 Touches only Y, so the chain copies the untouched U/V planes rather than bringing the
 whole frame into `work` first.
 
+### Auto visibility (`auto_vis.c`) — not a chain stage
+
+Switched by the config's `auto_visibility`, not placed in `chain`: it is a mode, run
+once ahead of the chain by `apply_effect_chain_auto`, reading `raw` and writing `work`
+so the chain continues from its output (a neighborhood op after it reads the corrected
+picture, not raw). It needs state across frames — the smoothed corrections — which no
+stage has, so it lives in an `AutoVis` owned by the effects thread.
+
+Steered by `img_stats.c`, which measures the raw frame every frame (every second pixel
+of every second row: the luma histogram, and the mean chroma of well-exposed pixels)
+whether or not auto visibility is on, since the operator gets the same numbers through
+the health file.
+
+Per frame: targets from the statistics (stretch percentiles, a gamma for the median,
+the cast to remove beyond a deadband), smoothed toward with a time constant on
+*capture* time, so the response is the same at 15fps as at 60; a gap of over a second
+restarts from the current frame. Then one luma pass applies the global LUT and counts a
+histogram per CLAHE tile (bands of tile rows run in parallel, each owning its tiles'
+counters); tile mappings are built with the clip limit and smoothed too; a second luma
+pass maps each pixel through its four nearest tiles, bilinearly; a chroma pass removes
+the cast in proportion to the luma under each chroma sample and lifts saturation.
+
+Every tuning constant is at the top of `auto_vis.c` with the reason for its value; the
+values are starting points from synthetic frames and a webcam, to be re-tuned on real
+footage. `tests/test_auto_vis.c` checks behaviour, not pixels: cast removed, range and
+edges restored, a clean scene's background left its colour, no flicker on a still
+scene, smooth following, no fade-in, noise bounded (≤4.5×; 3.9× measured), and prints
+the per-frame cost. `AUTO_VIS_DUMP=<dir>` writes its frames out for a look.
+
 ### `light` — brightness and saturation together
 
 One dial over luma offset and chroma scale-around-128. Unlike `contrast` it is a fixed

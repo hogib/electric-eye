@@ -165,6 +165,12 @@ typedef struct {
   // alone; see camera_ctrl.h for why that is a sentinel rather than 0.
   CameraControls camera;
 
+  // Auto visibility (auto_vis.h): continuously corrects colour cast,
+  // brightness range and haze on the pilot's picture, ahead of the chain.
+  // Off by default -- it changes what the pilot sees, so it is switched on
+  // deliberately (the page's big toggle) -- and hot-reloadable.
+  bool auto_visibility;
+
   // --- Geometry: the one group of fields here that is NOT hot-reloadable ---
   //
   // Read once, at startup, by config_load_once(); the running pipeline
@@ -285,6 +291,8 @@ typedef struct {
  * out leaves that control as the camera had it. These are hot-reloadable.
  * See camera_ctrl.h for the units and ranges, which are deliberately
  * device-independent so one config works on both capture backends.
+ * "auto_visibility" is optional (default false), hot-reloadable: true runs
+ * auto_vis.h's continuous correction ahead of the chain, pilot only.
  * The old preview keys "stream_raw", "stream_frame_interval" and
  * "stream_quality" are accepted and ignored (logged once): the preview is
  * hellion's now, and a config written before that must still load.

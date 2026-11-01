@@ -13,7 +13,8 @@
 | `negotiation` | Resolution ranking, the divisibility filter, YUYV downscale |
 | `log_edges` | LoG behavior |
 | `canny` | Canny behavior |
-| `effect_chain` | LUT fusion against an independent reference; chroma skipping, role swaps |
+| `effect_chain` | LUT fusion against an independent reference; chroma skipping, role swaps; auto visibility running ahead of point and neighborhood ops, raw untouched |
+| `auto_vis` | Auto visibility on synthetic underwater frames (an image formation model: per-channel attenuation plus scattered light): cast removed, range and edges restored, a clean scene left alone, no flicker, smooth following, no fade-in, noise bounded, tiny frames; prints its cost. `AUTO_VIS_DUMP=<dir>` writes the frames |
 | `recorder` | Recording thread: file contents, ordering, a stalled disk (FIFO) never blocking |
 | `camera_ctrl` | Range scaling, unit conversion, rpicam argv |
 | `health` | Health file contents and escaping |

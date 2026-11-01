@@ -409,6 +409,80 @@ static void test_empty_chain_aliasing_is_undone_next_frame(void) {
   vf_free(frame); // must free each allocation exactly once
 }
 
+// Auto visibility runs ahead of the chain, reading raw and writing work;
+// the chain then continues from its output -- a point op and a
+// neighborhood op alike -- and raw is left exactly as captured.
+static void auto_expected(VideoFrame *f, uint8_t *out[3]) {
+  ImgStats st;
+  const uint8_t *raw[3] = {f->raw_planes[0], f->raw_planes[1], f->raw_planes[2]};
+  img_stats_compute(raw, f->width, f->height, f->stride, &st);
+  AutoVis *av = auto_vis_create();
+  auto_vis_apply(av, &st, raw, out, f->width, f->height, f->stride, f->capture_ns);
+  auto_vis_destroy(av);
+}
+
+static void run_auto(VideoFrame *f, const Config *cfg) {
+  ImgStats st;
+  const uint8_t *raw[3] = {f->raw_planes[0], f->raw_planes[1], f->raw_planes[2]};
+  img_stats_compute(raw, f->width, f->height, f->stride, &st);
+  AutoVis *av = auto_vis_create();
+  apply_effect_chain_auto(f, cfg, av, &st);
+  auto_vis_destroy(av);
+}
+
+static void test_auto_visibility_runs_first(void) {
+  VideoFrame *frame = make_frame(64, 32, 5);
+  size_t n_y = frame->plane_sizes[0], n_c = frame->plane_sizes[1];
+  uint8_t *raw_copy = malloc(n_y + 2 * n_c);
+  memcpy(raw_copy, frame->raw_data, n_y + 2 * n_c);
+  uint8_t *exp_buf = malloc(n_y + 2 * n_c);
+  uint8_t *expect[3] = {exp_buf, exp_buf + n_y, exp_buf + n_y + n_c};
+  auto_expected(frame, expect);
+
+  // Empty chain: the result is auto visibility's output, in work.
+  Config cfg = {0};
+  cfg.auto_visibility = true;
+  run_auto(frame, &cfg);
+  CHECK(frame->stats.auto_on);
+  CHECK(frame->planes[0] != frame->raw_planes[0]);
+  CHECK_MEM_EQ(frame->planes[0], expect[0], n_y);
+  CHECK_MEM_EQ(frame->planes[1], expect[1], n_c);
+  CHECK_MEM_EQ(frame->planes[2], expect[2], n_c);
+
+  // A point op after it works on its output.
+  cfg.stage_count = 1;
+  cfg.stages[0] = (EffectStage){.effect = EFFECT_INVERT};
+  run_auto(frame, &cfg);
+  for (size_t i = 0; i < n_y; i++)
+    if (frame->planes[0][i] != 255 - expect[0][i]) {
+      CHECK(!"invert reads auto visibility's output");
+      break;
+    }
+
+  // So does a neighborhood op, which would otherwise read raw.
+  cfg.stages[0] = (EffectStage){.effect = EFFECT_BLUR, .blur_strength = 1};
+  run_auto(frame, &cfg);
+  uint8_t *blur_buf = malloc(n_y + 2 * n_c);
+  uint8_t *blurred[3] = {blur_buf, blur_buf + n_y, blur_buf + n_y + n_c};
+  const uint8_t *bsrc[3] = {expect[0], expect[1], expect[2]};
+  gaussian_blur(bsrc, blurred, frame->width, frame->height, frame->stride, 1);
+  CHECK_MEM_EQ(frame->planes[0], blurred[0], n_y);
+  CHECK_MEM_EQ(frame->planes[1], blurred[1], n_c);
+
+  // Off: the chain alone, and the flag says so.
+  cfg.auto_visibility = false;
+  cfg.stage_count = 0;
+  run_auto(frame, &cfg);
+  CHECK(!frame->stats.auto_on);
+  CHECK_MEM_EQ(frame->planes[0], raw_copy, n_y);
+
+  CHECK_MEM_EQ(frame->raw_data, raw_copy, n_y + 2 * n_c);
+  free(raw_copy);
+  free(exp_buf);
+  free(blur_buf);
+  vf_free(frame);
+}
+
 int main(void) {
   printf("test_effect_chain:\n");
   RUN_TEST(test_single_point_ops);
@@ -424,5 +498,6 @@ int main(void) {
   RUN_TEST(test_blur_keeps_live_chroma);
   RUN_TEST(test_result_in_spare_is_swapped_not_copied);
   RUN_TEST(test_empty_chain_aliasing_is_undone_next_frame);
+  RUN_TEST(test_auto_visibility_runs_first);
   TEST_MAIN_END();
 }

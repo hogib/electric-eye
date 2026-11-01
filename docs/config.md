@@ -8,8 +8,9 @@ is a starting point for running `eeye` by hand.
 
 This is the distinction to internalize before changing anything:
 
-**Hot-reloadable** — picked up within ~200ms, no restart. `chain`, `record_path`,
-`record_format` (read when a recording starts), and everything under `camera`.
+**Hot-reloadable** — picked up within ~200ms, no restart. `chain`, `auto_visibility`,
+`record_path`, `record_format` (read when a recording starts), and everything under
+`camera`.
 
 **Ignored** — `stream_frame_interval`, `stream_quality`, `stream_raw`: they fed `eeye`'s
 old JPEG preview server, which `hellion` replaced. Still type-checked, so an old config
@@ -46,6 +47,7 @@ has to understand them anyway or every reload of a geometry-carrying file would 
 ```json
 {
   "chain": [{"effect": "sobel"}],
+  "auto_visibility": false,
   "record_path": "",
   "record_format": "raw",
   "capture_width": 1280,
@@ -151,6 +153,13 @@ them where the camera is.
 Refused at parse time: invalid names (letters, digits, `-`, `_`, under 32
 characters), `bus_pilot` equal to `bus_raw`, and reading a stream `eeye` itself
 publishes.
+
+### `auto_visibility`
+
+Bool, default `false`, hot-reloadable. True runs the continuous colour, brightness
+and haze correction (`auto_vis.c`; see [effects.md](effects.md)) ahead of the chain, on
+the pilot's picture only. Off by default because it changes what the pilot sees; the
+page's toggle writes it. Only a JSON bool is accepted.
 
 ### Recording
 

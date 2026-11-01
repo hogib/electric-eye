@@ -182,6 +182,36 @@ static void test_disk_free_reports_something(void) {
   CHECK_EQ_INT(health_disk_free("/no/such/dir/at/all/file.raw"), 0);
 }
 
+// The picture's statistics: null until measured, then every field the page
+// and hellion top read, under its unique key, in a file that still parses.
+static void test_reports_image_statistics(void) {
+  HealthSnapshot s = {.recording_state = RECORDING_OFF};
+  char *out = publish_and_read(&s);
+  CHECK(out && strstr(out, "\"image\":null}") != NULL);
+  CHECK(out && strstr(out, "\"auto_visibility\":false") != NULL);
+  free(out);
+
+  s.image.valid = true;
+  s.image.auto_on = true;
+  s.image.p1 = 3;
+  s.image.p50 = 77;
+  s.image.p99 = 240;
+  s.image.dark_pm = 12;
+  s.image.clip_pm = 4;
+  s.image.cast_u = 9;
+  s.image.cast_v = -31;
+  s.image.hist32[0] = 500;
+  s.image.hist32[31] = 7;
+  out = publish_and_read(&s);
+  CHECK(out != NULL);
+  if (!out) return;
+  CHECK(strstr(out, "\"auto_visibility\":true") != NULL);
+  CHECK(strstr(out, "\"p1\":3,\"p50\":77,\"p99\":240,\"dark_pm\":12,"
+                    "\"clip_pm\":4,\"cast_u\":9,\"cast_v\":-31,\"hist\":[500,0,") != NULL);
+  CHECK(strstr(out, ",0,7]}}\n") != NULL);
+  free(out);
+}
+
 int main(void) {
   printf("test_health:\n");
   RUN_TEST(test_reports_recording_off);
@@ -192,5 +222,6 @@ int main(void) {
   RUN_TEST(test_leaves_no_temp_file);
   RUN_TEST(test_unwritable_path_is_not_fatal);
   RUN_TEST(test_disk_free_reports_something);
+  RUN_TEST(test_reports_image_statistics);
   TEST_MAIN_END();
 }

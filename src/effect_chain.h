@@ -1,5 +1,7 @@
 #pragma once
+#include "auto_vis.h"
 #include "config.h"
+#include "img_stats.h"
 #include "video_frame.h"
 
 /*
@@ -14,3 +16,13 @@
  * third (spare) buffer exists at all.
  */
 void apply_effect_chain(VideoFrame *frame, const Config *cfg);
+
+/*
+ * The same, with auto visibility (auto_vis.h) run first when
+ * cfg->auto_visibility is set: it reads raw and writes work, and the chain
+ * continues from work, so a neighborhood op after it sees the corrected
+ * picture. `stats` must describe frame->raw_planes. Sets frame->stats.auto_on
+ * to whether it ran.
+ */
+void apply_effect_chain_auto(VideoFrame *frame, const Config *cfg,
+                             AutoVis *av, const ImgStats *stats);

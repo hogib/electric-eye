@@ -577,6 +577,12 @@ static bool parse_config(const char *buf, size_t len, Config *out) {
           printf("Config: invalid value for \"record_path\"\n");
           return false;
         }
+      } else if (strcmp(key, "auto_visibility") == 0) {
+        if (!parse_bool(&c, &parsed.auto_visibility)) {
+          printf("Config: invalid value for \"auto_visibility\" (expected "
+                 "true or false)\n");
+          return false;
+        }
       } else if (strcmp(key, "camera") == 0) {
         if (!parse_camera(&c, &parsed.camera))
           return false; // parse_camera already explained why

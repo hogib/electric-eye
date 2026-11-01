@@ -268,6 +268,15 @@ by `hellion/embed.c`), so there is nothing to install beside it.
 | `GET /api/status` | This `hellion`'s pipelines as JSON, for scripts |
 | `POST /api/peer` | The status exchange between the two ends — see [ROV ↔ topside status](#rov--topside-status) |
 
+**Auto visibility** is the first thing on the page: a full-width button (and the `A`
+key) that writes `"auto_visibility"` into `eeye`'s config like any other change —
+locally, or through the ROV in placement B — and turns back if `eeye` refuses. The
+button shows what was asked for; an **AUTO VISIBILITY** badge on the picture shows
+what `eeye`'s health file says it is doing, so the two can never be confused. Under it,
+a histogram of the camera's raw picture and notes in words (crushed blacks, blown
+highlights, a colour cast, low contrast), from the `image` block of `eeye`'s health
+(see [output.md](output.md#health-reporting-healthc)).
+
 The preview is **any frame bus stream** on the topside machine, chosen in the page:
 `pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. Each
 viewer reads the bus directly, so viewers cost the pipeline nothing.
@@ -380,6 +389,7 @@ FRAME BUS  /dev/shm
 
 EEYE  /var/lib/eeye/effects.json
   health 1s old  camera connected  640x480  150 frames  recording off
+  auto visibility ON  camera picture: luma 44/101/147 (1/50/99%)  0.0% black  0.0% clipped  cast 20/-35
   last config load accepted  6s ago
 
 LOG  "rov", last 5 of 5 lines

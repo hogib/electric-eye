@@ -1,4 +1,5 @@
 #pragma once
+#include "img_stats.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -48,6 +49,11 @@ typedef struct {
   // frames up against other sensors -- autonomy, above all -- gets the
   // camera's time, not the time a frame happened to reach it.
   uint64_t capture_ns;
+
+  // What the raw frame looks like (img_stats.h), set by the effects thread
+  // and published by the consumer through the health file. valid is false
+  // until the effects thread has measured this frame.
+  FrameStats stats;
 
   // The three allocations behind the role pointers above. Roles can move
   // between them -- effect_chain.c swaps work and spare instead of copying

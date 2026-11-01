@@ -91,6 +91,7 @@ ALL_LDLIBS = $(EE_LDLIBS) $(LDLIBS)
 
 SRC := \
 	src/eeye.c \
+	src/auto_vis.c \
 	src/bus_in.c \
 	src/camera_ctrl.c \
 	src/child_proc.c \
@@ -100,6 +101,7 @@ SRC := \
 	src/fbus.c \
 	src/frame_ring_buffer.c \
 	src/health.c \
+	src/img_stats.c \
 	src/jpeg_decode.c \
 	src/video_frame.c \
 	src/point_opps.c \
@@ -176,7 +178,7 @@ $(OBJDIR)/%.o: %.c
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
 	canny health camera_ctrl recorder effect_chain child_proc \
-	virtual_cam fbus hellion http
+	virtual_cam fbus hellion http auto_vis
 
 # Extra translation units each test needs beyond the one it includes:
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
@@ -195,6 +197,7 @@ test_recorder_SRC := src/frame_ring_buffer.c src/health.c src/video_frame.c
 test_child_proc_SRC :=
 test_fbus_SRC :=
 test_http_SRC :=
+test_auto_vis_SRC := src/img_stats.c
 test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
 	hellion/hstatus.c hellion/http.c hellion/jpeg.c hellion/udp_relay.c \
 	hellion/pipeline.c hellion/hrecord.c hellion/sinks.c src/camera_ctrl.c \
@@ -202,8 +205,8 @@ test_hellion_SRC := hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
 	src/fbus.c src/jpeg_decode.c src/rpicam_in.c src/v4l2_in.c src/v4l2_out.c \
 	src/video_frame.c src/virtual_cam.c
 test_virtual_cam_SRC := src/child_proc.c src/v4l2_out.c src/video_frame.c
-test_effect_chain_SRC := src/camera_ctrl.c src/config.c src/conv.c src/fbus.c \
-	src/point_opps.c src/video_frame.c
+test_effect_chain_SRC := src/auto_vis.c src/camera_ctrl.c src/config.c src/conv.c \
+	src/fbus.c src/img_stats.c src/point_opps.c src/video_frame.c
 
 $(OBJDIR)/tests/%.o: EE_CPPFLAGS += -Itests -Ihellion
 

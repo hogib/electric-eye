@@ -130,6 +130,37 @@
   label.field.gated { opacity: 0.4; }
   label.field .val { float: right; font-family: monospace; opacity: 0.8; }
 
+  /* Auto visibility: the one control a pilot reaches for mid-dive, so it
+     is the first thing in the panel, full width and tall enough to hit
+     without looking, and impossible to misread: grey and labelled OFF, or
+     bright and labelled ON. */
+  #btn-auto {
+    display: block; width: 100%; margin: 4px 0 6px; padding: 16px 10px;
+    font-size: 18px; font-weight: bold; letter-spacing: 0.04em;
+    border: 2px solid #555; border-radius: 6px; cursor: pointer;
+    background: #2a2a2a; color: #bbb;
+  }
+  #btn-auto .sub { display: block; font-size: 12px; font-weight: normal;
+                   letter-spacing: 0; margin-top: 3px; opacity: 0.85; }
+  #btn-auto.on { background: #19c3b0; border-color: #7ff3e4; color: #04211d; }
+  #btn-auto:disabled { opacity: 0.6; cursor: progress; }
+  /* The same state on the picture itself, for a pilot who never looks at
+     the panel: what they see is being processed. Shows what eeye reports
+     it is doing, not what was asked for. */
+  #autobadge {
+    position: absolute; left: 10px; bottom: 10px; z-index: 2;
+    padding: 5px 10px; border-radius: 4px; font-weight: bold;
+    font-size: 14px; letter-spacing: 0.06em;
+    background: rgba(25, 195, 176, 0.9); color: #04211d; display: none;
+  }
+  #autobadge.on { display: block; }
+  #picture { display: flex; gap: 10px; align-items: flex-start; margin: 4px 0; }
+  #hist { flex: none; width: 128px; height: 48px; background: #0b0b0b;
+          border: 1px solid #2b2b2b; border-radius: 3px; }
+  #picnotes { font-size: 13px; line-height: 1.35; }
+  #picnotes .warn { color: #fc6; }
+  #picnotes .ok { color: #8d8; }
+
   #recstate { margin: 4px 0 2px; font-size: 13px; }
   #recstate.active { color: #6f6; }
   #recstate.failed { color: #f66; font-weight: bold; }
@@ -141,8 +172,20 @@
   <div id="videowrap">
     <img id="video" alt="">
     <div id="banner"></div>
+    <div id="autobadge">AUTO VISIBILITY</div>
   </div>
   <div id="panel">
+    <button id="btn-auto" type="button">AUTO VISIBILITY: OFF
+      <span class="sub">tap to turn on (A)</span></button>
+    <div id="picture">
+      <canvas id="hist" width="128" height="48"></canvas>
+      <div id="picnotes" class="readonly">camera picture: -</div>
+    </div>
+    <div class="readonly">Auto visibility continuously corrects the water's
+      colour cast, the brightness range and haze on the pilot's picture,
+      before the effect chain. The histogram and notes describe the camera's
+      own picture, before any of it.</div>
+
     <h2>Effect chain</h2>
     <div id="stages"></div>
     <button id="add-stage" type="button">+ Add stage</button>
@@ -379,6 +422,7 @@ function buildConfig() {
   }
   return {
     chain,
+    auto_visibility: autoVisibility,
     record_path: document.getElementById("record_path").value,
     ...(Object.keys(buildCameraObject()).length
         ? {camera: buildCameraObject()} : {}),
@@ -387,6 +431,8 @@ function buildConfig() {
 }
 
 function loadConfig(cfg) {
+  autoVisibility = cfg.auto_visibility === true;
+  renderAutoButton();
   stagesEl.innerHTML = "";
   for (const stage of (cfg.chain || [])) addStage(stage);
   if (stagesEl.children.length === 0) addStage();
@@ -751,10 +797,98 @@ const banner = document.getElementById("banner");
 const video = document.getElementById("video");
 const recstate = document.getElementById("recstate");
 
+// --- Auto visibility ---------------------------------------------------
+//
+// What was asked for (autoVisibility, from the config) and what eeye says
+// it is doing (the health file's auto_visibility) are kept apart: the
+// button shows the request, the badge on the picture shows the fact.
+let autoVisibility = false;
+const autoBtn = document.getElementById("btn-auto");
+const autoBadge = document.getElementById("autobadge");
+
+function renderAutoButton() {
+  autoBtn.className = autoVisibility ? "on" : "";
+  autoBtn.firstChild.textContent =
+    autoVisibility ? "AUTO VISIBILITY: ON" : "AUTO VISIBILITY: OFF";
+  autoBtn.querySelector(".sub").textContent = autoVisibility
+    ? "correcting colour, brightness and haze — tap to turn off (A)"
+    : "tap to turn on (A)";
+}
+
+async function toggleAuto() {
+  if (autoBtn.disabled) return;
+  autoVisibility = !autoVisibility;
+  renderAutoButton();
+  autoBtn.disabled = true;
+  try {
+    await applyConfig();
+  } finally {
+    autoBtn.disabled = false;
+  }
+  // A config eeye refused leaves the previous one running: show that,
+  // not what was asked for.
+  if (document.getElementById("status").className === "err") {
+    autoVisibility = !autoVisibility;
+    renderAutoButton();
+  }
+}
+autoBtn.addEventListener("click", toggleAuto);
+document.addEventListener("keydown", (e) => {
+  const t = e.target.tagName;
+  if ((e.key === "a" || e.key === "A") && !e.ctrlKey && !e.metaKey &&
+      !e.altKey && t !== "INPUT" && t !== "SELECT" && t !== "TEXTAREA") {
+    e.preventDefault();
+    toggleAuto();
+  }
+});
+
+const histCanvas = document.getElementById("hist");
+const picNotes = document.getElementById("picnotes");
+
+// The camera's picture, from eeye's measurements of the raw frame: a
+// histogram, and what is wrong with it in words.
+function renderPicture(drone) {
+  const im = drone.image;
+  const g = histCanvas.getContext("2d");
+  g.clearRect(0, 0, histCanvas.width, histCanvas.height);
+  if (!im) {
+    picNotes.textContent = drone.error ? "camera picture: unknown"
+                                       : "camera picture: no frames yet";
+    return;
+  }
+  const max = Math.max(1, ...im.hist);
+  const bw = histCanvas.width / im.hist.length;
+  for (let i = 0; i < im.hist.length; i++) {
+    const h = Math.round(im.hist[i] / max * (histCanvas.height - 2));
+    // Bins shaded by the brightness they count, crushed and clipped ends
+    // in amber.
+    const shade = Math.round(60 + i * 6);
+    g.fillStyle = (i === 0 || i === im.hist.length - 1) && im.hist[i] > 20
+      ? "#e9a23b" : `rgb(${shade},${shade},${shade})`;
+    g.fillRect(i * bw, histCanvas.height - h, bw - 1, h);
+  }
+  const notes = [];
+  if (im.dark_pm > 250)
+    notes.push(`<span class="warn">${(im.dark_pm / 10).toFixed(0)}% crushed black — needs light or exposure</span>`);
+  else if (im.p50 < 40)
+    notes.push(`<span class="warn">dark (median ${im.p50})</span>`);
+  if (im.clip_pm > 20)
+    notes.push(`<span class="warn">${(im.clip_pm / 10).toFixed(1)}% blown out — too much exposure or light</span>`);
+  const cast = Math.hypot(im.cast_u, im.cast_v);
+  if (cast > 20)
+    notes.push(`<span class="warn">strong ${im.cast_u > 0 && im.cast_v < 0 ? "blue-green" : im.cast_v < 0 ? "green" : "colour"} cast</span>`);
+  if (im.p99 - im.p1 < 110)
+    notes.push(`<span class="warn">low contrast (range ${im.p1}–${im.p99})</span>`);
+  if (!notes.length) notes.push('<span class="ok">camera picture looks fine</span>');
+  picNotes.innerHTML = notes.join("<br>");
+}
+
 function renderHealth(h) {
   const link = h.link || {};
   const drone = h.drone || {};
   renderRecorder(h.recorder);
+  renderPicture(drone);
+  autoBadge.className = drone.auto_visibility === true ? "on" : "";
 
   // Link first: if the picture is not live, nothing else on screen
   // matters as much.

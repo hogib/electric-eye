@@ -207,6 +207,20 @@ static void test_camera_boundaries_accepted(void) {
 // stream_raw / stream_frame_interval / stream_quality and must still load:
 // an eeye that refused its own old config would come up with no video.
 // Still type-checked, so a mangled value is caught rather than ignored.
+// Auto visibility changes what the pilot sees, so it is off unless asked
+// for, and only a real JSON bool turns it on.
+static void test_auto_visibility_key(void) {
+  Config c;
+  CHECK(parse("{}", &c));
+  CHECK(c.auto_visibility == false);
+  CHECK(parse("{\"auto_visibility\":true}", &c));
+  CHECK(c.auto_visibility == true);
+  CHECK(parse("{\"auto_visibility\":false}", &c));
+  CHECK(c.auto_visibility == false);
+  CHECK(!parse("{\"auto_visibility\":1}", &c));
+  CHECK(!parse("{\"auto_visibility\":\"on\"}", &c));
+}
+
 static void test_old_preview_keys_still_load(void) {
   Config c;
   CHECK(parse("{\"chain\":[{\"effect\":\"blur\"}],\"stream_raw\":true,"
@@ -570,6 +584,7 @@ int main(void) {
   RUN_TEST(test_log_parameter_validation);
   RUN_TEST(test_canny_threshold_defaults);
   RUN_TEST(test_old_preview_keys_still_load);
+  RUN_TEST(test_auto_visibility_key);
   RUN_TEST(test_camera_controls_default_to_unset);
   RUN_TEST(test_camera_controls_round_trip);
   RUN_TEST(test_camera_explicit_zero_is_kept);

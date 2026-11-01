@@ -7,6 +7,7 @@
 #include "hstatus.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -268,6 +269,30 @@ static void draw_eeye(const char *config_path) {
     seg(strcmp(rec, "failed") == 0 ? C_BAD : C_NONE, "%s", rec);
     if (rec_err[0])
       seg(C_BAD, " (%s)", rec_err);
+    line_end();
+
+    // The camera's picture as eeye measures it, and whether auto
+    // visibility is processing it.
+    char av[8] = "", p1[8] = "", p50[8] = "", p99[8] = "", cu[8] = "",
+         cv[8] = "", dark[8] = "", clip[8] = "";
+    json_field(health, "auto_visibility", av, sizeof av);
+    seg(C_NONE, "  auto visibility ");
+    seg(strcmp(av, "true") == 0 ? C_OK : C_DIM, "%s",
+        strcmp(av, "true") == 0 ? "ON" : "off");
+    if (json_field(health, "p50", p50, sizeof p50)) {
+      json_field(health, "p1", p1, sizeof p1);
+      json_field(health, "p99", p99, sizeof p99);
+      json_field(health, "cast_u", cu, sizeof cu);
+      json_field(health, "cast_v", cv, sizeof cv);
+      json_field(health, "dark_pm", dark, sizeof dark);
+      json_field(health, "clip_pm", clip, sizeof clip);
+      double d = atof(dark) / 10, c = atof(clip) / 10;
+      double cast = hypot(atof(cu), atof(cv));
+      seg(C_NONE, "  camera picture: luma %s/%s/%s (1/50/99%%)", p1, p50, p99);
+      seg(d > 25 ? C_WARN : C_NONE, "  %.1f%% black", d);
+      seg(c > 2 ? C_WARN : C_NONE, "  %.1f%% clipped", c);
+      seg(cast > 20 ? C_WARN : C_NONE, "  cast %s/%s", cu, cv);
+    }
     line_end();
   }
 

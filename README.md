@@ -141,6 +141,16 @@ answering), `2` down (no video). Every line names what is wrong.
 
 **During the dive**, the page at `http://<topside>:8080/`:
 
+- **AUTO VISIBILITY** — the big button at the top (or the `A` key). On, `eeye`
+  continuously corrects the pilot's picture for what water does to it: the blue-green
+  colour cast, a squashed brightness range, and haze. It follows the light as you
+  descend, smoothly, with nothing to adjust. **Off by default**; while it is on the
+  picture carries an **AUTO VISIBILITY** badge, so nobody mistakes the processed
+  picture for the camera's. Under the button, a histogram of the camera's own picture
+  and what is wrong with it in words ("strong blue-green cast", "12% blown out —
+  too much exposure or light"), which also says when the fix is the camera's exposure
+  or the lights rather than anything on screen. See
+  [Auto visibility](#auto-visibility).
 - **The picture** — any frame bus stream (`pilot`, or `camera`/`raw` to see past the
   effects), at ~15fps. When frames stop it greys out with a banner saying how stale it
   is: a frozen picture never looks live.
@@ -259,6 +269,7 @@ Every key is optional. Defaults shown:
 ```json
 {
   "chain": [{"effect": "sobel"}],
+  "auto_visibility": false,
   "record_path": "",
   "record_format": "raw",
   "capture_width": 1280,
@@ -284,6 +295,34 @@ Every key is optional. Defaults shown:
 **Writer contract:** write a temp file in the same directory, then `rename()` onto
 the target. In-place overwrite also works, but rename guarantees a reader never
 sees a half-written file.
+
+### Auto visibility
+
+`"auto_visibility": true` (the page's big button) runs a continuous correction ahead of
+the chain, on the pilot's picture only — the `raw` stream, recordings `eeye` makes, and
+anything autonomy reads stay the camera's own frame. Every frame it measures the
+camera's picture and corrects three things, each smoothed over ~0.4s so the picture
+neither flickers nor pumps, but follows a descent:
+
+- **Colour cast** — the average colour of well-exposed pixels is moved back to near
+  neutral (gray world), scaled with brightness, then saturation is lifted a little.
+  A scene's own colours average out to a small cast that is left alone, so a red
+  object does not turn the rest of the picture blue.
+- **Brightness range** — the 0.5th to 99.5th percentiles are stretched to full range
+  (a few specks of backscatter cannot defeat it, unlike `contrast`), with a gamma that
+  puts the median at mid-grey. The stretch is capped (~2.7×) so dark open water does
+  not turn its sensor noise into texture.
+- **Haze** — contrast-limited adaptive histogram equalization (CLAHE) on brightness,
+  tile by tile, blended with the global correction.
+
+On synthetic underwater frames it takes the cast from 39 to 9, the brightness range
+from 129 to 249 levels, and more than doubles edge contrast; on a still scene the
+picture is still. It adds ~1.2 ms per 720p frame on an x86 desktop (all cores); the Pi
+is not measured yet. Switching on takes effect on the next frame, with no fade-in.
+The effect chain runs on its output, so `auto_visibility` and, say, `sobel` combine.
+
+It works on the picture, not the camera: it cannot recover highlights the sensor
+clipped or detail lost in black. The page's notes say when that is the problem.
 
 ### Effects
 

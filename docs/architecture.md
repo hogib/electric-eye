@@ -11,7 +11,7 @@ own them.
 | Thread | Entry point | Job |
 |---|---|---|
 | producer | `producer_loop` | Owns the camera. Captures into a frame, pushes it downstream. |
-| effects | `effects_loop` | Runs the effect chain on each frame. |
+| effects | `effects_loop` | Measures each raw frame (`img_stats.c`), runs auto visibility when it is on, then the effect chain. |
 | consumer | `consumer_loop` | Writes to the virtual camera, publishes to the frame bus, then hands the frame to the recording tap. |
 | recorder | `writer_loop` in `recorder.c` | Owns the recording file. Writes frames the consumer hands it, returns them to the pool. |
 | stats | `stats_loop` | Logs ring occupancy and effects time every 5s. Purely diagnostic. |

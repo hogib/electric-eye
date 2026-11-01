@@ -74,7 +74,7 @@ void health_publish(const char *config_path, const HealthSnapshot *snap) {
           "{\"recording\":{\"state\":\"%s\",\"path\":\"%s\",\"error\":\"%s\","
           "\"bytes\":%llu,\"dropped_frames\":%llu,\"disk_free_bytes\":%llu},"
           "\"camera\":{\"connected\":%s,\"frames\":%llu},"
-          "\"geometry\":{\"width\":%u,\"height\":%u}}\n",
+          "\"geometry\":{\"width\":%u,\"height\":%u},",
           state_name(snap->recording_state), esc_path, esc_err,
           (unsigned long long)snap->recording_bytes,
           (unsigned long long)snap->recording_dropped,
@@ -82,6 +82,23 @@ void health_publish(const char *config_path, const HealthSnapshot *snap) {
           snap->camera_connected ? "true" : "false",
           (unsigned long long)snap->frames_captured, snap->frame_width,
           snap->frame_height);
+
+  // The picture's statistics. Unique key names throughout, like the rest of
+  // this file: hellion top reads fields out by name without a JSON parser.
+  const FrameStats *im = &snap->image;
+  fprintf(f, "\"auto_visibility\":%s,\"image\":", im->auto_on ? "true" : "false");
+  if (!im->valid) {
+    fprintf(f, "null}\n");
+  } else {
+    fprintf(f,
+            "{\"p1\":%u,\"p50\":%u,\"p99\":%u,\"dark_pm\":%u,"
+            "\"clip_pm\":%u,\"cast_u\":%d,\"cast_v\":%d,\"hist\":[",
+            im->p1, im->p50, im->p99, im->dark_pm, im->clip_pm, im->cast_u,
+            im->cast_v);
+    for (int b = 0; b < 32; b++)
+      fprintf(f, b ? ",%u" : "%u", im->hist32[b]);
+    fprintf(f, "]}}\n");
+  }
 
   if (fclose(f) != 0 || rename(tmp, path) != 0)
     unlink(tmp);

@@ -153,9 +153,20 @@ knows.
                 "bytes": 24166195200, "dropped_frames": 0,
                 "disk_free_bytes": 27641176064},
   "camera": {"connected": true, "frames": 13110},
-  "geometry": {"width": 1280, "height": 720}
+  "geometry": {"width": 1280, "height": 720},
+  "auto_visibility": false,
+  "image": {"p1": 3, "p50": 77, "p99": 240, "dark_pm": 12, "clip_pm": 4,
+            "cast_u": 9, "cast_v": -31, "hist": [500, 0, "...", 7]}
 }
 ```
+
+`image` describes the **camera's** picture (the raw frame, before auto visibility and
+the chain), measured every frame by `img_stats.c`: luma percentiles, the permille of
+samples crushed below 16 or clipped at 250 and above, the mean chroma offset of
+well-exposed pixels (the colour cast; water is positive U, negative V), and a 32-bin
+luma histogram in permille. `null` until the first frame. `auto_visibility` is whether
+it actually processed the latest frame. The page draws the histogram and turns these
+into words; `hellion top` prints them.
 
 `state` is one of `off`, `active`, `failed`.
 
