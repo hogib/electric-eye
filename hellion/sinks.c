@@ -43,6 +43,7 @@ struct SinkImpl {
   // stamps them at (see ff_encoder_args).
   uint64_t rate_window_ns;
   uint64_t rate_window_frames;
+  uint64_t rate_last_ns; // the previous frame, to notice gaps
   double measured_fps;
   bool warned_rate;
 };
@@ -104,7 +105,12 @@ static void encoder_failed(SinkImpl *s, const char *why) {
 // but a recording plays at the wrong speed. Say so once, with the fix.
 static void check_rate(SinkImpl *s, uint64_t now) {
   static const uint64_t window_ns = 10000000000ull;
-  if (s->rate_window_ns == 0) {
+  // A pause in the stream (the source restarting, the camera unplugged)
+  // is not a frame rate: start measuring afresh after one.
+  static const uint64_t gap_ns = 1000000000ull;
+  bool gap = s->rate_last_ns && now - s->rate_last_ns > gap_ns;
+  s->rate_last_ns = now;
+  if (s->rate_window_ns == 0 || gap) {
     s->rate_window_ns = now;
     s->rate_window_frames = 0;
     return;
@@ -117,14 +123,13 @@ static void check_rate(SinkImpl *s, uint64_t now) {
   s->rate_window_ns = now;
   s->rate_window_frames = 0;
   double nominal = (double)s->enc_cfg.framerate;
-  if (!s->warned_rate && (s->measured_fps < nominal * 0.9 ||
-                          s->measured_fps > nominal * 1.1)) {
+  bool off = s->measured_fps < nominal * 0.9 || s->measured_fps > nominal * 1.1;
+  if (off && !s->warned_rate)
     printf("hellion: rtp sink %s: frames arrive at %.1f fps but are stamped "
            "at %u fps; recordings of this stream will play at the wrong "
            "speed. Set this pipeline's \"framerate\" to %.0f.\n",
            s->arg, s->measured_fps, s->enc_cfg.framerate, s->measured_fps);
-    s->warned_rate = true;
-  }
+  s->warned_rate = off; // cleared again once the rate is back in range
 }
 
 static bool rtp_open(SinkImpl *s, const PipelineConfig *pc, SinkReport *rep) {

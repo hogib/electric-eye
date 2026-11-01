@@ -52,6 +52,7 @@ typedef struct Sink {
   uint64_t dropped;
   SinkReport rep;
   FpsMeter fps;
+  uint64_t last_frame_ns; // last frame taken from the mailbox; 0 = none
   // The sink thread's implementation, published so the status thread can
   // ask a network sink for its link stats. Set and cleared under lock.
   SinkImpl *impl;
@@ -188,6 +189,7 @@ static void *sink_loop(void *arg) {
     pthread_mutex_lock(&s->lock);
     if (ok)
       s->frames++;
+    s->last_frame_ns = mono_ns();
     s->rep = rep;
     if (reopened)
       s->impl = impl;
@@ -742,6 +744,14 @@ void pipeline_status(Pipeline *p, HsPipeline *out) {
     pthread_mutex_lock(&s->lock);
     endpoint(&out->sinks[i], spec, s->rep.state, s->rep.detail, s->frames,
              s->dropped, fps_update(&s->fps, s->frames, now));
+    // A sink reports its state when it handles a frame, so with no frames
+    // coming its last word ("sending") would stand. Say what is true.
+    if (s->last_frame_ns && now - s->last_frame_ns > 2000000000ull) {
+      snprintf(out->sinks[i].state, sizeof out->sinks[i].state, "idle");
+      snprintf(out->sinks[i].detail, sizeof out->sinks[i].detail,
+               "no frames from the source for %.0fs",
+               (double)(now - s->last_frame_ns) / 1e9);
+    }
     RelayStats rs;
     if (sink_impl_net(s->impl, &rs))
       endpoint_net(&out->sinks[i], &rs);
