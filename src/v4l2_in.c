@@ -51,6 +51,10 @@ struct V4l2In {
   // See jpeg_decode.h -- shared with the rpicam backend, which faces the
   // same MJPEG-to-I422 problem from a pipe rather than an MMAP buffer.
   JpegDecoder *jpeg_decoder;
+  // Older frames handed straight back to the driver unread, to decode
+  // only the newest (see v4l2_in_capture), and when that was last logged.
+  uint64_t stale_skipped;
+  uint64_t stale_logged;
 };
 
 // YUYV is packed 4:2:2: every 2 horizontal pixels are 4 bytes, Y0 U0 Y1 V0
@@ -247,6 +251,33 @@ bool v4l2_in_capture(V4l2In *in, VideoFrame *frame) {
         continue;
       printf("v4l2_in: VIDIOC_DQBUF failed: %s\n", strerror(errno));
       return false;
+    }
+
+    // Only the newest frame is worth decoding. When every buffer fills
+    // (one slow decode is enough), the driver drops the *new* frames and
+    // keeps the old ones queued, and nothing ever drains them: the picture
+    // would stay that many frames behind -- 100ms and more -- for good.
+    // So take whatever else is ready, hand the older ones straight back,
+    // and keep the last. In steady state this is one extra ioctl that
+    // returns EAGAIN.
+    for (;;) {
+      struct v4l2_buffer newer = {0};
+      newer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      newer.memory = V4L2_MEMORY_MMAP;
+      if (xioctl(in->fd, VIDIOC_DQBUF, &newer) < 0)
+        break; // EAGAIN: buf is the newest there is
+      if (xioctl(in->fd, VIDIOC_QBUF, &buf) < 0) {
+        printf("v4l2_in: VIDIOC_QBUF failed: %s\n", strerror(errno));
+        return false;
+      }
+      buf = newer;
+      in->stale_skipped++;
+    }
+    if (in->stale_skipped >= in->stale_logged + 100) {
+      printf("v4l2_in: skipped %llu queued frames in all, to show the newest "
+             "(capture or decode is falling behind)\n",
+             (unsigned long long)in->stale_skipped);
+      in->stale_logged = in->stale_skipped;
     }
 
     const uint8_t *data = (const uint8_t *)in->buffers[buf.index].start;

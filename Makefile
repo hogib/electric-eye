@@ -70,6 +70,29 @@ $(warning OpenMP not available: conv.c/point_opps.c will build, but their \
   loops will run single-threaded.)
 endif
 
+# NEON on 32-bit ARM. conv.c and point_opps.c have NEON paths, compiled in
+# only when the compiler defines __ARM_NEON -- and the compilers 32-bit Pi
+# OS and Debian armhf ship do not by default (armv6 + VFP, or armv7 with
+# VFPv3-D16), so a plain `make` there ran every effect scalar: ~3.5-6x the
+# instructions for sobel, blur and LoG. On 32-bit hard-float ARM without
+# NEON already on, this adds what the release armv7 build uses, if the
+# compiler takes it. The binary then needs an ARMv7 with NEON and VFPv4:
+# every Pi from the Pi 2 v1.1 on, not the Pi 1 or Zero. NEON=0 leaves the
+# compiler's defaults alone. 64-bit ARM always has NEON; x86 is unaffected.
+ifeq ($(origin NEON),undefined)
+NEON := 1
+endif
+ifeq ($(NEON),1)
+ARM_NEON_FLAGS := -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard
+NEED_NEON_FLAGS := $(shell echo | $(CC) $(CFLAGS) -dM -E - 2>/dev/null | \
+  grep -q '__ARM_PCS_VFP' && ! (echo | $(CC) $(CFLAGS) -dM -E - 2>/dev/null | \
+  grep -q '__ARM_NEON') && echo 'int main(void){return 0;}' | \
+  $(CC) $(ARM_NEON_FLAGS) -x c - -o /dev/null >/dev/null 2>&1 && echo 1)
+ifeq ($(NEED_NEON_FLAGS),1)
+EE_CFLAGS += $(ARM_NEON_FLAGS)
+endif
+endif
+
 # libturbojpeg (libjpeg-turbo 1.4 or newer: that's where the planar-YUV
 # API this uses first appeared). Older distros' pkg-config may not know the
 # library even when it is installed, hence the bare -lturbojpeg fallback.

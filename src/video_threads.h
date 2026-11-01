@@ -1,8 +1,27 @@
 #pragma once
 #include "config.h"
 #include "frame_ring_buffer.h"
+#include "health.h"
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+
+// The health snapshot, from the consumer to whoever writes the file.
+// Writing it is file I/O on the SD card (fopen, rename, statvfs), which
+// can block for tens to hundreds of milliseconds while a raw recording
+// fills the card -- not something the thread feeding the pilot's picture
+// can wait on. So the consumer only fills this (a struct copy under a
+// mutex) and stats_loop writes it. `writer` says stats_loop is there to
+// do it; it is optional, and without it the consumer writes the file
+// itself as before.
+typedef struct {
+  pthread_mutex_t lock;
+  HealthSnapshot snap; // under lock
+  bool fresh;          // under lock: snap not yet written
+  bool writer;         // atomic (see compat.h)
+  const char *config_path;
+} HealthMailbox;
 
 static inline void sleep_us(long microseconds) {
   struct timespec ts;
@@ -84,6 +103,7 @@ typedef struct {
   // "" publishes nothing.
   const char *bus_pilot;
   const char *bus_raw;
+  HealthMailbox *health;
 } ConsumerArgs;
 
 // All three rings, read-only from here -- stats_loop only ever calls
@@ -94,6 +114,7 @@ typedef struct {
   const FrameRingBuffer *ring_buffer_in;
   const FrameRingBuffer *ring_buffer_out;
   const FrameRingBuffer *ring_buffer_free;
+  HealthMailbox *health; // written from here when set
 } StatsArgs;
 
 void *producer_loop(void *arg);

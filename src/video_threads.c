@@ -212,6 +212,10 @@ void *producer_loop(void *arg) {
             printf("Camera controls changed; restarting rpicam-vid to "
                    "apply them (brief gap in video)...\n");
             controls_need_restart = true;
+            // The frame taken from the pool above goes back first: dropped
+            // here, every control change would cost one of the pool's
+            // eight frames, and the eighth would freeze the video.
+            ring_push_wait(args->ring_buffer_free, frame, NULL);
             break; // drop to the reconnect loop, which reopens with them
           }
         }
@@ -421,9 +425,18 @@ void *consumer_loop(void *arg) {
       }
       health.frames_captured = (uint64_t)frame->pts;
       health.image = frame->stats;
-      health.disk_free_bytes =
-          health.recording_path[0] ? health_disk_free(health.recording_path) : 0;
-      health_publish(args->config_path, &health);
+      HealthMailbox *box = args->health;
+      if (box && __atomic_load_n(&box->writer, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&box->lock);
+        box->snap = health;
+        box->fresh = true;
+        pthread_mutex_unlock(&box->lock);
+      } else {
+        health.disk_free_bytes = health.recording_path[0]
+                                     ? health_disk_free(health.recording_path)
+                                     : 0;
+        health_publish(args->config_path, &health);
+      }
     }
 
     // The recorder takes the frame and returns it to the pool once it is
@@ -452,14 +465,37 @@ static void log_ring_stats(const char *name, const FrameRingBuffer *rb) {
         (unsigned long long)s.full_stalls, (unsigned long long)s.empty_stalls);
 }
 
+// Writes the consumer's latest health snapshot, if there is a new one.
+// The file I/O happens here, off the consumer thread (see HealthMailbox).
+static void write_health(HealthMailbox *box) {
+  if (!box)
+    return;
+  HealthSnapshot snap;
+  pthread_mutex_lock(&box->lock);
+  bool fresh = box->fresh;
+  if (fresh) {
+    snap = box->snap;
+    box->fresh = false;
+  }
+  pthread_mutex_unlock(&box->lock);
+  if (!fresh)
+    return;
+  snap.disk_free_bytes =
+      snap.recording_path[0] ? health_disk_free(snap.recording_path) : 0;
+  health_publish(box->config_path, &snap);
+}
+
 void *stats_loop(void *arg) {
   StatsArgs *args = (StatsArgs *)arg;
+  if (args->health)
+    __atomic_store_n(&args->health->writer, true, __ATOMIC_RELEASE);
 
   while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST)) {
     for (int waited_ms = 0; waited_ms < STATS_LOG_INTERVAL_MS &&
                             __atomic_load_n(args->is_running, __ATOMIC_SEQ_CST);
          waited_ms += 100) {
       sleep_us(100000); // 100ms chunks so shutdown is noticed promptly
+      write_health(args->health); // within 100ms of the consumer's snapshot
     }
     if (!__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST))
       break; // don't log a final partial-interval snapshot on shutdown --
@@ -487,5 +523,9 @@ void *stats_loop(void *arg) {
     }
   }
 
+  if (args->health) {
+    __atomic_store_n(&args->health->writer, false, __ATOMIC_RELEASE);
+    write_health(args->health); // the last snapshot it was handed
+  }
   return NULL;
 }

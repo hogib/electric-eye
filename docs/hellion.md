@@ -316,6 +316,25 @@ The preview is **any frame bus stream** on the topside machine, chosen in the pa
 `pilot` (what the pilot sees), `camera`/`raw` (before effects) where they exist. Each
 viewer reads the bus directly, so viewers cost the pipeline nothing.
 
+The page reads the MJPEG stream with `fetch()` rather than an `<img src>`, so it knows
+when each picture arrives. It reopens the stream whenever it ends, fails (a 503 when all
+four preview slots are taken), or delivers nothing for 3s, and stops it while the tab is
+hidden. The health check greys the picture with `PICTURE NOT UPDATING` when the page's
+own copy is stale while the link is fine — an `<img>` left holding an ended stream used
+to show its last frame forever, and look live once the link recovered. On the server,
+a preview with nothing to send (its stream missing or silent) asks the socket each pass
+whether the viewer has gone (`http_peer_gone`); otherwise only a write would notice, and
+each page reload during an outage held a slot until `hellion` restarted.
+
+`/health` answers at once. Where `eeye` is on the peer, its health is fetched by the
+peer thread once a second (after the status exchange) and served from that copy, with
+`age_s` including how old the copy is, or an error naming why there is none — rather
+than every page poll waiting on the tether, which took 3s per poll with the ROV
+unreachable and delayed the very warning that matters then. The page polls one
+request at a time, each with a 2.5s deadline. `POST /config` and `POST /camera` are
+each serialized: both read a file or state they may have to restore, and wait for a
+verdict on their own write.
+
 **`eeye`'s config.** Where `eeye` runs on this machine (`eeye_config` set), a POST
 writes the file the way `eeye`'s watcher expects (temp file + rename) and waits up to
 3s for `eeye`'s verdict in `<config>.status`, comparing its mtime to the nanosecond.

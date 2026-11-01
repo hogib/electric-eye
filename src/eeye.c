@@ -109,10 +109,15 @@ WorkerArgs work_args = {
     .ring_buffer_out = &ring_buffer_out,
 };
 
+// The health file is written by the stats thread, off the consumer's
+// (see HealthMailbox in video_threads.h).
+static HealthMailbox health_box = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
 ConsumerArgs cons_args = {
     .is_running = &is_running,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
+    .health = &health_box,
 };
 
 StatsArgs stats_args = {
@@ -121,6 +126,7 @@ StatsArgs stats_args = {
     .ring_buffer_in = &ring_buffer_in,
     .ring_buffer_out = &ring_buffer_out,
     .ring_buffer_free = &ring_buffer_free,
+    .health = &health_box,
 };
 
 // The path main() re-executes. /proc/self/exe works as an execve() target
@@ -365,6 +371,7 @@ int main(int argc, char **argv) {
   prod_args.config = config_watcher;
   cons_args.config = config_watcher;
   cons_args.config_path = config_path;
+  health_box.config_path = config_path;
 
   pthread_t producer, worker, consumer, stats;
   if (pthread_create(&producer, NULL, producer_loop, &prod_args) != 0) {

@@ -237,7 +237,18 @@ void udp_relay_detach(UdpRelay *r, int id) {
 }
 
 // RTP bookkeeping for one packet; called with the lock held.
+// Silence longer than this restarts the sequence tracking. A sender that
+// kept going through an outage (a pulled cable) comes back thousands of
+// numbers on; past 32768 that reads as "behind", so every packet after it
+// would count as late -- cancelling real losses -- until the numbers
+// wrapped around again, up to a minute later. Nothing that late is still
+// worth reordering for, so the gap is not counted either: the outage is
+// what top shows as "no packets for Ns".
+static const uint64_t resync_after_ns = 1000000000ull;
+
 static void account(UdpRelay *r, const uint8_t *p, size_t n, uint64_t now) {
+  if (r->last_packet_ns && now - r->last_packet_ns > resync_after_ns)
+    r->have_seq = false;
   r->totals.packets++;
   r->totals.bytes += n;
   r->win_packets++;

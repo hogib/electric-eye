@@ -269,8 +269,13 @@ several-fold and will mislead you.
 | YUYV / yuv420 downscale | no (integer shifts, rarely used) |
 
 Every NEON block in `conv.c` builds on **ARMv7 as well as AArch64** (`GS_NEON`): none of
-its intrinsics is AArch64-only, so 32-bit Pi OS images no longer run the edge operators
-and blur scalar. `point_opps.c` keeps its separate ARMv7 branch for the min/max
+its intrinsics is AArch64-only. But it is compiled in only when the compiler defines
+`__ARM_NEON`, and the compilers 32-bit Pi OS and Debian armhf ship do not by default — a
+plain `make` there ran everything scalar (~3.5–6× the instructions for sobel, blur and
+LoG, counted under qemu). The `Makefile` now adds `-march=armv7-a -mfpu=neon-vfpv4
+-mfloat-abi=hard` on 32-bit hard-float ARM when NEON is not already on (`NEON=0` to
+opt out), the same flags as the release armv7 build; such a binary needs a Pi 2 v1.1 or
+newer. `point_opps.c` keeps its separate ARMv7 branch for the min/max
 reduction, which does need AArch64-only instructions.
 
 **NMS** selects 2 of 8 neighbours by direction, which is data-dependent addressing. It is

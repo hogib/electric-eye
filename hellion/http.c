@@ -364,6 +364,20 @@ bool http_stopping(const HttpConn *c) {
   return __atomic_load_n(&c->server->stop, __ATOMIC_ACQUIRE);
 }
 
+bool http_peer_gone(HttpConn *c) {
+  struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
+  if (poll(&pfd, 1, 0) <= 0)
+    return false; // nothing to read: still there, as far as anyone can tell
+  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    return true;
+  // Readable: either the orderly close (recv returns 0) or bytes the
+  // client sent anyway, which a GET with its body read never has.
+  char b;
+  ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+  return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR);
+}
+
 const char *http_client_addr(const HttpConn *c) { return c->addr; }
 
 static void plain_error(HttpConn *c, int status, const char *msg) {

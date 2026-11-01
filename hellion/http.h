@@ -82,6 +82,12 @@ void http_stop(HttpServer *s);
 // Whether the server is shutting down; long-running handlers poll it.
 bool http_stopping(const HttpConn *c);
 
+// Whether the client has hung up, without blocking. A long-running
+// handler that has nothing to write for a while (a preview of a stream
+// that is down) must ask: only a write would otherwise find out, and
+// until then the connection, its thread and its slot stay taken.
+bool http_peer_gone(HttpConn *c);
+
 // A complete response. Adds Content-Length, Connection: close and
 // Cache-Control: no-store; text/* gets "; charset=utf-8".
 void http_respond(HttpConn *c, int status, const char *content_type,

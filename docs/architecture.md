@@ -14,7 +14,7 @@ own them.
 | effects | `effects_loop` | Measures each raw frame (`img_stats.c`), runs auto visibility when it is on, then the effect chain. |
 | consumer | `consumer_loop` | Writes to the virtual camera, publishes to the frame bus, then hands the frame to the recording tap. |
 | recorder | `writer_loop` in `recorder.c` | Owns the recording file. Writes frames the consumer hands it, returns them to the pool. |
-| stats | `stats_loop` | Logs ring occupancy and effects time every 5s. Purely diagnostic. |
+| stats | `stats_loop` | Logs ring occupancy and effects time every 5s, and writes the health file the consumer hands it (`HealthMailbox`), so that file I/O never runs on the consumer. |
 | config watcher | inside `config.c` | Watches the config file with inotify, republishes on change. |
 | bus heartbeat | `heartbeat_loop` in `fbus.c` | One per published stream. Stamps the stream every 500ms so readers can tell a running writer from a dead one. |
 
@@ -69,7 +69,11 @@ That is deliberately far below the rings' 31-slot capacity. Every pooled frame c
 up queued in front of the virtual camera, so the pool size is also the worst-case lag
 between camera and output: 8 frames is ~270ms at 30fps, where the old 31 was a full
 second. When the pipeline falls behind, the producer blocks on an empty pool and the
-camera driver drops its oldest frames, which is the right trade for a live view. Each
+camera's buffers fill. The driver then drops the *newest* frames and keeps the old ones
+queued, so `v4l2_in_capture` takes everything ready after each wait, hands the older
+buffers straight back, and decodes only the newest: one hiccup cannot leave the picture
+permanently a few frames behind (it used to: 100ms and more, for good). Skipped frames
+are logged per hundred. Each
 frame is three full I422 buffers, ~5.5MB at 720p, so it is also 44MB instead of 171MB.
 
 **A frame must never be abandoned.** If a frame is dropped instead of returned to

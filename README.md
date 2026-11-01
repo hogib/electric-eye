@@ -142,6 +142,10 @@ Needs GNU make, a C99 compiler (GCC 4.7+ or clang), and libturbojpeg 1.4+
 has it. A distro too old to package libturbojpeg 1.4 can point the build at one built
 from source; see the top of the `Makefile`.
 
+On 32-bit ARM (32-bit Raspberry Pi OS, Debian armhf) the build turns NEON on itself, so
+the effects use the Pi's SIMD unit; the result needs a Pi 2 v1.1 or newer. `make NEON=0`
+builds for older boards (every effect then runs several times slower).
+
 Neither program needs root. Both need the `video` group (cameras, v4l2loopback, and the
 frame bus's shared memory); the services run as a system user, `eeye`, in that group.
 Nothing loads v4l2loopback on demand: `install.sh` sets it to load at boot topside.
@@ -283,13 +287,11 @@ topside machine has the port.
 ### The picture is frozen but looks live
 
 When frames stop arriving the page desaturates the picture and shows a pulsing banner
-naming how stale it is (`LINK LOST — showing a frozen frame from 4.0s ago`).
+naming how stale it is (`LINK LOST — showing a frozen frame from 4.0s ago`). That
+includes the page's own connection: if its preview stops while the link is fine (the
+topside `hellion` restarted, say), it shows `PICTURE NOT UPDATING — reconnecting the
+preview` and reconnects by itself, within a second of the stream being back.
 `hellion top` shows which hop stopped.
-
-**Known gap:** if the page's own preview connection drops — the topside `hellion`
-restarted, or the browser fell behind — the picture does not reconnect by itself, and
-once the link is healthy again the banner clears over a frozen frame. **Reload the
-page** after restarting `hellion` or if the picture seems still. A fix is coming.
 
 ### Blocky or smeared picture
 

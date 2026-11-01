@@ -50,6 +50,11 @@ struct Control {
   // POST /camera, one at a time: each waits for the camera to take its
   // controls, and two interleaved would each report the other's result.
   pthread_mutex_t camera_lock;
+  // POST /config, one at a time, for the same reason: each reads the file
+  // it may have to put back and waits for eeye's verdict on its own write.
+  // Interleaved, one could restore the other's rejected config, or report
+  // the other's verdict.
+  pthread_mutex_t config_lock;
   int previews; // atomic (see compat.h)
 
   pthread_mutex_t lock; // the status snapshot and the peer view
@@ -65,6 +70,14 @@ struct Control {
 
   pthread_t peer_thread;
   bool peer_started;
+
+  // eeye's health from the peer, when eeye is there: fetched by the peer
+  // thread once a second, so /health answers at once from here instead of
+  // making every page poll wait on the tether (3s, when the ROV is
+  // unreachable -- the very time the page's warnings matter). Under lock.
+  char drone_cache[2600];
+  uint64_t drone_cache_ns; // monotonic; 0 = never fetched
+  char drone_error[hs_detail_len];
   bool stop; // atomic (see compat.h)
 };
 
@@ -123,7 +136,11 @@ static void serve_stream(Control *ctl, HttpConn *conn, const char *src) {
 
   // Until the viewer leaves: follow the stream through its writer
   // restarting or vanishing (the page shows the link as down meanwhile).
-  while (!http_stopping(conn)) {
+  // While nothing is being sent -- the stream is missing, or silent -- only
+  // asking the socket notices a viewer who has gone: without it, every
+  // page reload during an outage left a preview slot taken until hellion
+  // restarted, and the fifth was refused.
+  while (!http_stopping(conn) && !http_peer_gone(conn)) {
     if (!r) {
       r = fbus_reader_open(src, NULL);
       if (!r) {
@@ -312,6 +329,7 @@ static const char *wait_verdict(const char *status_path, uint64_t before) {
 
 static void forward_camera(Control *ctl, const char *body, size_t len,
                            char *out, size_t cap);
+static void cached_peer_drone(Control *ctl, char *out, size_t cap);
 
 // Writes eeye's config the way eeye's watcher expects (a temp file in the
 // same directory, renamed over), then waits for eeye's verdict in
@@ -637,7 +655,9 @@ static void serve_config(Control *ctl, HttpConn *conn, bool post,
                          const char *body, size_t len) {
   if (ctl->cfg.eeye_config[0]) {
     if (post) {
+      pthread_mutex_lock(&ctl->config_lock);
       write_eeye_config(ctl, conn, body, len);
+      pthread_mutex_unlock(&ctl->config_lock);
       return;
     }
     static __thread char buf[16384];
@@ -669,22 +689,12 @@ static void serve_health(Control *ctl, HttpConn *conn, const char *src) {
 
   // eeye: here, or from the peer.
   char drone[2600];
-  char err[200];
   if (ctl->cfg.eeye_config[0]) {
     if (!eeye_health(ctl, drone, sizeof drone))
       snprintf(drone, sizeof drone,
                "{\"error\":\"no health file -- is eeye running?\"}");
   } else if (ctl->cfg.peer[0]) {
-    size_t rlen = 0;
-    int status = http_call(ctl->cfg.peer, "GET", "/api/drone", NULL, 0, drone,
-                           sizeof drone, &rlen, peer_timeout_ms, err,
-                           sizeof err);
-    if (status != 200 || rlen == 0 || drone[0] != '{') {
-      char esc[300];
-      json_escape(status < 0 ? err : "peer has no eeye health", esc,
-                  sizeof esc);
-      snprintf(drone, sizeof drone, "{\"error\":\"%s\"}", esc);
-    }
+    cached_peer_drone(ctl, drone, sizeof drone);
   } else {
     snprintf(drone, sizeof drone, "{\"error\":\"eeye does not run here\"}");
   }
@@ -871,6 +881,60 @@ static void serve_peer(Control *ctl, HttpConn *conn, const char *body,
   http_respond(conn, 200, "text/plain", out, n);
 }
 
+// One GET of the peer's /api/drone into drone_cache (see struct Control).
+static void fetch_peer_drone(Control *ctl) {
+  static __thread char buf[2600];
+  size_t got = 0;
+  char err[200];
+  int status = http_call(ctl->cfg.peer, "GET", "/api/drone", NULL, 0, buf,
+                         sizeof buf - 1, &got, peer_exchange_timeout_ms, err,
+                         sizeof err);
+  while (got > 0 && (buf[got - 1] == '\n' || buf[got - 1] == ' '))
+    got--;
+  buf[got] = '\0';
+  pthread_mutex_lock(&ctl->lock);
+  if (status == 200 && got > 1 && buf[0] == '{' && buf[got - 1] == '}') {
+    memcpy(ctl->drone_cache, buf, got + 1);
+    ctl->drone_cache_ns = mono_ns();
+    ctl->drone_error[0] = '\0';
+  } else {
+    snprintf(ctl->drone_error, sizeof ctl->drone_error, "%.*s",
+             hs_detail_len - 1,
+             status < 0 ? err : "the ROV has no eeye health to give");
+  }
+  pthread_mutex_unlock(&ctl->lock);
+}
+
+// The cached health of the peer's eeye for /health, with its "age_s" made
+// to include how long ago it was fetched. An error object when there is
+// nothing recent enough to show.
+static void cached_peer_drone(Control *ctl, char *out, size_t cap) {
+  pthread_mutex_lock(&ctl->lock);
+  double cache_age = ctl->drone_cache_ns
+                         ? (double)(mono_ns() - ctl->drone_cache_ns) / 1e9
+                         : -1;
+  char esc[300];
+  if (cache_age < 0 || cache_age > 5) {
+    const char *why = ctl->drone_error[0] ? ctl->drone_error
+                      : ctl->peer_error[0] ? ctl->peer_error
+                                           : "no word from the ROV yet";
+    json_escape(why, esc, sizeof esc);
+    snprintf(out, cap, "{\"error\":\"ROV: %s\"}", esc);
+    pthread_mutex_unlock(&ctl->lock);
+    return;
+  }
+  // eeye_health() ends the object with ,"age_s":N} -- add the cache's age.
+  const char *tail = strstr(ctl->drone_cache, ",\"age_s\":");
+  if (tail) {
+    double age = strtod(tail + 9, NULL) + cache_age;
+    snprintf(out, cap, "%.*s,\"age_s\":%.1f}", (int)(tail - ctl->drone_cache),
+             ctl->drone_cache, age);
+  } else {
+    snprintf(out, cap, "%s", ctl->drone_cache);
+  }
+  pthread_mutex_unlock(&ctl->lock);
+}
+
 static void *peer_loop(void *arg) {
   Control *ctl = (Control *)arg;
   char mine[4096];
@@ -884,6 +948,8 @@ static void *peer_loop(void *arg) {
                            peer_exchange_timeout_ms, err, sizeof err);
     if (status == 200) {
       store_peer_view(ctl, ctl->cfg.peer, theirs, got);
+      if (!ctl->cfg.eeye_config[0])
+        fetch_peer_drone(ctl);
     } else {
       pthread_mutex_lock(&ctl->lock);
       if (status > 0)
@@ -990,6 +1056,7 @@ Control *control_start(const HellionConfig *cfg, HRec *rec, Pipeline **pipes,
     ctl->pipes[ctl->pipe_count++] = pipes[i];
   pthread_mutex_init(&ctl->lock, NULL);
   pthread_mutex_init(&ctl->camera_lock, NULL);
+  pthread_mutex_init(&ctl->config_lock, NULL);
   char err[200];
   ctl->http = http_start(cfg->control, max_connections, handle, ctl, err,
                          sizeof err);
@@ -997,6 +1064,7 @@ Control *control_start(const HellionConfig *cfg, HRec *rec, Pipeline **pipes,
     printf("hellion: web page and API disabled: %s\n", err);
     pthread_mutex_destroy(&ctl->lock);
     pthread_mutex_destroy(&ctl->camera_lock);
+    pthread_mutex_destroy(&ctl->config_lock);
     free(ctl);
     return NULL;
   }
@@ -1027,5 +1095,6 @@ void control_stop(Control *c) {
   http_stop(c->http);
   pthread_mutex_destroy(&c->lock);
   pthread_mutex_destroy(&c->camera_lock);
+  pthread_mutex_destroy(&c->config_lock);
   free(c);
 }

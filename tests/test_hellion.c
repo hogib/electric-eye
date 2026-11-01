@@ -524,6 +524,20 @@ static void test_udp_relay(void) {
   udp_relay_stats(r, &st);
   CHECK_EQ_INT(st.lost, 1);
 
+  // A long outage with the sender still going (cable pulled): it comes
+  // back 40000 numbers on, which modulo 2^16 looks like "behind". After a
+  // second of silence that is a fresh start, and loss after it is counted
+  // again -- it used to read as late packets, hiding real loss for up to a
+  // minute.
+  sleep_ms(1200);
+  send_rtp(in, port, 40001, 0x3333, 100);
+  send_rtp(in, port, 40002, 0x3333, 100);
+  send_rtp(in, port, 40004, 0x3333, 100); // 40003 lost
+  sleep_ms(100);
+  udp_relay_stats(r, &st);
+  CHECK_EQ_INT(st.lost, 2);
+  CHECK_EQ_INT(st.late, 1);
+
   udp_relay_close(r);
   close(in);
   close(a);

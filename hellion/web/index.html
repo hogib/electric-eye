@@ -664,13 +664,107 @@ let previewSrc = "pilot";
 try { previewSrc = localStorage.getItem("preview_src") || previewSrc; }
 catch (e) { /* no storage: use the default */ }
 
+// Read with fetch() rather than handed to <img src>, so the page knows
+// when each picture arrives. An <img> left holding an ended multipart
+// stream shows its last frame forever, and nothing on the page can tell --
+// a topside restart or a dropped connection used to leave a frozen picture
+// that looked live once the link recovered. Here the stream is reopened
+// whenever it ends, fails, or delivers nothing for PREVIEW_STALL_MS, and
+// lastPreviewFrame lets the health check grey out a picture that stopped.
+const PREVIEW_STALL_MS = 3000;
+let previewGen = 0;          // bumped to stop the running reader
+let previewAbort = null;
+let lastPreviewFrame = 0;    // performance.now() of the newest picture
+let previewUrl = null;
+
+function showFrame(bytes) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+  const old = previewUrl;
+  previewUrl = url;
+  document.getElementById("video").src = url;
+  if (old) URL.revokeObjectURL(old);
+  lastPreviewFrame = performance.now();
+}
+
+function indexOfCrlfCrlf(b, from) {
+  for (let i = from; i + 3 < b.length; i++)
+    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10)
+      return i;
+  return -1;
+}
+
+async function readPreview(name, gen) {
+  while (gen === previewGen) {
+    const ctl = new AbortController();
+    previewAbort = ctl;
+    let watchdog = null;
+    const kick = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => ctl.abort(), PREVIEW_STALL_MS);
+    };
+    try {
+      kick();
+      const res = await fetch("/stream?src=" + encodeURIComponent(name),
+                              { signal: ctl.signal, cache: "no-store" });
+      if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+      const reader = res.body.getReader();
+      let buf = new Uint8Array(0);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const joined = new Uint8Array(buf.length + value.length);
+        joined.set(buf);
+        joined.set(value, buf.length);
+        buf = joined;
+        // Each part: "--frame", headers with Content-Length, a blank line,
+        // that many bytes of JPEG.
+        for (;;) {
+          const end = indexOfCrlfCrlf(buf, 0);
+          if (end < 0) break;
+          const head = new TextDecoder().decode(buf.subarray(0, end));
+          const m = /Content-Length:\s*(\d+)/i.exec(head);
+          const start = end + 4;
+          if (!m) { buf = buf.subarray(start); continue; }
+          const len = Number(m[1]);
+          if (buf.length < start + len) break;
+          showFrame(buf.slice(start, start + len));
+          kick();
+          buf = buf.subarray(start + len);
+        }
+      }
+    } catch (e) {
+      // Aborted by the watchdog or a new choice, refused (503: all preview
+      // slots taken), or the connection dropped: try again below.
+    }
+    clearTimeout(watchdog);
+    if (gen !== previewGen) return;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+function startPreview() {
+  previewGen++;
+  if (previewAbort) previewAbort.abort();
+  if (document.visibilityState === "hidden") return; // see below
+  readPreview(previewSrc, previewGen);
+}
+
 function showPreview(name) {
   previewSrc = name;
   try { localStorage.setItem("preview_src", name); } catch (e) {}
-  // A fresh URL each time, so the browser drops the old multipart stream.
-  document.getElementById("video").src =
-    "/stream?src=" + encodeURIComponent(name) + "&t=" + Date.now();
+  startPreview();
 }
+
+// A tab nobody is looking at costs the topside a JPEG encode per frame for
+// nothing: stop its preview while hidden, start it again when shown.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    previewGen++;
+    if (previewAbort) previewAbort.abort();
+  } else {
+    startPreview();
+  }
+});
 
 let lastStreams = "";
 async function loadStreams() {
@@ -923,6 +1017,18 @@ function renderHealth(h) {
     message = `VIDEO STALLED — last frame ${link.age_s.toFixed(1)}s ago`;
   }
 
+  // The picture on this page can stop on its own (its connection dropped)
+  // while the link is fine. Then it is as frozen as a lost link, and says
+  // so, while the reader above reconnects.
+  const pictureAge = (performance.now() - lastPreviewFrame) / 1000;
+  if (!stale && link.have_frame && document.visibilityState !== "hidden" &&
+      pictureAge > STALE_AFTER_S) {
+    stale = true;
+    message = lastPreviewFrame
+      ? `PICTURE NOT UPDATING — reconnecting the preview (${pictureAge.toFixed(0)}s)`
+      : "CONNECTING THE PREVIEW…";
+  }
+
   banner.className = stale ? "stale" : "";
   banner.textContent = message;
   video.className = stale ? "stale" : "";
@@ -970,10 +1076,17 @@ function renderHealth(h) {
   }
 }
 
+// One request at a time, each with a deadline, and the next a second after
+// it answers: a fixed setInterval kept firing while a slow answer was out,
+// piling requests onto the browser's few connections, and a topside that
+// hung never tripped the "unreachable" banner.
+const HEALTH_TIMEOUT_MS = 2500;
 async function pollHealth() {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), HEALTH_TIMEOUT_MS);
   try {
     const r = await fetch("/health?src=" + encodeURIComponent(previewSrc),
-                          { cache: "no-store" });
+                          { cache: "no-store", signal: ctl.signal });
     renderHealth(await r.json());
   } catch (e) {
     // The topside server itself is unreachable -- the browser cannot
@@ -982,10 +1095,17 @@ async function pollHealth() {
     banner.className = "stale";
     banner.textContent = "TOPSIDE UNREACHABLE — display is frozen";
     video.className = "stale";
+  } finally {
+    clearTimeout(timer);
   }
 }
-setInterval(pollHealth, 1000);
-pollHealth();
+async function healthLoop() {
+  for (;;) {
+    await pollHealth();
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+healthLoop();
 
 refreshFromDrone();
 </script>

@@ -144,7 +144,9 @@ know: the UI still shows the path they typed.
 
 ## Health reporting (`health.c`)
 
-`eeye` republishes `<config_path>.health` every second, carrying what only the drone
+`eeye` republishes `<config_path>.health` every second (the consumer fills the snapshot;
+the stats thread writes the file, so SD-card I/O never stalls the pilot's picture),
+carrying what only the drone
 knows.
 
 ```json
