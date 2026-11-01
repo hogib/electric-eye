@@ -250,6 +250,15 @@ Exposure, gain, white balance and the usual image adjustments, expressed once an
 applied by whichever backend is running. Hot-reloadable — light changes as the drone
 descends, and surfacing to adjust exposure is not an option.
 
+Shared by both programs: `eeye` applies them to its camera, and `hellion` to a camera
+source on the ROV in placement A ([hellion.md](hellion.md#camera-controls-in-placement-a)).
+The `"camera"` JSON object lives here too — `camera_ctrl_parse` (which returns its
+reason as text rather than printing it, so `hellion` can answer over HTTP with it) and
+`camera_ctrl_to_json`, its inverse — so the two programs cannot disagree about what a
+valid camera setting is. A new control is added in this file, its parser, and
+`camera_ctrl_to_json`'s field table; `test_camera_ctrl`'s round trip catches a
+mismatch.
+
 ### Three things this had to get right
 
 **1. Ordering, and why it looks like a permissions bug.** A camera rejects a manual

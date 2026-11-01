@@ -117,6 +117,8 @@ unknown key or bad value stops startup with the reason.
 | `snapshot_dir` | `/var/lib/hellion/snapshots` | Where the page's snapshots are saved |
 | `record_dir` | `/var/lib/hellion/recordings` | Where recordings are saved |
 | `record_from` | first `rtp:` source | The pipeline whose arriving stream is recorded |
+| `camera_controls` | `""` | `"peer"` (topside, placement A): send the page's camera controls on to the peer, which has the camera. Needs `peer` |
+| `camera_file` | `/var/lib/hellion/camera.json` | With a camera source: where the last camera controls are kept, and put back from on start |
 | `pipelines` | — | 1 to 8; see below |
 
 A **pipeline** moves frames from one source to up to 8 sinks:
@@ -161,6 +163,31 @@ Two encodes, one on each side.
 camera and the ROV sends `pilot` up. Topside relays the packets unchanged to QGC on
 5600 — no second encode, no extra latency for the pilot — and also decodes them to
 `bus:pilot` and `/dev/video10`. This is where autonomy will want `eeye` to be.
+
+### Camera controls in placement A
+
+The camera is on the ROV under `hellion`; `eeye`, and with it the config the page
+edits, is topside. So the topside `hellion` (`"camera_controls": "peer"`, in
+`a-topside.json`) sends the `"camera"` object of every config `eeye` accepts to the
+ROV's `POST /camera`, and adds the answer to the page's response as `"camera"`:
+applied, kept for when the camera opens, or an error naming what failed (the page shows
+that in red — the sliders would otherwise show values the camera is not using).
+
+On the ROV, the controls go to every camera source:
+
+- **V4L2**: the source thread applies them between frames (a generation counter it
+  checks per frame), and again on every open, since a replugged camera comes back at
+  its factory defaults.
+- **rpicam**: `rpicam-vid` takes them only on its command line, so a change restarts
+  it (~1s, logged), as in `eeye`.
+- They are written to `camera_file` first and put back on start, so a restarted ROV
+  `hellion` keeps the pilot's exposure. Defaults as in `eeye`: `keep_framerate` on,
+  nothing else touched.
+
+Tested with a laptop webcam as the ROV: manual exposure, gain and brightness reached
+the camera's registers 99–160 ms after the request; reset by hand while the ROV's
+`hellion` was down, they came back when it restarted; with it down, the page's
+request still applied the effects and reported "Connection refused" for the camera.
 
 **Ports:** keep the tether port away from 5600. Most RTP receivers also bind port+1
 for RTCP (QGC does not, but ffplay and VLC do), so a tether on 5601 collides with a
@@ -266,6 +293,8 @@ by `hellion/embed.c`), so there is nothing to install beside it.
 | `GET /api/drone` | `eeye`'s health file here, with `age_s` |
 | `POST /record` | `{"action":"start"}` / `{"action":"stop"}` — see [Recording](#recording) |
 | `GET /api/status` | This `hellion`'s pipelines as JSON, for scripts |
+| `POST /camera` | Camera controls (a `"camera"` object, as in `eeye`'s config) for this `hellion`'s camera sources: kept in `camera_file`, applied, answered once the camera has them — `{"applied":true,"controls":N}`, or `applied:false` with why. 409 without a camera source |
+| `GET /camera` | The camera controls kept here |
 | `POST /api/peer` | The status exchange between the two ends — see [ROV ↔ topside status](#rov--topside-status) |
 
 **Auto visibility** is the first thing on the page: a full-width button (and the `A`

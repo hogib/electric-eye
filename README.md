@@ -457,7 +457,11 @@ at a lower rate. Cameras without the control ignore it silently.
 | `keep_framerate` | bool | Default `true`: auto exposure may not lower the frame rate (see below) |
 
 These are **hot-reloadable** — adjust them from the page's Camera section and the
-picture changes immediately, no restart. They are also re-applied after a camera
+picture changes immediately, no restart. In placement A, where the camera is on the
+ROV under `hellion` and `eeye` is topside, the topside `hellion` carries them to the
+ROV (`"camera_controls": "peer"`, already in `a-topside.json`); the page says whether
+the ROV's camera took them, and the ROV keeps them for its next restart. Measured over
+a LAN: ~100–160 ms from the page's request to the camera's registers. They are also re-applied after a camera
 reconnect, since a replugged camera comes back at its factory defaults.
 
 The percent-style ranges are deliberate: real cameras disagree about units (this
@@ -612,9 +616,6 @@ a shared network.
 
 ## Known limitations
 
-- **In placement A, camera controls do nothing.** The page writes them to the topside
-  `eeye`, which reads the frame bus and has no camera; the ROV's `hellion` holds the
-  camera and does not apply controls yet. Placement B is unaffected.
 - **Latency through the tether is about two frame periods inside ffmpeg** — 70 ms at
   30fps, 37 ms at 60fps, measured bus to bus on one machine — before camera, tether and
   display. Which ffmpeg stages hold the frames is not yet established.

@@ -147,8 +147,10 @@ publishes the processed and the untouched frame under; `""` turns either off. Se
 camera as `hellion` decodes it. The stream sets the geometry: `capture_width` and
 `capture_height` are ignored, `downscale` must be 1, and `eeye` waits at startup for
 the stream to appear. If the stream comes back at a different size, `eeye` exits with
-status 1 so systemd restarts it at the new one. Camera controls do nothing here; set
-them where the camera is.
+status 1 so systemd restarts it at the new one. Camera controls do nothing in `eeye`
+here — there is no camera — but `"camera"` is still parsed and kept in the file: in
+placement A the topside `hellion` sends it on to the ROV's `hellion`, which holds the
+camera (see [hellion.md](hellion.md#camera-controls-in-placement-a)).
 
 Refused at parse time: invalid names (letters, digits, `-`, `_`, under 32
 characters), `bus_pilot` equal to `bus_raw`, and reading a stream `eeye` itself
