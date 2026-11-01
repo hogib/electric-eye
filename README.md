@@ -705,9 +705,10 @@ a shared network.
 
 ## Known limitations
 
-- **Latency through the tether is about two frame periods inside ffmpeg** — 70 ms at
-  30fps, 37 ms at 60fps, measured bus to bus on one machine — before camera, tether and
-  display. Which ffmpeg stages hold the frames is not yet established.
+- **Tether latency is measured on x86 only** — frame bus to frame bus through both
+  `hellion`s, 3.8 ms at 640×480 and 8.3 ms at 720p (down from 70–75 ms in v0.2.0;
+  see [docs/hellion.md](docs/hellion.md#latency)). Camera exposure, the tether and the
+  Pi's slower encode add to that on the vehicle, and are not measured yet.
 - **Recordings' timing assumes `framerate`** (default 30): frames are stamped at the
   nominal rate. `hellion` warns when a source runs more than 10% off it.
 - **Cockpit cannot show the processed picture** (it takes video from BlueOS over WebRTC).

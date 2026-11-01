@@ -254,14 +254,35 @@ measures the real rate and, if it is more than 10% off for 10s, logs what to set
 
 ### Latency
 
-Measured on one x86 machine over loopback, frame bus to frame bus through both
-`hellion`s (encode, RTP, relay, decode), with textured 640×480 frames at 4 Mbit/s:
-**median 70ms at 30fps, 37ms at 60fps**, spread under 1ms. A bus-to-bus pipeline with
-no encoding measures 0.7ms, so the time is in ffmpeg — and since it halves at double
-the frame rate, it is about two frame periods of holding, not processing time. Which
-two stages hold a frame is not yet established (a likely candidate is the H.264 parser
-on the decode side waiting for the next frame to know the current one ended). Camera,
-tether and the Pi's slower encode add to this on the real vehicle.
+Frame bus to frame bus through both `hellion`s (encode, RTP, relay, decode) over
+loopback on an idle x86 laptop, textured frames at 4 Mbit/s, p10–p90 within 0.5ms:
+
+| | v0.2.0 | now |
+|---|---|---|
+| 640×480, 30fps | 70.4ms | **3.8ms** |
+| 640×480, 60fps | 37.0ms | **3.7ms** |
+| 1280×720, 30fps | 74.8ms | **8.3ms** |
+
+The old figure halved at double the frame rate: two frame periods of *holding*, both
+in the topside decoder's ffmpeg, found by timing each stage (an RTP tap between encoder
+and decoder; the encoder side, x264 with `zerolatency`, took 1.2–1.5ms):
+
+- **The H.264 parser** only knows a frame has ended when the next one's first packet
+  arrives. The relay now sends its own decoder a 2-byte access unit delimiter after
+  each frame's last packet (RTP marker bit), renumbering that destination's packets to
+  fit (`udp_relay_add_decoder`); QGC and the recorder get the stream untouched. A lost
+  marker packet leaves that one frame waiting for the next, as before. The old build
+  also never delivered a run's last two frames; this one does.
+- **The rawvideo output encoder** — a plain copy — runs frame-threaded on ffmpeg 5.1
+  and later, returning each frame only when the next arrives. The decoder's output has
+  `-thread_type slice` (not `-threads 1`, which would also single-thread the scale).
+
+Tried and not used: x264 `slice-max-size` with the decoder's parser off also reached
+~2.5ms, but works only with libx264 (a hardware encoder that splits slices across
+packets decodes nothing), costs bitrate, and drops a whole frame when its last packet
+is lost. Camera exposure, the tether and the Pi's slower encode add to these figures
+on the vehicle; `-flags low_delay` stays essential (without it the decoder
+frame-threads and holds ~430ms on many cores).
 
 ## How a pipeline runs
 
