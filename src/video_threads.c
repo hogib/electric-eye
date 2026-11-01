@@ -280,6 +280,7 @@ void *effects_loop(void *arg) {
   if (!av)
     printf("Warning: auto visibility unavailable (out of memory).\n");
   static ImgStats stats; // 1KB+; this thread is the only user
+  int64_t last_stats_bucket = -1;
   while (__atomic_load_n(args->is_running, __ATOMIC_SEQ_CST) ||
          __atomic_load_n(&args->ring_buffer_in->head, __ATOMIC_RELAXED) !=
              __atomic_load_n(&args->ring_buffer_in->tail, __ATOMIC_RELAXED)) {
@@ -300,12 +301,25 @@ void *effects_loop(void *arg) {
     const Config *cfg = config_current(args->config);
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    // Measured on the raw frame every time: it is a quarter of the pixels,
-    // read once, and the operator gets it whether or not auto is on.
-    const uint8_t *raw[3] = {frame->raw_planes[0], frame->raw_planes[1],
-                             frame->raw_planes[2]};
-    img_stats_compute(raw, frame->width, frame->height, frame->stride, &stats);
-    img_stats_summarize(&stats, &frame->stats);
+    // The raw frame's statistics: every frame for auto visibility, which
+    // steers by them; otherwise only for the frame the consumer will put in
+    // the health file -- the first of each health interval, by the same
+    // pts rule it uses -- since nothing else reads them. On a Pi that is
+    // most of a millisecond of serial work saved on 29 frames in 30.
+    const int64_t stats_every =
+        (CAMERA_FRAMERATE * HEALTH_PUBLISH_INTERVAL_MS) / 1000;
+    int64_t bucket = stats_every > 0 ? frame->pts / stats_every : frame->pts;
+    bool for_health = bucket != last_stats_bucket;
+    last_stats_bucket = bucket;
+    if (cfg->auto_visibility || for_health) {
+      const uint8_t *raw[3] = {frame->raw_planes[0], frame->raw_planes[1],
+                               frame->raw_planes[2]};
+      img_stats_compute(raw, frame->width, frame->height, frame->stride,
+                        &stats);
+      img_stats_summarize(&stats, &frame->stats);
+    } else {
+      memset(&frame->stats, 0, sizeof frame->stats); // valid = false
+    }
     apply_effect_chain_auto(frame, cfg, av, &stats);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     record_effects_time(args->timing, &t0, &t1);

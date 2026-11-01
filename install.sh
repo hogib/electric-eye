@@ -297,10 +297,13 @@ fi
 if [ "$RUN_EEYE" -eq 1 ]; then
   install -d -m 0775 -o eeye -g video /var/lib/eeye
   # Where the frames come from differs by placement; the loopback device is
-  # hellion's (topside), so eeye writes none.
+  # hellion's (topside), so eeye writes none. In placement A, eeye's input
+  # is already the camera's frame on the bus ("camera"), so republishing it
+  # as "raw" would be a full-frame copy per frame of a stream that exists.
   if [ "$PLACEMENT" = a ]; then
     source_keys='  "capture_source": "bus",
-  "capture_stream": "camera",'
+  "capture_stream": "camera",
+  "bus_raw": "",'
   else
     source_keys='  "capture_device": "/dev/video0",'
   fi

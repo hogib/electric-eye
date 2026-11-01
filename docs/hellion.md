@@ -46,7 +46,8 @@ resolve names. What it sets up:
   `hellion top`. The installing user is added to `video`.
 - **Configs:** `/etc/hellion/hellion.json` from `hellion/examples/<placement>-<role>.json`;
   on the machine running `eeye`, `/var/lib/eeye/effects.json` with the source for the
-  placement (`capture_source: "bus"` topside in A) and `output_device: ""` (the
+  placement (`capture_source: "bus"` topside in A, with `bus_raw: ""` since its
+  input already is the camera's frame) and `output_device: ""` (the
   loopback device is `hellion`'s). Existing configs are kept unless `--reset-config`,
   which keeps the old ones as `.bak`.
 - **Units:** `eeye.service` and `hellion/hellion.service`, as installed. A placement in
