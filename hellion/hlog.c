@@ -1,6 +1,7 @@
 // _GNU_SOURCE: pipe2().
 #define _GNU_SOURCE
 
+#include "thread_name.h"
 #include "hlog.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -70,6 +71,7 @@ static void write_all(int fd, const char *buf, size_t n) {
 }
 
 static void *reader_loop(void *arg) {
+  thread_set_name("hl/log");
   (void)arg;
   char buf[4096];
   for (;;) {

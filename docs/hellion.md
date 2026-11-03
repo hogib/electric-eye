@@ -581,6 +581,93 @@ Exit **0** healthy, **1** degraded (a sink waiting or failing, a stream without 
 frames, a receiving link losing 1% or more of its packets, a peer not answering),
 **2** down (no `hellion` responding, or a pipeline with no video at all).
 
+## `hellion bench`
+
+What it all costs, measured from outside while it runs: one line a second for 30s (or
+the number of seconds given; Ctrl-C ends it early), then a summary. It follows every
+`eeye` and `hellion` on the machine and everything they started -- the `ffmpeg` encoding
+the tether's video, `rpicam-vid` feeding the Pi camera -- each charged to the one that
+started it, and reads nothing but `/proc` and `/sys`, so it measures the installed
+binaries as they are. Run it on the ROV over SSH during a dive, or topside; it never
+touches the processes it watches.
+
+```
+$ hellion bench 60
+hellion bench: following eeye[4306] hellion[4300] ffmpeg[4410]
+60s, one sample a second (Ctrl-C ends it early)
+
+    t  total%   eeye% hellion%  child%  rss MB   temp    MHz       fps net kB/s
+   1s    52.1    31.2      4.1     12.0   121.4   61.2   2400  32.0 pilot   540 eth0
+   2s    50.8    30.6      4.0     11.8   121.4   61.2   2400  32.0 pilot   545 eth0
+   ...
+
+BENCH  rov  60 samples over 60s  4 cores (100% = one core busy)
+
+  process / thread                       cpu%    max    rss MB     max     hwm   ctxsw/s write kB/s
+  eeye [4306]                            31.2   38.0      38.1    38.4    40.2      1210         0
+      eeye/effects                       15.1   19.0
+      eeye/capture                        9.8   11.2
+      eeye/output                         4.0    5.1
+      eeye x3                             2.3    4.0
+  hellion [4300]                          4.1    6.0      22.0    22.0    22.3       410       n/a
+      src pilot-up                        2.9    4.0
+      sink rtp                            1.1    2.0
+    ffmpeg [4410] <- hellion             12.0   14.5      61.3    61.3    61.3       980       n/a
+      ffmpeg x4                          11.8   14.0
+  all of the above                       47.3   55.1     121.4   121.8
+  everything else on the machine          2.0
+  machine total                          49.3   57.0
+    per core                               14    12    11    12
+
+  memory   7012 MB available of 8048 (lowest 7001)   load 0.61
+  thermal  61.4 C avg, 58.1-63.4 C   clock 2400 MHz avg, 2400-2400
+  throttle none during this run
+
+  frame bus
+    pilot          1280x720  32.0 fps avg, 31.0-33.0
+    camera         1280x720  32.0 fps avg, 31.0-33.0
+
+  hellion pipelines
+    rov/pilot-up source bus:pilot                     32.0 fps  0 dropped
+    rov/pilot-up sink   rtp:192.168.2.1:5610          32.0 fps  0 dropped  4350 kbit/s avg (max 4620)  loss 0.00% avg (max 0.00%)
+
+  network
+    eth0              545 kB/s out (max 580)         2 kB/s in (max 3)
+```
+
+- **cpu%** is of one core, like `top`'s, so the figures add up: a 4-core Pi reads 400%
+  flat out. `max` is the busiest single second. Under each process, its threads by
+  name, idle ones left out; threads that share a name (OpenMP workers, `ffmpeg`'s pool)
+  are summed with a count. `eeye`'s threads are `eeye/capture`, `eeye/effects`,
+  `eeye/output`, `eeye/stats`, `eeye/config` and `eeye/record`; plain `eeye` ones are
+  OpenMP's workers. `hellion`'s are `src <pipeline>` and `sink <kind>` per pipeline,
+  `hl/http`, `hl/discovery`, `hl/relay`, `hl/preview`, `hl/peer` and `hl/log`.
+- **rss MB** is resident memory now and at its highest during the run; **hwm** is the
+  most it ever held since it started (`VmHWM`), which may predate the run.
+- **ctxsw/s** is context switches a second, voluntary and not: a high figure on a thread
+  that should be streaming says it is waiting on something a frame at a time.
+- **write kB/s** is what the kernel wrote to disk for the process -- the recorder's
+  figure. Linux shows it only to the process's owner or root, so without `sudo` it says
+  `n/a`.
+- **everything else on the machine** is the rest of the CPU time: BlueOS, the OS, the
+  SSH session running the bench.
+- **thermal**, **clock** and **throttle** are the Pi's: the CPU temperature, its clock
+  (it drops when the firmware caps it), and the firmware's throttle flags -- any that were
+  set during the run (`under-voltage`, `freq-capped`, `throttled`, `soft-temp-limit`)
+  and, separately, any set since boot. Elsewhere the first CPU-looking thermal zone is
+  used, and the throttle line is left out.
+- **frame bus** and **hellion pipelines** are the frame rates these resources bought,
+  from the bus and the status file, so a cost can be read against what it delivers.
+  Drops and link figures are over the run.
+- **network** is every interface that carried anything, so the tether's traffic shows
+  up without naming it.
+
+`--csv FILE` keeps every sample as long-form rows for a spreadsheet:
+`t_s,kind,name,id,value,value2`, where `kind` is `system` (`cpu_pct`, `tracked_cpu_pct`,
+`tracked_rss_mb`, `mem_avail_mb`, `load1`, `temp_c`, `cpu_mhz`, `throttled`), `process`
+(cpu%, rss MB), `thread` (cpu%), `stream` (fps), `link` (kbit/s, loss%) and `net` (kB/s
+in, out). `-n name` restricts the pipeline figures to one `hellion` instance.
+
 ## Status file and logs
 
 `hellion` writes its status to `<bus dir>/hellion.<name>` (shared memory, 0660) four

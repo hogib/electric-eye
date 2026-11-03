@@ -2,6 +2,7 @@
 // ISO mode otherwise. Same guard as video_threads.c/config.c.
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "recorder.h"
 #include <assert.h>
 #include <errno.h>
@@ -214,6 +215,7 @@ static void write_frame(Recorder *r, const VideoFrame *frame) {
 }
 
 static void *writer_loop(void *arg) {
+  thread_set_name("eeye/record");
   Recorder *r = arg;
   pthread_mutex_lock(&r->lock);
   for (;;) {

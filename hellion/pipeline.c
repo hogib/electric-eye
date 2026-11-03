@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "pipeline.h"
 #include "child_proc.h"
 #include "fbus.h"
@@ -148,6 +149,13 @@ static double fps_update(FpsMeter *m, uint64_t frames, uint64_t now) {
 
 static void *sink_loop(void *arg) {
   Sink *s = (Sink *)arg;
+  {
+    // "sink rtp", "sink bus": the kind, for hellion bench and top(1).
+    char tn[16];
+    snprintf(tn, sizeof tn, "sink %.*s",
+             (int)strcspn(s->cfg.spec, ":"), s->cfg.spec);
+    thread_set_name(tn);
+  }
   SinkReport rep = {"starting", ""};
   SinkImpl *impl = sink_impl_open(&s->cfg, s->pc, s->width, s->height, &rep);
   // A sink that failed to open retries this often, not on every frame.
@@ -678,6 +686,11 @@ static CaptureResult source_capture(Pipeline *p, Source *src, VideoFrame *vf,
 
 static void *source_loop(void *arg) {
   Pipeline *p = (Pipeline *)arg;
+  {
+    char tn[16];
+    snprintf(tn, sizeof tn, "src %.11s", p->cfg.name);
+    thread_set_name(tn);
+  }
   VideoFrame *vf = NULL;
   int64_t frame_no = 0;
   bool was_running = false;

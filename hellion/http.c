@@ -2,6 +2,7 @@
 // through fcntl rather than accept4() (a GNU extension).
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "http.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -447,6 +448,7 @@ static void serve_connection(HttpConn *c) {
 }
 
 static void *conn_thread(void *arg) {
+  thread_set_name("hl/http-conn");
   HttpConn *c = (HttpConn *)arg;
   serve_connection(c);
   shutdown(c->fd, SHUT_WR);
@@ -457,6 +459,7 @@ static void *conn_thread(void *arg) {
 }
 
 static void *accept_loop(void *arg) {
+  thread_set_name("hl/http");
   HttpServer *s = (HttpServer *)arg;
   while (!__atomic_load_n(&s->stop, __ATOMIC_ACQUIRE)) {
     struct pollfd pfd = {.fd = s->fd, .events = POLLIN, .revents = 0};

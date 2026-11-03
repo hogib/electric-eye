@@ -3,8 +3,10 @@
 //   hellion [-c config]            run (the default)
 //   hellion top [-n name] [--once] live dashboard, for an SSH session
 //   hellion check [-n name]        one-shot health check; exit 0/1/2
+//   hellion bench [seconds] [--csv FILE]  what it all costs, measured
 #define _POSIX_C_SOURCE 200809L
 
+#include "bench.h"
 #include "control.h"
 #include "discovery.h"
 #include "hconfig.h"
@@ -35,7 +37,12 @@ static void usage(FILE *to) {
           "usage: hellion [-c config]            run (default config %s)\n"
           "       hellion top [-n name] [--once] live dashboard\n"
           "       hellion check [-n name]        health check: exit 0 ok, 1 "
-          "degraded, 2 down\n",
+          "degraded, 2 down\n"
+          "       hellion bench [seconds] [--csv FILE]\n"
+          "                                      CPU, memory, temperature and "
+          "frame rates of eeye,\n"
+          "                                      hellion and their children, "
+          "for 30s by default\n",
           default_config);
 }
 
@@ -181,6 +188,8 @@ int main(int argc, char **argv) {
   const char *name = NULL;
   const char *command = "run";
   bool once = false;
+  int bench_seconds = 0;
+  const char *csv_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i];
@@ -191,11 +200,16 @@ int main(int argc, char **argv) {
       name = argv[++i];
     } else if (strcmp(a, "--once") == 0) {
       once = true;
+    } else if (strcmp(a, "--csv") == 0 && i + 1 < argc) {
+      csv_path = argv[++i];
+    } else if (strcmp(command, "bench") == 0 && a[0] >= '0' && a[0] <= '9' &&
+               atoi(a) > 0) {
+      bench_seconds = atoi(a);
     } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
       usage(stdout);
       return 0;
     } else if (strcmp(a, "run") == 0 || strcmp(a, "top") == 0 ||
-               strcmp(a, "check") == 0) {
+               strcmp(a, "check") == 0 || strcmp(a, "bench") == 0) {
       command = a;
     } else {
       fprintf(stderr, "hellion: unexpected argument \"%s\"\n", a);
@@ -208,5 +222,7 @@ int main(int argc, char **argv) {
     return hellion_top(name, once);
   if (strcmp(command, "check") == 0)
     return hellion_check(name);
+  if (strcmp(command, "bench") == 0)
+    return hellion_bench(name, bench_seconds, csv_path);
   return run(config_path);
 }

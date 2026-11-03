@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "control.h"
 #include "discovery.h"
 #include "fbus.h"
@@ -156,6 +157,7 @@ static void hub_nap(PreviewHub *hb, uint64_t ns) {
 }
 
 static void *hub_loop(void *arg) {
+  thread_set_name("hl/preview");
   PreviewHub *hb = (PreviewHub *)arg;
   JpegEnc *enc = jpeg_enc_create();
   FbusReader *r = NULL;
@@ -1145,6 +1147,7 @@ static void cached_peer_drone(Control *ctl, char *out, size_t cap) {
 }
 
 static void *peer_loop(void *arg) {
+  thread_set_name("hl/peer");
   Control *ctl = (Control *)arg;
   char mine[4096];
   static __thread char theirs[8192];

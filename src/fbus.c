@@ -2,6 +2,7 @@
 // posix_fallocate/clock_gettime under strict ISO mode (-std=c99).
 #define _GNU_SOURCE
 
+#include "thread_name.h"
 #include "fbus.h"
 #include "compat.h"
 #include <dirent.h>
@@ -174,6 +175,7 @@ struct FbusWriter {
 };
 
 static void *heartbeat_loop(void *arg) {
+  thread_set_name("fbus/heartbeat");
   FbusWriter *w = (FbusWriter *)arg;
   while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
     __atomic_store_n(&w->hdr->heartbeat_mono_ns, mono_ns(), __ATOMIC_RELEASE);

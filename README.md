@@ -10,7 +10,7 @@ GNU/Linux machine. Two programs:
 - **`hellion`** — everything that touches the tether. Sends the video up from the ROV
   as H.264 over RTP, receives it topside, feeds QGroundControl, records MP4, serves the
   browser control page, and carries `eeye`'s config across. `hellion top` is a live
-  dashboard for an SSH session; `hellion check` is a pre-dive check.
+  dashboard for an SSH session; `hellion check` is a pre-dive check; `hellion bench` measures what it all costs.
 
 Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (for
 `hellion`'s video) `ffmpeg`.
@@ -119,6 +119,7 @@ fights the first for the camera and the tether. What you run by hand is only:
 ```sh
 hellion top                       # live dashboard, either machine (q quits); fine over SSH
 hellion check                     # pre-dive check: exit 0 healthy, 1 degraded, 2 down
+hellion bench 60                  # CPU, memory, temperature and fps of everything, for 60s
 journalctl -u hellion -u eeye -f  # the logs
 ```
 

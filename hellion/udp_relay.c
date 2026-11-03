@@ -1,6 +1,7 @@
 // getaddrinfo, its AI_* flags and struct addrinfo are POSIX (2001).
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "udp_relay.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -361,6 +362,7 @@ static void roll_window(UdpRelay *r, uint64_t now) {
 }
 
 static void *relay_loop(void *arg) {
+  thread_set_name("hl/relay");
   UdpRelay *r = (UdpRelay *)arg;
   uint8_t *buf = r->buf;
   while (!__atomic_load_n(&r->stop, __ATOMIC_ACQUIRE)) {

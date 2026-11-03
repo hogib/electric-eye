@@ -5,6 +5,7 @@
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 
+#include "thread_name.h"
 #include "discovery.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -474,6 +475,7 @@ static void receive(Disc *d, int fd) {
 }
 
 static void *disc_loop(void *arg) {
+  thread_set_name("hl/discovery");
   Disc *d = (Disc *)arg;
   uint64_t next_announce = 0, next_ifaces = 0;
   while (!__atomic_load_n(&d->stop, __ATOMIC_ACQUIRE)) {

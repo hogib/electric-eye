@@ -2,6 +2,7 @@
 // the same guard in video_threads.c.
 #define _POSIX_C_SOURCE 200809L
 
+#include "thread_name.h"
 #include "config.h"
 #include "fbus.h"
 #include "json_cursor.h"
@@ -873,6 +874,7 @@ static void write_reload_status(const char *config_path, bool ok) {
 }
 
 static void *config_watch_thread(void *arg) {
+  thread_set_name("eeye/config");
   ConfigWatcher *w = (ConfigWatcher *)arg;
   // inotify_event has a flexible-array-member `name`; alignment matters
   // because the buffer is walked as a sequence of these structs packed

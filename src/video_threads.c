@@ -1,3 +1,4 @@
+#include "thread_name.h"
 #include "video_threads.h"
 #include "effect_chain.h"
 #include "camera_ctrl.h"
@@ -115,6 +116,7 @@ static void capture_close(CaptureHandle *h) {
 }
 
 void *producer_loop(void *arg) {
+  thread_set_name("eeye/capture");
   ProducerArgs *args = (ProducerArgs *)arg;
   int64_t pts = 0;
   int reconnect_attempt = 0;
@@ -273,6 +275,7 @@ static void record_effects_time(EffectsTiming *t, const struct timespec *t0,
 }
 
 void *effects_loop(void *arg) {
+  thread_set_name("eeye/effects");
   WorkerArgs *args = (WorkerArgs *)arg;
   // Auto visibility's smoothing state lives as long as this thread. NULL
   // (out of memory) only means auto visibility cannot run.
@@ -333,6 +336,7 @@ void *effects_loop(void *arg) {
 }
 
 void *consumer_loop(void *arg) {
+  thread_set_name("eeye/output");
   ConsumerArgs *args = (ConsumerArgs *)arg;
 
   // Optional: a missing or failing loopback device is retried by
@@ -502,6 +506,7 @@ static void write_health(HealthMailbox *box) {
 }
 
 void *stats_loop(void *arg) {
+  thread_set_name("eeye/stats");
   StatsArgs *args = (StatsArgs *)arg;
   if (args->health)
     __atomic_store_n(&args->health->writer, true, __ATOMIC_RELEASE);

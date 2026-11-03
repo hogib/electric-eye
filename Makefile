@@ -138,6 +138,7 @@ SRC := \
 # hellion: its own sources, plus the shared modules from src/ it reuses
 # (the frame bus, child processes, camera capture, the loopback output).
 HSRC := \
+	hellion/bench.c \
 	hellion/check.c \
 	hellion/control.c \
 	hellion/discovery.c \
@@ -202,7 +203,7 @@ $(OBJDIR)/%.o: %.c
 # without widening their visibility in the shipping build just to test them.
 TESTS := config ring_buffer jpeg_framing negotiation jpeg_decode log_edges \
 	canny health camera_ctrl recorder effect_chain child_proc \
-	virtual_cam fbus hellion http auto_vis
+	virtual_cam fbus hellion http auto_vis bench
 
 # Extra translation units each test needs beyond the one it includes:
 # rpicam_in.c and v4l2_in.c both reference the shared JPEG decoder and the
@@ -222,6 +223,7 @@ test_child_proc_SRC :=
 test_fbus_SRC :=
 test_http_SRC :=
 test_auto_vis_SRC := src/img_stats.c
+test_bench_SRC := hellion/hstatus.c hellion/hlog.c src/fbus.c
 test_hellion_SRC := hellion/discovery.c hellion/ffmpeg.c hellion/hconfig.c hellion/hlog.c \
 	hellion/hstatus.c hellion/http.c hellion/jpeg.c hellion/udp_relay.c \
 	hellion/pipeline.c hellion/hrecord.c hellion/sinks.c src/camera_ctrl.c \
