@@ -15,6 +15,8 @@
 #include "test_harness.h"
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -723,6 +725,29 @@ static bool file_has(const char *path, const char *tag) {
   return false;
 }
 
+// The camera keeps running while a recording stops: hellion forwards packets
+// to the recording ffmpeg until it exits, because ffmpeg (6.1, as Ubuntu 24.04
+// ships it) acts on SIGINT only when its input read returns. A test that
+// stopped publishing first would leave that read waiting out the grace period
+// and see the recording killed instead of stopped (newer ffmpeg does not wait).
+typedef struct {
+  FbusWriter *w;
+  Img *src;
+  int seq;
+  atomic_bool run;
+} Feeder;
+
+static void *feeder_loop(void *arg) {
+  Feeder *fd = (Feeder *)arg;
+  while (atomic_load(&fd->run)) {
+    img_pattern(fd->src, fd->seq);
+    fbus_writer_publish(fd->w, (const uint8_t *const *)fd->src->planes, fd->seq, 0);
+    fd->seq++;
+    sleep_ms(33);
+  }
+  return NULL;
+}
+
 // Recording the RTP arriving at a pipeline: a fragmented MP4 (ftyp, then
 // moof fragments, which is what makes a cut-off recording still play),
 // one at a time, and stop refusing when nothing is recording.
@@ -769,7 +794,13 @@ static void test_recorder(void) {
   hrec_status_json(rec, status, sizeof status);
   CHECK(strstr(status, "\"recording\":true") != NULL);
 
+  Feeder feed = {.w = in, .src = &src, .seq = 1000};
+  atomic_init(&feed.run, true);
+  pthread_t feeder;
+  CHECK(pthread_create(&feeder, NULL, feeder_loop, &feed) == 0);
   CHECK(hrec_stop(rec, detail, sizeof detail));
+  atomic_store(&feed.run, false);
+  pthread_join(feeder, NULL);
   char path[512];
   snprintf(path, sizeof path, "%s/rec/%s", bus_dir, detail);
   struct stat st;
