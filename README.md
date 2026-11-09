@@ -18,7 +18,33 @@ Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (fo
 - [Installing](#installing) · [Using it](#using-it) ·
   [Where eeye runs](#where-eeye-runs) · [In the field](#in-the-field) ·
   [Troubleshooting](#troubleshooting) · [Config reference](#config-reference) ·
-  [Building by hand](#building-by-hand)
+  [Building by hand](#building-by-hand) · [Citing electric-eye](#citing-electric-eye)
+
+## Citing electric-eye
+
+If you use electric-eye in your research, please cite it. The metadata is in
+[CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" gives it as APA and
+BibTeX), and each release is archived on Zenodo with a DOI.
+
+> H. Oğuz Bolat (Department of Geomatics Engineering, Yıldız Technical University;
+> ORCID [0009-0000-8522-7746](https://orcid.org/0009-0000-8522-7746)) and Hakan Ersoy
+> (Department of Electronics and Communications Engineering, Yıldız Technical
+> University; ORCID [0009-0006-0495-6589](https://orcid.org/0009-0006-0495-6589)).
+> *electric-eye: Real-Time Image Enhancement and Low-Latency Video Transport for
+> Remotely Operated Underwater Vehicles.* Software, version 0.3.2, 2026.
+> https://github.com/hogib/electric-eye
+
+```bibtex
+@software{bolat_ersoy_electric_eye_2026,
+  author  = {Bolat, H. O{\u{g}}uz and Ersoy, Hakan},
+  title   = {electric-eye: Real-Time Image Enhancement and Low-Latency Video
+             Transport for Remotely Operated Underwater Vehicles},
+  version = {0.3.2},
+  year    = {2026},
+  url     = {https://github.com/hogib/electric-eye},
+  license = {MIT}
+}
+```
 
 ## Installing
 

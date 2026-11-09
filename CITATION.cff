@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use electric-eye in your research, please cite it as below."
+type: software
+title: "electric-eye: Real-Time Image Enhancement and Low-Latency Video Transport for Remotely Operated Underwater Vehicles"
+abstract: >-
+  electric-eye is realtime camera software for a remotely operated underwater
+  vehicle, built for a BlueROV and any GNU/Linux machine. eeye takes frames
+  from a camera, runs them through a chain of image-enhancement effects, and
+  publishes the pilot's picture and the untouched camera frame on a
+  shared-memory frame bus; hellion carries the video across the tether as
+  H.264 over RTP, feeds QGroundControl, records MP4 and serves the browser
+  control page.
+authors:
+  - given-names: "H. Oğuz"
+    family-names: Bolat
+    affiliation: "Department of Geomatics Engineering, Yıldız Technical University"
+    orcid: "https://orcid.org/0009-0000-8522-7746"
+  - given-names: Hakan
+    family-names: Ersoy
+    affiliation: "Department of Electronics and Communications Engineering, Yıldız Technical University"
+    orcid: "https://orcid.org/0009-0006-0495-6589"
+repository-code: "https://github.com/hogib/electric-eye"
+license: MIT
+version: "0.3.2"
+date-released: "2026-11-09"
+keywords:
+  - underwater vehicles
+  - ROV
+  - underwater image enhancement
+  - video streaming
+  - RTP
+  - BlueROV2
+  - Raspberry Pi
