@@ -307,8 +307,20 @@ static void test_corrupt_payload_is_transient(void) {
 
   JpegDecoder *dec = jpeg_decoder_create(32, 32);
   VideoFrame *f = vf_create(32, 32, 0);
-  CHECK_EQ_INT(jpeg_decode_frame(dec, junk, sizeof junk, f),
-               JPEG_DECODE_TRANSIENT_FAIL);
+  JpegDecodeResult r = jpeg_decode_frame(dec, junk, sizeof junk, f);
+  // How junk is classified depends on libjpeg-turbo's version: 3.x refuses
+  // its header outright (a transient failure); 2.1.x, as shipped by Debian
+  // bookworm, Ubuntu 24.04 and Raspberry Pi OS, reads a header out of it
+  // with nonsense dimensions, which the decoder then reports as a format
+  // mismatch. Both drop the frame and leave the decoder usable; the
+  // release binaries link 3.x statically, so the stricter case is the one
+  // they run. (The same fix as hangar's 96f4a3c, where this code lives on.)
+#ifdef TJPARAM_STOPONWARNING /* the tj3 API: libjpeg-turbo 3.x */
+  CHECK_EQ_INT(r, JPEG_DECODE_TRANSIENT_FAIL);
+#else
+  CHECK(r == JPEG_DECODE_TRANSIENT_FAIL || r == JPEG_DECODE_FORMAT_MISMATCH);
+#endif
+  CHECK(r != JPEG_DECODE_OK);
   vf_free(f); jpeg_decoder_destroy(dec);
 }
 
