@@ -1,0 +1,59 @@
+# electric-eye CI: every suite with gcc and clang (OpenMP on), and with gcc and
+# OpenMP off; natively on arm64 for the NEON paths; a minute of fuzzing on
+# hellion's HTTP parsers. ffmpeg is installed so that hellion's tests that
+# need it run instead of skipping; the v4l2loopback test skips (no kernel
+# module on the runners).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: check (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            os: ubuntu-24.04
+            make: ""
+          - name: clang
+            os: ubuntu-24.04
+            make: CC=clang HOSTCC=clang
+          - name: gcc, no OpenMP
+            os: ubuntu-24.04
+            make: OPENMP=0
+          - name: gcc, aarch64 native
+            os: ubuntu-24.04-arm
+            make: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential clang libomp-dev libturbojpeg0-dev pkg-config ffmpeg
+      - name: Build
+        run: make -j"$(nproc)" ${{ matrix.make }} all
+      - name: Check
+        run: make -j"$(nproc)" ${{ matrix.make }} check
+      - name: Suite logs on failure
+        if: failure()
+        run: for f in builddir/tests-*/*.log builddir/*/*.log; do [ -f "$f" ] && { echo "== $f"; cat "$f"; }; done; true
+
+  fuzz:
+    name: fuzz-http (clang, 60 s)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential clang libturbojpeg0-dev pkg-config
+      - name: Fuzz
+        run: make fuzz-http FUZZ_SECONDS=60
