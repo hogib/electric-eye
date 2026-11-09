@@ -779,6 +779,8 @@ static void test_recorder(void) {
   hrec_status_json(rec, status, sizeof status);
   CHECK(strstr(status, "\"recording\":false") != NULL);
   CHECK(strstr(status, "\"error\":\"\"") != NULL); // stopped cleanly
+  if (!strstr(status, "\"error\":\"\""))
+    printf("    recorder status: %s\n", status);
   CHECK(!hrec_stop(rec, detail, sizeof detail));
   unlink(path);
   char dir[300];
