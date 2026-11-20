@@ -23,6 +23,14 @@ repository-code: "https://github.com/hogib/electric-eye"
 license: MIT
 version: "0.3.2"
 date-released: "2026-11-09"
+doi: 10.5281/zenodo.24085245
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.24085245
+    description: "Version 0.3.2, archived on Zenodo"
+  - type: doi
+    value: 10.5281/zenodo.24085244
+    description: "All versions (resolves to the latest)"
 keywords:
   - underwater vehicles
   - ROV

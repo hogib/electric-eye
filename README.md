@@ -1,5 +1,7 @@
 # Electric Eye
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24085244.svg)](https://doi.org/10.5281/zenodo.24085244)
+
 Realtime camera effects for a submersible drone (ROV), built for a BlueROV and any
 GNU/Linux machine. Two programs:
 
@@ -24,7 +26,10 @@ Both are C99, built by one Makefile, and need nothing but `libturbojpeg` and (fo
 
 If you use electric-eye in your research, please cite it. The metadata is in
 [CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" gives it as APA and
-BibTeX), and each release is archived on Zenodo with a DOI.
+BibTeX). Each release is archived on Zenodo:
+[10.5281/zenodo.24085244](https://doi.org/10.5281/zenodo.24085244) names all versions
+and resolves to the latest; version 0.3.2 is
+[10.5281/zenodo.24085245](https://doi.org/10.5281/zenodo.24085245).
 
 > H. Oğuz Bolat (Department of Geomatics Engineering, Yıldız Technical University;
 > ORCID [0009-0000-8522-7746](https://orcid.org/0009-0000-8522-7746)) and Hakan Ersoy
@@ -32,7 +37,7 @@ BibTeX), and each release is archived on Zenodo with a DOI.
 > University; ORCID [0009-0006-0495-6589](https://orcid.org/0009-0006-0495-6589)).
 > *electric-eye: Real-Time Image Enhancement and Low-Latency Video Transport for
 > Remotely Operated Underwater Vehicles.* Software, version 0.3.2, 2026.
-> https://github.com/hogib/electric-eye
+> https://doi.org/10.5281/zenodo.24085245
 
 ```bibtex
 @software{bolat_ersoy_electric_eye_2026,
@@ -41,6 +46,7 @@ BibTeX), and each release is archived on Zenodo with a DOI.
              Transport for Remotely Operated Underwater Vehicles},
   version = {0.3.2},
   year    = {2026},
+  doi     = {10.5281/zenodo.24085245},
   url     = {https://github.com/hogib/electric-eye},
   license = {MIT}
 }
