@@ -5,6 +5,7 @@
 #include "child_proc.h"
 #include "fbus.h"
 #include "ffmpeg.h"
+#include "h264_src.h"
 #include "rpicam_in.h"
 #include "sinks.h"
 #include "v4l2_in.h"
@@ -57,6 +58,10 @@ typedef struct Sink {
   // The sink thread's implementation, published so the status thread can
   // ask a network sink for its link stats. Set and cleared under lock.
   SinkImpl *impl;
+  // No thread and no mailbox: the source thread writes to `impl` itself
+  // (see passthrough_loop). The status fields are used as above.
+  bool direct;
+  uint64_t next_open_ns; // direct: when to retry an impl that did not open
 } Sink;
 
 struct Pipeline {
@@ -247,6 +252,58 @@ static Sink *sink_start(const SinkConfig *cfg, const PipelineConfig *pc,
   return s;
 }
 
+// A sink the source thread writes to itself: for H.264 passing through,
+// where "writing" is packetizing and a few sendto()s -- nothing that can
+// stall, so nothing to put a thread and a mailbox in front of.
+static const uint64_t direct_reopen_ns = 2000000000ull;
+
+static Sink *sink_start_direct(const SinkConfig *cfg, const PipelineConfig *pc,
+                               uint32_t w, uint32_t h) {
+  Sink *s = (Sink *)calloc(1, sizeof *s);
+  if (!s)
+    return NULL;
+  s->cfg = *cfg;
+  s->pc = pc;
+  s->width = w;
+  s->height = h;
+  s->direct = true;
+  pthread_mutex_init(&s->lock, NULL);
+  pthread_cond_init(&s->cond, NULL);
+  snprintf(s->rep.state, sizeof s->rep.state, "starting");
+  s->impl = sink_impl_open(cfg, pc, w, h, &s->rep);
+  s->next_open_ns = mono_ns() + direct_reopen_ns;
+  return s;
+}
+
+// One access unit to a direct sink. Returns whether the sink now wants a
+// keyframe from the source (a receiver joined).
+static bool sink_write_h264(Sink *s, const uint8_t *au, size_t len,
+                            uint64_t capture_ns) {
+  // Only this thread opens, writes and closes the impl; the lock is for
+  // the status thread, which reads the fields and asks the impl for its
+  // link statistics (safe during a write: see sink_impl_net).
+  SinkImpl *impl = s->impl;
+  SinkReport rep = s->rep;
+  bool reopened = false;
+  if (!impl && mono_ns() >= s->next_open_ns) {
+    impl = sink_impl_open(&s->cfg, s->pc, s->width, s->height, &rep);
+    s->next_open_ns = mono_ns() + direct_reopen_ns;
+    reopened = impl != NULL;
+  }
+  bool ok = impl && sink_impl_write_h264(impl, au, len, capture_ns, &rep);
+  bool keyframe = impl && sink_impl_wants_keyframe(impl);
+
+  pthread_mutex_lock(&s->lock);
+  if (ok)
+    s->frames++;
+  s->last_frame_ns = mono_ns();
+  s->rep = rep;
+  if (reopened)
+    s->impl = impl;
+  pthread_mutex_unlock(&s->lock);
+  return keyframe;
+}
+
 // Hands a frame to a sink: one copy into its slot, never a wait for the
 // sink itself. An untaken frame is replaced, and counted as dropped.
 static void sink_offer(Sink *s, uint8_t *const planes[3], int64_t frame_no,
@@ -299,6 +356,17 @@ static void sink_offer_swap(Sink *s, VideoFrame *vf, int64_t frame_no) {
 static void sink_stop(Sink *s) {
   if (!s)
     return;
+  if (s->direct) {
+    pthread_mutex_lock(&s->lock);
+    SinkImpl *impl = s->impl;
+    s->impl = NULL;
+    pthread_mutex_unlock(&s->lock);
+    sink_impl_close(impl);
+    pthread_mutex_destroy(&s->lock);
+    pthread_cond_destroy(&s->cond);
+    free(s);
+    return;
+  }
   pthread_mutex_lock(&s->lock);
   s->stop = true;
   pthread_cond_signal(&s->cond);
@@ -329,7 +397,9 @@ static void restart_sinks(Pipeline *p, uint32_t w, uint32_t h) {
   Sink *fresh[hcfg_max_sinks];
   size_t n = 0;
   for (size_t i = 0; w && h && i < p->cfg.sink_count; i++) {
-    Sink *s = sink_start(&p->cfg.sinks[i], &p->cfg, w, h);
+    Sink *s = hcfg_passthrough(&p->cfg)
+                  ? sink_start_direct(&p->cfg.sinks[i], &p->cfg, w, h)
+                  : sink_start(&p->cfg.sinks[i], &p->cfg, w, h);
     if (s)
       fresh[n++] = s;
   }
@@ -481,8 +551,8 @@ static void take_camera(Pipeline *p, CameraControls *out, uint64_t *gen) {
   pthread_mutex_unlock(&p->lock);
 }
 
-static void camera_done(Pipeline *p, Source *src, uint64_t gen, int n) {
-  src->cam_gen = gen;
+static void camera_done(Pipeline *p, uint64_t *src_gen, uint64_t gen, int n) {
+  *src_gen = gen;
   pthread_mutex_lock(&p->lock);
   p->cam_done_gen = gen;
   p->cam_done_n = n;
@@ -490,15 +560,20 @@ static void camera_done(Pipeline *p, Source *src, uint64_t gen, int n) {
   pthread_mutex_unlock(&p->lock);
 }
 
-// The latest controls onto an open V4L2 camera.
-static void apply_v4l2_camera(Pipeline *p, Source *src) {
+// The latest controls onto an open V4L2 camera. *src_gen: the generation
+// this open of it has applied.
+static void apply_camera_fd(Pipeline *p, int fd, uint64_t *src_gen) {
   CameraControls cc;
   uint64_t gen;
   take_camera(p, &cc, &gen);
   int n = 0;
   if (gen && camera_ctrl_any_set(&cc))
-    n = camera_ctrl_apply(v4l2_in_fd(src->v4l2), &cc);
-  camera_done(p, src, gen, n);
+    n = camera_ctrl_apply(fd, &cc);
+  camera_done(p, src_gen, gen, n);
+}
+
+static void apply_v4l2_camera(Pipeline *p, Source *src) {
+  apply_camera_fd(p, v4l2_in_fd(src->v4l2), &src->cam_gen);
 }
 
 static int controls_set(const CameraControls *c) {
@@ -548,7 +623,7 @@ static bool source_open(Pipeline *p, Source *src) {
       set_source(p, "waiting", "rpicam-vid would not start (see log)");
       return false;
     }
-    camera_done(p, src, gen, any ? controls_set(&cc) : 0);
+    camera_done(p, &src->cam_gen, gen, any ? controls_set(&cc) : 0);
     break;
   }
   case SRC_BUS: {
@@ -563,6 +638,8 @@ static bool source_open(Pipeline *p, Source *src) {
     fbus_reader_geometry(src->bus, &w, &h);
     break;
   }
+  case SRC_H264FILE:
+    return false; // never here: see passthrough_loop
   case SRC_RTP: {
     char err[160];
     if (!rtp_prepare(p, err, sizeof err)) {
@@ -684,12 +761,126 @@ static CaptureResult source_capture(Pipeline *p, Source *src, VideoFrame *vf,
   return CAP_FRAME;
 }
 
+// The source thread of a pipeline whose source is H.264 already
+// (hcfg_passthrough): each access unit goes to the RTP sinks as it is.
+// No frames, so no VideoFrame, no mailboxes and no sink threads; the
+// status the rest of hellion reads is kept as source_loop keeps it.
+static void passthrough_loop(Pipeline *p) {
+  const PipelineConfig *c = &p->cfg;
+  bool camera = c->source == SRC_V4L2;
+  uint32_t cur_w = 0, cur_h = 0;
+  bool was_running = false;
+  char detail[hs_detail_len];
+
+  while (!stopping(p)) {
+    H264Src *src = NULL;
+    if (camera && !device_exists(c->source_arg)) {
+      snprintf(detail, sizeof detail, "%.90s: no such device", c->source_arg);
+      set_source(p, "waiting", detail);
+    } else {
+      src = camera ? h264_src_open_camera(c->source_arg, c->width, c->height,
+                                          c->framerate)
+                   : h264_src_open_file(c->source_arg, c->framerate);
+      if (!src)
+        set_source(p, "waiting",
+                   camera ? "no H.264 from the camera (see log)"
+                          : "the file would not open (see log)");
+    }
+    if (!src) {
+      if (nap(p, source_retry_ms))
+        break;
+      continue;
+    }
+
+    // A file's size is not parsed out of it; the configured one is shown.
+    uint32_t w, h;
+    h264_src_geometry(src, &w, &h);
+    if (!w || !h) {
+      w = c->width;
+      h = c->height;
+    }
+    if (w != cur_w || h != cur_h) {
+      restart_sinks(p, w, h);
+      cur_w = w;
+      cur_h = h;
+    }
+    uint64_t cam_gen = 0;
+    if (camera)
+      apply_camera_fd(p, h264_src_fd(src), &cam_gen);
+
+    printf("hellion: pipeline \"%s\": %s connected at %ux%u, H.264 passed "
+           "through\n",
+           c->name, c->source_spec, w, h);
+    set_source(p, "running", "H.264 from the source, sent as it is");
+    was_running = true;
+
+    while (!stopping(p)) {
+      const uint8_t *au;
+      size_t len;
+      uint64_t capture_ns;
+      H264SrcResult r = h264_src_read(src, &au, &len, &capture_ns, 500);
+      if (r == H264_SRC_IDLE) {
+        set_source(p, "idle", "connected, but nothing arriving");
+        continue;
+      }
+      if (r == H264_SRC_LOST)
+        break;
+
+      pthread_mutex_lock(&p->lock);
+      size_t n = p->sink_count;
+      Sink *sinks[hcfg_max_sinks];
+      memcpy(sinks, p->sinks, n * sizeof sinks[0]);
+      pthread_mutex_unlock(&p->lock);
+      // Only this thread replaces the sinks, so the copies stay valid.
+      bool want_keyframe = false;
+      for (size_t i = 0; i < n; i++)
+        want_keyframe |= sink_write_h264(sinks[i], au, len, capture_ns);
+      h264_src_done(src);
+
+      pthread_mutex_lock(&p->lock);
+      p->src_frames++;
+      p->src_last_frame_ns = mono_ns();
+      if (strcmp(p->src_state, "running") != 0) {
+        snprintf(p->src_state, sizeof p->src_state, "running");
+        snprintf(p->src_detail, sizeof p->src_detail,
+                 "H.264 from the source, sent as it is");
+      }
+      bool new_camera = camera && p->cam_gen != cam_gen;
+      pthread_mutex_unlock(&p->lock);
+
+      if (new_camera)
+        apply_camera_fd(p, h264_src_fd(src), &cam_gen);
+      if (want_keyframe) {
+        // A receiver has just joined, and can show nothing until a
+        // keyframe arrives.
+        bool ok = h264_src_keyframe(src);
+        printf("hellion: pipeline \"%s\": a receiver joined; %s\n", c->name,
+               ok ? "asked the source for a keyframe"
+                  : "the source would not give a keyframe on request, so "
+                    "the picture starts at its next one");
+      }
+    }
+
+    h264_src_close(src);
+    if (!stopping(p) && was_running) {
+      printf("hellion: pipeline \"%s\": lost %s; reconnecting\n", c->name,
+             c->source_spec);
+      set_source(p, "waiting", "lost; reconnecting");
+    }
+  }
+  restart_sinks(p, 0, 0); // stops them
+}
+
 static void *source_loop(void *arg) {
   Pipeline *p = (Pipeline *)arg;
   {
     char tn[16];
     snprintf(tn, sizeof tn, "src %.11s", p->cfg.name);
     thread_set_name(tn);
+  }
+  if (hcfg_passthrough(&p->cfg)) {
+    passthrough_loop(p);
+    return NULL;
   }
   VideoFrame *vf = NULL;
   int64_t frame_no = 0;

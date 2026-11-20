@@ -55,10 +55,12 @@ static bool parse_source(PipelineConfig *p) {
     p->source = SRC_BUS;
   } else if (strcmp(kind, "rtp") == 0 && valid_port(p->source_arg)) {
     p->source = SRC_RTP;
+  } else if (strcmp(kind, "h264file") == 0 && p->source_arg[0]) {
+    p->source = SRC_H264FILE;
   } else {
     printf("hellion config: pipeline \"%s\": bad source \"%s\" (expected "
-           "\"v4l2:<device>\", \"rpicam\", \"bus:<stream>\", or "
-           "\"rtp:<port>\")\n",
+           "\"v4l2:<device>\", \"rpicam\", \"bus:<stream>\", "
+           "\"rtp:<port>\", or \"h264file:<path>\")\n",
            p->name, p->source_spec);
     return false;
   }
@@ -290,9 +292,16 @@ static bool parse_pipeline(Cursor *c, PipelineConfig *p) {
       p->gop = v;
     } else if (strcmp(key, "format") == 0) {
       char fmt[16];
-      if (!parse_string(c, fmt, sizeof fmt) || !parse_format(fmt, &p->format)) {
+      if (!parse_string(c, fmt, sizeof fmt)) {
+        printf("hellion config: \"format\" must be a string\n");
+        return false;
+      }
+      p->h264 = strcmp(fmt, "h264") == 0;
+      if (p->h264) {
+        p->format = FORMAT_AUTO;
+      } else if (!parse_format(fmt, &p->format)) {
         printf("hellion config: bad \"format\" (expected \"auto\", "
-               "\"mjpeg\", \"yuyv\" or \"yuv420\")\n");
+               "\"mjpeg\", \"yuyv\", \"h264\" or \"yuv420\")\n");
         return false;
       }
     } else {
@@ -338,6 +347,23 @@ static bool parse_pipeline(Cursor *c, PipelineConfig *p) {
            "\"rpicam\"\n",
            p->name);
     return false;
+  }
+  if (p->h264 && p->source != SRC_V4L2) {
+    printf("hellion config: pipeline \"%s\": \"format\": \"h264\" is only "
+           "for a \"v4l2:<device>\" source\n",
+           p->name);
+    return false;
+  }
+  // H.264 sent as it is: there are no frames for a bus or a v4l2 sink.
+  for (size_t i = 0; hcfg_passthrough(p) && i < p->sink_count; i++) {
+    if (p->sinks[i].kind != SINK_RTP) {
+      printf("hellion config: pipeline \"%s\": sink \"%s\": a source of "
+             "H.264 that is sent as it is (\"format\": \"h264\", "
+             "\"h264file:\") can only have \"rtp:\" sinks; frames need "
+             "the decode it avoids\n",
+             p->name, p->sinks[i].spec);
+      return false;
+    }
   }
   // A pipeline reading the stream it publishes would feed itself.
   for (size_t i = 0; i < p->sink_count; i++) {
@@ -586,6 +612,10 @@ bool hconfig_parse(const char *buf, size_t len, HellionConfig *out) {
 
 bool hcfg_sink_is_auto(const SinkConfig *s) {
   return s->kind == SINK_RTP && strncmp(s->arg, "auto:", 5) == 0;
+}
+
+bool hcfg_passthrough(const PipelineConfig *p) {
+  return (p->source == SRC_V4L2 && p->h264) || p->source == SRC_H264FILE;
 }
 
 bool hcfg_peer_is_auto(const HellionConfig *c) {

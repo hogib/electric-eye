@@ -4,6 +4,7 @@
 // a file.
 #define _POSIX_C_SOURCE 200809L
 #include "h264_rtp.c"
+#include "h264_src.c"
 
 #include "child_proc.h"
 #include "ffmpeg.h"
@@ -413,6 +414,65 @@ static void test_timestamp(void) {
   CHECK(h264rtp_timestamp(wrap_ns) < 90000);
 }
 
+// ---- Access units ---------------------------------------------------------
+
+// h264_src.c's splitter, which an h264file: source walks its file with.
+static void test_access_unit_split(void) {
+  static const uint8_t aud[] = {0x09, 0xf0};
+  static const uint8_t sps[] = {0x67, 0x42, 0xc0, 0x1f};
+  static const uint8_t pps[] = {0x68, 0xce, 0x3c};
+  static const uint8_t sei[] = {0x06, 0x05, 0x01, 0x80};
+  static const uint8_t idr_a[] = {0x65, 0x88, 0x84}; // first_mb 0
+  static const uint8_t idr_b[] = {0x65, 0x08, 0x84}; // a later slice
+  static const uint8_t p_a[] = {0x41, 0x9a, 0x24};
+  static const uint8_t p_b[] = {0x41, 0x1a, 0x24};
+  uint8_t b[160];
+  size_t n = 0, start[6];
+  // 0: AUD SPS PPS SEI IDR IDR'   (a keyframe in two slices)
+  start[0] = n;
+  n = put_nal(b, n, 4, aud, sizeof aud);
+  n = put_nal(b, n, 4, sps, sizeof sps);
+  n = put_nal(b, n, 3, pps, sizeof pps);
+  n = put_nal(b, n, 3, sei, sizeof sei);
+  n = put_nal(b, n, 3, idr_a, sizeof idr_a);
+  n = put_nal(b, n, 3, idr_b, sizeof idr_b);
+  // 1: P P'   (no delimiter: the slice's first_mb_in_slice starts it)
+  start[1] = n;
+  n = put_nal(b, n, 4, p_a, sizeof p_a);
+  n = put_nal(b, n, 3, p_b, sizeof p_b);
+  // 2: P      (a three-byte start code at the boundary)
+  start[2] = n;
+  n = put_nal(b, n, 3, p_a, sizeof p_a);
+  // 3: SEI P  (the SEI belongs to the picture after it)
+  start[3] = n;
+  n = put_nal(b, n, 4, sei, sizeof sei);
+  n = put_nal(b, n, 3, p_a, sizeof p_a);
+  // 4: AUD P
+  start[4] = n;
+  n = put_nal(b, n, 4, aud, sizeof aud);
+  n = put_nal(b, n, 4, p_a, sizeof p_a);
+  start[5] = n;
+
+  size_t pos = 0;
+  for (int i = 0; i < 5; i++) {
+    CHECK_EQ_INT(pos, start[i]);
+    size_t end = h264_next_access_unit(b, n, pos);
+    CHECK_EQ_INT(end, start[i + 1]);
+    CHECK_EQ_INT(h264_is_keyframe(b + pos, end - pos), i == 0);
+    pos = end;
+  }
+  CHECK_EQ_INT(h264_next_access_unit(b, n, n), n);
+  CHECK_EQ_INT(h264_next_access_unit(b, 0, 0), 0);
+  // No start code at all: one "access unit" of everything, not a keyframe.
+  static const uint8_t junk[] = {1, 2, 3, 4, 5, 6};
+  CHECK_EQ_INT(h264_next_access_unit(junk, sizeof junk, 0), sizeof junk);
+  CHECK(!h264_is_keyframe(junk, sizeof junk));
+  // A start code as the last bytes: nothing is read past the end.
+  static const uint8_t cut[] = {0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x00, 0x01};
+  CHECK_EQ_INT(h264_next_access_unit(cut, sizeof cut, 0), sizeof cut);
+  CHECK(!h264_is_keyframe(cut, sizeof cut));
+}
+
 // ---- ffmpeg decodes it ----------------------------------------------------
 
 static void sleep_ms(int ms) {
@@ -582,6 +642,13 @@ static void test_ffmpeg_decodes_it(void) {
   CHECK(es && ref && got && au_buf);
   CHECK_EQ_INT(ref_len, (size_t)frames * frame_bytes);
   CHECK_EQ_INT(aus, frames);
+  // h264_src.c's splitter finds the same boundaries as the one above.
+  for (size_t i = 0, pos = 0; es && i < aus && i < frames; i++) {
+    CHECK_EQ_INT(pos, starts[i]);
+    pos = h264_next_access_unit(es, es_len, pos);
+    if (i + 1 == aus)
+      CHECK_EQ_INT(pos, es_len);
+  }
   if (!es || !ref || !got || !au_buf || aus != frames ||
       ref_len != (size_t)frames * frame_bytes)
     goto free_bufs;
@@ -696,6 +763,7 @@ int main(void) {
   RUN_TEST(test_dropped_nals);
   RUN_TEST(test_not_annex_b);
   RUN_TEST(test_timestamp);
+  RUN_TEST(test_access_unit_split);
   RUN_TEST(test_ffmpeg_decodes_it);
   TEST_MAIN_END();
 }

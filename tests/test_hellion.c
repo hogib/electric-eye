@@ -12,6 +12,7 @@
 #include "pipeline.h"
 #include "hrecord.h"
 #include "udp_relay.h"
+#include "video_frame.h"
 #include "test_harness.h"
 #include <dirent.h>
 #include <fcntl.h>
@@ -330,7 +331,8 @@ static void test_pipeline_waits_for_missing_source(void) {
 // (make check runs suites from the repository root.)
 static void test_example_configs_load(void) {
   static const char *const files[] = {
-      "hellion/examples/a-rov.json", "hellion/examples/a-topside.json",
+      "hellion/examples/a-rov.json", "hellion/examples/a-rov-h264.json",
+      "hellion/examples/a-topside.json",
       "hellion/examples/b-rov.json", "hellion/examples/b-topside.json"};
   for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
     HellionConfig c;
@@ -836,6 +838,251 @@ static void test_recorder(void) {
   hrec_destroy(rec);
 }
 
+// ---- H.264 passed through ---------------------------------------------------
+
+static void test_config_h264(void) {
+  HellionConfig c;
+  CHECK(parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"v4l2:/dev/video2\","
+              "\"format\":\"h264\",\"sinks\":[\"rtp:auto:5610\","
+              "\"rtp:10.0.0.2:5600\"]}]}",
+              &c));
+  CHECK_EQ_INT(c.pipelines[0].source, SRC_V4L2);
+  CHECK(c.pipelines[0].h264);
+  CHECK(hcfg_passthrough(&c.pipelines[0]));
+  CHECK(parse("{\"pipelines\":[{\"name\":\"up\",\"source\":"
+              "\"h264file:/tmp/clip.h264\",\"sinks\":[\"rtp:h:1\"]}]}",
+              &c));
+  CHECK_EQ_INT(c.pipelines[0].source, SRC_H264FILE);
+  CHECK(strcmp(c.pipelines[0].source_arg, "/tmp/clip.h264") == 0);
+  CHECK(hcfg_passthrough(&c.pipelines[0]));
+  // The other formats are not it.
+  CHECK(parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"v4l2:/dev/video0\","
+              "\"format\":\"mjpeg\",\"sinks\":[\"rtp:h:1\"]}]}",
+              &c));
+  CHECK(!c.pipelines[0].h264 && !hcfg_passthrough(&c.pipelines[0]));
+
+  // Encoded H.264 cannot go where frames go.
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"v4l2:/dev/video2\","
+               "\"format\":\"h264\",\"sinks\":[\"bus:camera\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"v4l2:/dev/video2\","
+               "\"format\":\"h264\",\"sinks\":[\"rtp:h:1\","
+               "\"v4l2:/dev/video10\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":"
+               "\"h264file:/tmp/clip.h264\",\"sinks\":[\"bus:camera\"]}]}",
+               &c));
+  // Only a V4L2 camera has it as a format.
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"rpicam\","
+               "\"format\":\"h264\",\"sinks\":[\"rtp:h:1\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"bus:a\","
+               "\"format\":\"h264\",\"sinks\":[\"rtp:h:1\"]}]}",
+               &c));
+  CHECK(!parse("{\"pipelines\":[{\"name\":\"up\",\"source\":\"h264file:\","
+               "\"sinks\":[\"rtp:h:1\"]}]}",
+               &c));
+}
+
+static bool run_quiet(char *const argv[]) {
+  ChildProc c;
+  int status = -1;
+  if (!child_spawn(&c, "test", argv, CHILD_NULL_STDIN))
+    return false;
+  if (!child_wait(&c, 30000, &status)) {
+    child_stop(&c, 500);
+    return false;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static uint8_t *slurp(const char *path, size_t *len) {
+  *len = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return NULL;
+  struct stat st;
+  uint8_t *buf = NULL;
+  if (fstat(fileno(f), &st) == 0 && st.st_size > 0 &&
+      (buf = (uint8_t *)malloc((size_t)st.st_size)) &&
+      fread(buf, 1, (size_t)st.st_size, f) == (size_t)st.st_size)
+    *len = (size_t)st.st_size;
+  fclose(f);
+  return buf;
+}
+
+// Which of the reference frames `frame` is, byte for byte; -1 for none.
+static int which_frame(const uint8_t *frame, const uint8_t *ref, int ref_frames,
+                       size_t frame_bytes) {
+  for (int i = 0; i < ref_frames; i++)
+    if (memcmp(frame, ref + (size_t)i * frame_bytes, frame_bytes) == 0)
+      return i;
+  return -1;
+}
+
+// The ROV without an encoder: an H.264 stream (a file standing in for a
+// camera that encodes) goes through a pipeline to its RTP sink untouched,
+// and a topside pipeline receives and decodes it as it would the ffmpeg
+// encoder's. Every picture that comes out of the bus must be, byte for
+// byte, one ffmpeg decodes from the file itself; and a recording of the
+// stream must hold those same pictures.
+static void test_h264_passthrough(void) {
+  if (!ff_available()) {
+    printf("    (skipped: ffmpeg is not installed)\n");
+    return;
+  }
+  enum { w = 320, h = 240, clip_frames = 60, frame_bytes = w * h * 2 };
+  char clip[128], ref_path[128], rec_yuv[128];
+  snprintf(clip, sizeof clip, "%s/clip.h264", bus_dir);
+  snprintf(ref_path, sizeof ref_path, "%s/clip.yuv", bus_dir);
+  snprintf(rec_yuv, sizeof rec_yuv, "%s/rec.yuv", bus_dir);
+  char *vf = "scale=w=320:h=240:in_range=tv:out_range=pc,format=yuv422p";
+  // x264 writes SPS and PPS at every keyframe here; a stream with them
+  // at the start only is the packetizer's own suite's business.
+  char *const encode[] = {
+      "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f",
+      "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "60", "-c:v",
+      "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt",
+      "yuv420p", "-g", "15", "-x264-params", "slices=2:aud=1", "-f", "h264",
+      "-y", clip, NULL};
+  char *const decode[] = {"ffmpeg", "-hide_banner", "-nostdin", "-loglevel",
+                          "error", "-i", clip, "-vf", vf, "-f", "rawvideo",
+                          "-y", ref_path, NULL};
+  size_t ref_len = 0;
+  uint8_t *ref = NULL;
+  if (!run_quiet(encode) || !run_quiet(decode) ||
+      !(ref = slurp(ref_path, &ref_len)) ||
+      ref_len != (size_t)clip_frames * frame_bytes) {
+    printf("    (skipped: this ffmpeg cannot make the test clip; no "
+           "libx264?)\n");
+    free(ref);
+    unlink(clip);
+    unlink(ref_path);
+    return;
+  }
+
+  int port = udp_free_port_pair();
+  char json[1024];
+  snprintf(json, sizeof json,
+           "{\"record_dir\":\"%s/rec\",\"pipelines\":["
+           "{\"name\":\"down\",\"source\":\"rtp:%d\",\"width\":320,"
+           "\"height\":240,\"sinks\":[\"bus:pt-out\"]},"
+           "{\"name\":\"up\",\"source\":\"h264file:%s\",\"width\":320,"
+           "\"height\":240,\"framerate\":30,"
+           "\"sinks\":[\"rtp:127.0.0.1:%d\"]}]}",
+           bus_dir, port, clip, port);
+  HellionConfig c;
+  CHECK(parse(json, &c));
+  Pipeline *pipes[2] = {pipeline_start(&c.pipelines[0]),
+                        pipeline_start(&c.pipelines[1])};
+  HRec *rec = hrec_create(&c, pipes, 2);
+
+  Img dst;
+  img_init(&dst, w, h);
+  FbusReader *out = NULL;
+  int matched = 0, unknown = 0, in_order = 0, last = -1;
+  bool recording = false;
+  char detail[256] = "";
+  uint64_t t0 = vf_now_ns();
+  // ~6s: the decoder needs a keyframe or two to start, then three seconds
+  // of pictures, recorded.
+  while (vf_now_ns() - t0 < 6000000000ull) {
+    if (!out) {
+      out = fbus_reader_open("pt-out", NULL);
+      if (!out) {
+        sleep_ms(20);
+        continue;
+      }
+    }
+    if (fbus_reader_next(out, dst.planes, 100, NULL) != FBUS_FRAME)
+      continue;
+    int f = which_frame(dst.buf, ref, clip_frames, frame_bytes);
+    if (f < 0) {
+      unknown++;
+    } else {
+      matched++;
+      // The clip loops: after frame 59 comes frame 0.
+      if (last >= 0 && f == (last + 1) % clip_frames)
+        in_order++;
+      last = f;
+    }
+    if (!recording && matched >= 10) {
+      recording = hrec_start(rec, detail, sizeof detail);
+      CHECK(recording);
+    }
+  }
+  printf("    %d decoded frames are the clip's, %d of them the one after "
+         "the last; %d are not\n",
+         matched, in_order, unknown);
+  CHECK(matched >= 60);
+  CHECK_EQ_INT(unknown, 0);
+  // Nearly all in sequence (the bus reader may skip one under load).
+  CHECK(in_order >= matched * 9 / 10);
+
+  HsPipeline st;
+  pipeline_status(pipes[1], &st);
+  CHECK(strcmp(st.source.state, "running") == 0);
+  CHECK(st.source.frames > 60);
+  CHECK(strcmp(st.sinks[0].state, "sending") == 0);
+  CHECK(strstr(st.sinks[0].detail, "H.264") != NULL);
+  CHECK(st.sinks[0].net && st.sinks[0].packets > st.source.frames);
+  CHECK(st.sinks[0].frames > 60);
+  CHECK_EQ_INT(st.width, w);
+  pipeline_status(pipes[0], &st);
+  CHECK(st.source.net && st.source.packets > 0);
+  CHECK_EQ_INT(st.source.lost, 0);
+
+  // The recording: the stream as it arrived, so the clip's own pictures.
+  CHECK(recording && hrec_stop(rec, detail, sizeof detail));
+  char path[512], status[1200];
+  snprintf(path, sizeof path, "%s/rec/%s", bus_dir, detail);
+  hrec_status_json(rec, status, sizeof status);
+  CHECK(strstr(status, "\"error\":\"\"") != NULL);
+  CHECK(file_has(path, "ftyp") && file_has(path, "moof"));
+  char *const play[] = {"ffmpeg", "-hide_banner", "-nostdin", "-loglevel",
+                        "error", "-i", path, "-vf", vf, "-f", "rawvideo",
+                        "-y", rec_yuv, NULL};
+  CHECK(run_quiet(play));
+  size_t rec_len = 0;
+  uint8_t *rec_frames = slurp(rec_yuv, &rec_len);
+  int rec_n = (int)(rec_len / frame_bytes), rec_matched = 0;
+  for (int i = 0; i < rec_n; i++)
+    rec_matched +=
+        which_frame(rec_frames + (size_t)i * frame_bytes, ref, clip_frames,
+                    frame_bytes) >= 0;
+  printf("    the recording holds %d frames, %d of them the clip's\n", rec_n,
+         rec_matched);
+  CHECK(rec_n >= 30);
+  // All but, at most, what came before its first keyframe.
+  CHECK(rec_matched >= rec_n - 15 && rec_matched >= 30);
+
+  free(rec_frames);
+  unlink(path);
+  unlink(rec_yuv);
+  char dir[300];
+  snprintf(dir, sizeof dir, "%s/rec", bus_dir);
+  rmdir(dir);
+  hrec_destroy(rec);
+  fbus_reader_close(out);
+  pipeline_stop(pipes[1]);
+  pipeline_stop(pipes[0]);
+  free(dst.buf);
+  free(ref);
+  unlink(clip);
+  unlink(ref_path);
+
+  // A source that is not there waits, as a camera does.
+  CHECK(parse("{\"pipelines\":[{\"name\":\"nofile\",\"source\":"
+              "\"h264file:/nonexistent/x.h264\","
+              "\"sinks\":[\"rtp:127.0.0.1:9\"]}]}",
+              &c));
+  Pipeline *p = pipeline_start(&c.pipelines[0]);
+  sleep_ms(200);
+  pipeline_status(p, &st);
+  CHECK(strcmp(st.source.state, "waiting") == 0);
+  pipeline_stop(p);
+}
+
 // ---- Status file ----------------------------------------------------------
 
 static void test_status_round_trip(void) {
@@ -1196,6 +1443,8 @@ int main(void) {
   RUN_TEST(test_udp_relay_frame_ends);
   RUN_TEST(test_rtp_round_trip);
   RUN_TEST(test_recorder);
+  RUN_TEST(test_config_h264);
+  RUN_TEST(test_h264_passthrough);
   RUN_TEST(test_status_round_trip);
   RUN_TEST(test_log_capture);
 

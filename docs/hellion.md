@@ -139,29 +139,33 @@ A **pipeline** moves frames from one source to up to 8 sinks:
 
 | Source | |
 |---|---|
-| `v4l2:<device>` | A V4L2 camera, MJPEG or YUYV, through `src/v4l2_in.c` |
+| `v4l2:<device>` | A V4L2 camera, MJPEG or YUYV, through `src/v4l2_in.c`; or, with `"format": "h264"`, the camera's own H.264, sent as it is ([below](#the-cameras-own-h264)) |
 | `rpicam` | A Pi camera module, through `rpicam-vid` (`src/rpicam_in.c`) |
 | `bus:<stream>` | A frame bus stream; the size comes from the stream |
 | `rtp:<port>` | H.264 over RTP arriving on UDP `<port>`, decoded by ffmpeg |
+| `h264file:<path>` | An Annex B `.h264` file, looped at `framerate` and sent as it is, like a camera's own H.264: for tests and benches without such a camera |
 
 | Sink | |
 |---|---|
 | `bus:<stream>` | Publish to the frame bus ([bus.md](bus.md)) |
 | `v4l2:<device>` | A v4l2loopback device. Optional and retried, like `eeye`'s ([output.md](output.md#optional-and-retried)) |
-| `rtp:<host>:<port>` | Encode to H.264 with ffmpeg and send over RTP |
+| `rtp:<host>:<port>` | Encode to H.264 with ffmpeg and send over RTP. From a source that is H.264 already, no encode and no ffmpeg: `hellion` packetizes it itself |
 | `rtp:auto:<port>` | The same, to the topside discovery finds; follows it if it changes, and sends nothing (and does not encode) while there is none |
 
 | Pipeline key | Default | For |
 |---|---|---|
 | `width`, `height` | 1280×720 | Camera sources (asked of the camera) and RTP sources (what the decoder scales to). Even numbers |
-| `format` | `auto` | Camera sources: `auto`, `mjpeg`, `yuyv`; `yuv420` for `rpicam` |
+| `format` | `auto` | Camera sources: `auto`, `mjpeg`, `yuyv`; `h264` for a V4L2 camera that encodes; `yuv420` for `rpicam` |
 | `framerate` | 30 | Asked of cameras, and what RTP sinks stamp frames at (see [Timestamps](#timestamps)) |
 | `relay` | `[]` | RTP sources: `["host:port", ...]` to forward the packets to unchanged, e.g. QGC |
 | `encoder` | `libx264` | RTP sinks: any ffmpeg H.264 encoder, e.g. `h264_v4l2m2m` (Pi 4's hardware encoder) |
 | `bitrate_kbps` | 4000 | RTP sinks |
 | `gop` | 30 | RTP sinks: frames between keyframes — how soon a viewer that joins late gets a picture |
 
-A pipeline cannot read the bus stream it publishes.
+A pipeline cannot read the bus stream it publishes. One whose source is H.264 already
+(`"format": "h264"`, `h264file:`) carries no frames, so it can only have `rtp:` sinks,
+and `encoder`, `bitrate_kbps` and `gop` do not apply to it: the camera encodes as it
+is set to.
 
 ## Discovery
 
@@ -224,6 +228,11 @@ same four example configs in `hellion/examples/` cover it (BlueROV addresses: to
 topside decodes it to `bus:camera`, `eeye` reads that and publishes `pilot`, and a
 second topside pipeline encodes `pilot` for QGC on 5600 and writes `/dev/video10`.
 Two encodes, one on each side.
+
+**A, with a camera that encodes** (`a-rov-h264.json` in place of `a-rov.json`; the
+topside is the same): the ROV sends the camera's own H.264 and encodes nothing. See
+[The camera's own H.264](#the-cameras-own-h264). `install.sh` does not pick this
+config; copy it to `/etc/hellion/hellion.json` on the ROV and set the device.
 
 **B — `eeye` on the ROV** (`b-rov.json`, `b-topside.json`): `eeye` runs next to the
 camera and the ROV sends `pilot` up. Topside relays the packets unchanged to QGC on
@@ -298,6 +307,56 @@ conversion, 40 comes back 28).
 
 **Late joiners.** SPS/PPS go out before every keyframe (`dump_extra`), whatever the
 encoder, so QGC opened mid-dive gets a picture within one `gop`.
+
+### The camera's own H.264
+
+Encoding is the expensive part of the ROV's side: on a Raspberry Pi 5, which has no
+hardware H.264 encoder, the ffmpeg (libx264, `ultrafast`) of a 1280×720 placement-B
+stream took 0.51 of a core out of 0.91 for all of electric-eye (measured 2026-11-19,
+on a Pi throttled by heat, so on the high side). Many USB cameras encode H.264
+themselves. A pipeline with `"source": "v4l2:<device>", "format": "h264"` takes that
+stream and sends it as it is: no decode, no encode, and **no ffmpeg on the ROV at
+all** (it does not even need to be installed for such a config).
+
+```json
+{"name": "camera-up", "source": "v4l2:/dev/video2", "format": "h264",
+ "width": 1280, "height": 720, "framerate": 30, "sinks": ["rtp:auto:5610"]}
+```
+
+- **Which device.** A camera often has its H.264 on another `/dev/video` node than its
+  MJPEG. `v4l2-ctl --list-devices`, then `v4l2-ctl -d /dev/videoN --list-formats-ext`
+  on each; a node without H.264 is refused with that advice.
+- **Effects are topside.** There are no decoded frames on the ROV in this mode, so it
+  is placement A: the topside decodes, `eeye` runs there, and the topside's second
+  pipeline encodes the pilot's picture for QGC.
+- **What is sent** is what the ffmpeg encoder sent, so nothing topside changes — the
+  decoder, the relay to QGC, recording: RFC 6184 packetization-mode 1 (single NAL unit
+  packets and FU-A fragments, `h264_rtp.c`), payload type 96, packets of at most 1200
+  bytes, the marker bit on each picture's last packet, and SPS/PPS before every
+  keyframe (kept and repeated for a camera that sends them only once).
+- **Timestamps** are the driver's capture times on the 90 kHz RTP clock, not a nominal
+  rate, so a recording plays at the speed things happened whatever the camera's real
+  frame rate.
+- **Every picture is taken, in order** (`h264_src.c`). The MJPEG capture keeps only the
+  newest buffer when it falls behind; here a skipped picture would break every one
+  predicted from it until the next keyframe.
+- **Keyframes.** A receiver can show nothing until one arrives. When an `rtp:auto:`
+  sink finds a topside, the camera is asked for one: with V4L2's force-key-frame
+  control if it has it, else by stopping and restarting its stream, which makes a
+  camera begin afresh at the cost of a short gap. Otherwise the wait is the camera's
+  own keyframe interval, which is the camera's to set (`v4l2-ctl -d <device> -L` shows
+  what it offers); QGC opened mid-dive, or a decoder restarted after an outage, waits
+  that long.
+- **Camera controls** (brightness, exposure, ...) go to the same device, as for MJPEG.
+- **The source thread writes to the sinks itself** in this mode: packetizing a picture
+  is a few `send()`s, so there is no mailbox and no sink thread.
+
+Tested end to end without a camera (`h264file:` source: every decoded frame and every
+frame of a recording byte-identical to ffmpeg's decode of the file), and through
+V4L2 with a v4l2loopback device carrying H.264 at 1280×720, 30 fps. **Not yet run on a
+camera that encodes**: whether the lab's reports H.264 at all, how it answers a
+keyframe request, and its keyframe interval are still to be seen, and so is the CPU
+this saves on the Pi.
 
 **Decoder damage.** With packet loss the H.264 decoder complains about every damaged
 macroblock — about ten lines a second at 2% loss. `hellion` counts those instead of

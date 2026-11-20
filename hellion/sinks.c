@@ -5,14 +5,19 @@
 #include "child_proc.h"
 #include "fbus.h"
 #include "ffmpeg.h"
+#include "h264_rtp.h"
 #include "udp_relay.h"
 #include "video_frame.h"
 #include "virtual_cam.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 // An encoder that cannot take a frame within this long is stuck, not slow
 // (a frame is a few ms of encoding), and is restarted.
@@ -56,6 +61,16 @@ struct SinkImpl {
   uint64_t rate_last_ns; // the previous frame, to notice gaps
   double measured_fps;
   bool warned_rate;
+
+  // H.264 that arrives encoded (hcfg_passthrough): no encoder at all.
+  // The packetizer sends to the relay's local port, where the encoder's
+  // packets would have arrived, so the destinations, discovery's
+  // re-targeting and the link statistics are the same either way.
+  bool passthrough;
+  H264Rtp rtp;
+  int rtp_fd;
+  uint64_t rtp_send_errors;
+  bool want_keyframe;
 };
 
 static uint64_t mono_ns(void) {
@@ -191,8 +206,39 @@ static void check_rate(SinkImpl *s, uint64_t now) {
   s->warned_rate = off; // cleared again once the rate is back in range
 }
 
+static void rtp_send_packet(void *ctx, const uint8_t *pkt, size_t len) {
+  SinkImpl *s = (SinkImpl *)ctx;
+  if (send(s->rtp_fd, pkt, len, 0) != (ssize_t)len)
+    s->rtp_send_errors++;
+}
+
+// A connected UDP socket to the relay's port on loopback, and the
+// packetizer that writes to it.
+static bool passthrough_open(SinkImpl *s, char *err, size_t err_cap) {
+  struct sockaddr_in to = {.sin_family = AF_INET,
+                           .sin_port = htons((uint16_t)udp_relay_port(s->relay)),
+                           .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  s->rtp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (s->rtp_fd < 0 ||
+      connect(s->rtp_fd, (struct sockaddr *)&to, sizeof to) != 0) {
+    snprintf(err, err_cap, "no local socket for RTP");
+    return false;
+  }
+  // The SSRC and first sequence number are meant to be random (RFC 3550),
+  // so that a restarted sender is seen as a new one; unpredictable is
+  // not needed here.
+  uint64_t r = mono_ns() ^ ((uint64_t)getpid() << 32) ^ (uintptr_t)s;
+  r ^= r >> 33;
+  r *= 0xff51afd7ed558ccdull;
+  r ^= r >> 33;
+  h264rtp_init(&s->rtp, (uint32_t)r, (uint16_t)(r >> 32), 0, rtp_send_packet,
+               s);
+  return true;
+}
+
 static bool rtp_open(SinkImpl *s, const PipelineConfig *pc, SinkReport *rep) {
-  if (!ff_available()) {
+  s->passthrough = hcfg_passthrough(pc);
+  if (!s->passthrough && !ff_available()) {
     report(rep, "error", "ffmpeg is not installed");
     return false;
   }
@@ -206,13 +252,21 @@ static bool rtp_open(SinkImpl *s, const PipelineConfig *pc, SinkReport *rep) {
   if (!s->relay ||
       (!s->auto_dest &&
        !udp_relay_add_dest(s->relay, s->arg, err, sizeof err)) ||
+      (s->passthrough && !passthrough_open(s, err, sizeof err)) ||
       !udp_relay_start(s->relay)) {
     printf("hellion: rtp sink %s: %s\n", s->arg, err);
     report(rep, "error", "%s", err);
     udp_relay_close(s->relay);
     s->relay = NULL;
+    if (s->rtp_fd >= 0)
+      close(s->rtp_fd);
+    s->rtp_fd = -1;
     return false;
   }
+  if (s->passthrough)
+    printf("hellion: rtp sink %s: sending the source's own H.264 (no "
+           "encoder, no ffmpeg)\n",
+           s->arg);
   snprintf(s->encoder, sizeof s->encoder, "%s", pc->encoder);
   s->enc_cfg = (FfEncoder){.encoder = s->encoder,
                            .width = s->width,
@@ -256,6 +310,7 @@ static bool retarget(SinkImpl *s, SinkReport *rep) {
       return false;
     }
     snprintf(s->dest_now, sizeof s->dest_now, "%s", target);
+    s->want_keyframe = true; // nothing decodes until one arrives
     DiscView v;
     disc_view(&v);
     printf("hellion: rtp sink %s: sending to %s (topside \"%s\"%s)\n",
@@ -268,6 +323,10 @@ static bool retarget(SinkImpl *s, SinkReport *rep) {
 }
 
 static bool rtp_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep) {
+  if (s->passthrough) { // it takes access units (sink_impl_write_h264)
+    report(rep, "error", "not a sink for frames");
+    return false;
+  }
   if (s->auto_dest && !retarget(s, rep))
     return false;
   uint64_t now = mono_ns();
@@ -305,6 +364,31 @@ static bool rtp_write(SinkImpl *s, const SinkFrame *f, SinkReport *rep) {
   return true;
 }
 
+bool sink_impl_write_h264(SinkImpl *s, const uint8_t *au, size_t len,
+                          uint64_t capture_ns, SinkReport *rep) {
+  if (s->kind != SINK_RTP || !s->passthrough) {
+    report(rep, "error", "not a sink for encoded H.264");
+    return false;
+  }
+  if (s->auto_dest && !retarget(s, rep))
+    return false;
+  uint64_t errors = s->rtp_send_errors;
+  h264rtp_send(&s->rtp, au, len, h264rtp_timestamp(capture_ns));
+  if (s->rtp_send_errors != errors) {
+    report(rep, "error", "could not send RTP to the local relay");
+    return false;
+  }
+  report(rep, "sending", "the source's H.264%s%s", s->auto_dest ? " to " : "",
+         s->auto_dest ? s->dest_now : "");
+  return true;
+}
+
+bool sink_impl_wants_keyframe(SinkImpl *s) {
+  bool want = s->want_keyframe;
+  s->want_keyframe = false;
+  return want;
+}
+
 // ---- Common ---------------------------------------------------------------
 
 SinkImpl *sink_impl_open(const SinkConfig *cfg, const PipelineConfig *pc,
@@ -315,6 +399,7 @@ SinkImpl *sink_impl_open(const SinkConfig *cfg, const PipelineConfig *pc,
     return NULL;
   }
   s->kind = cfg->kind;
+  s->rtp_fd = -1;
   s->width = width;
   s->height = height;
   snprintf(s->arg, sizeof s->arg, "%s", cfg->arg);
@@ -334,10 +419,13 @@ SinkImpl *sink_impl_open(const SinkConfig *cfg, const PipelineConfig *pc,
     report(rep, "waiting", "not opened yet");
     break;
   case SINK_RTP:
-    s->i420_bytes = (size_t)width * height +
-                    2 * (size_t)((width + 1) / 2) * ((height + 1) / 2);
-    s->i420 = (uint8_t *)malloc(s->i420_bytes);
-    if (!s->i420) {
+    // Encoded H.264 passing through needs no frame for an encoder.
+    s->i420_bytes = hcfg_passthrough(pc)
+                        ? 0
+                        : (size_t)width * height +
+                              2 * (size_t)((width + 1) / 2) * ((height + 1) / 2);
+    s->i420 = s->i420_bytes ? (uint8_t *)malloc(s->i420_bytes) : NULL;
+    if (s->i420_bytes && !s->i420) {
       report(rep, "error", "out of memory");
       free(s);
       return NULL;
@@ -401,6 +489,8 @@ void sink_impl_close(SinkImpl *s) {
     // Closing stdin first lets ffmpeg flush what it has and exit cleanly.
     child_stop(&s->enc, 2000);
     udp_relay_close(s->relay);
+    if (s->rtp_fd >= 0)
+      close(s->rtp_fd);
   }
   free(s->i420);
   free(s);

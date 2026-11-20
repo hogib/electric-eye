@@ -32,13 +32,19 @@
  *            "rpicam"         a Pi camera module, via rpicam-vid
  *            "bus:<stream>"   a frame bus stream (geometry from the stream)
  *            "rtp:<port>"     H.264 over RTP arriving on UDP <port>
+ *            "h264file:<path>" an Annex B .h264 file, looped (tests, benches)
  *   sinks    "bus:<stream>"   publish to the frame bus
  *            "v4l2:<device>"  a v4l2loopback device (optional, retried)
  *            "rtp:<host>:<port>"  encode to H.264, send over RTP
  *            "rtp:auto:<port>"    the same, to the topside discovery finds
  * Camera and RTP sources take "width"/"height" (default 1280x720; an RTP
  * source scales what it decodes to that) and camera sources "format"
- * ("auto", "mjpeg", "yuyv"; "yuv420" for rpicam). An RTP source takes
+ * ("auto", "mjpeg", "yuyv"; "yuv420" for rpicam). A "v4l2:" source with
+ * "format": "h264" takes the camera's own H.264 and sends it as it is:
+ * no decode, no encode, no ffmpeg on this machine. There are no frames in
+ * such a pipeline, so its sinks can only be "rtp:" ones, and "encoder",
+ * "bitrate_kbps" and "gop" do not apply (the camera encodes as it
+ * pleases). "h264file:" behaves the same way. An RTP source takes
  * "relay": ["host:port", ...] to forward its packets unchanged (to QGC,
  * say). RTP sinks take "encoder" (default "libx264"), "bitrate_kbps"
  * (default 4000) and "gop" (default 30). "framerate" (default 30) is the
@@ -60,6 +66,7 @@ typedef enum {
   SRC_RPICAM,
   SRC_BUS,
   SRC_RTP, // H.264 over RTP arriving on a UDP port
+  SRC_H264FILE, // an Annex B file, sent as it is (see hcfg_passthrough)
 } SourceKind;
 
 typedef enum {
@@ -84,6 +91,8 @@ typedef struct {
   uint16_t width; // camera sources only
   uint16_t height;
   CaptureFormat format;
+  // "format": "h264" on a v4l2 source: the camera's own H.264.
+  bool h264;
   size_t sink_count;
   SinkConfig sinks[hcfg_max_sinks];
 
@@ -141,6 +150,11 @@ typedef struct {
 // "peer": "auto".
 bool hcfg_sink_is_auto(const SinkConfig *s);
 bool hcfg_peer_is_auto(const HellionConfig *c);
+
+// Whether a pipeline carries H.264 that is already encoded from its
+// source to its RTP sinks, untouched, rather than frames: a camera with
+// "format": "h264", or an "h264file:" source.
+bool hcfg_passthrough(const PipelineConfig *p);
 
 // Parses `buf`. On failure prints why and returns false.
 bool hconfig_parse(const char *buf, size_t len, HellionConfig *out);
