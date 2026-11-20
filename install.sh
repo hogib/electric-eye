@@ -12,6 +12,15 @@
 #                          b = on the ROV: the ROV sends the pilot's picture
 #                              up (where autonomy will run)
 #                        Both ends must be installed with the same placement.
+#   --camera-h264 DEVICE ROV, placement a only: the camera encodes H.264
+#                        itself, on DEVICE (e.g. /dev/video2; find it with
+#                        v4l2-ctl --list-devices, then --list-formats-ext on
+#                        each node). hellion sends that stream as it is: no
+#                        encode on the ROV, and no ffmpeg, which is then
+#                        neither installed nor needed here. Replaces
+#                        /etc/hellion/hellion.json (the old one kept as .bak)
+#                        and is remembered; "off" goes back to MJPEG and the
+#                        ffmpeg encoder. The topside is installed as usual.
 #   --tether IFACE       topside only: give IFACE the BlueROV topside address,
 #                        192.168.2.1/24 (or --topside-ip's), with
 #                        NetworkManager. Without it the network is left alone.
@@ -40,8 +49,9 @@
 #
 # What runs where:
 #                 ROV                         topside
-#   placement a   hellion (camera -> RTP)     hellion (RTP -> bus "camera",
-#                                               bus "pilot" -> QGC, loopback),
+#   placement a   hellion (camera -> RTP;     hellion (RTP -> bus "camera",
+#                 with --camera-h264, the
+#                 camera's own H.264)           bus "pilot" -> QGC, loopback),
 #                                               eeye (bus "camera" -> "pilot")
 #   placement b   eeye (camera -> "pilot"),   hellion (RTP -> QGC, bus
 #                 hellion ("pilot" -> RTP)      "pilot", loopback)
@@ -64,6 +74,8 @@ TETHER_IF=""
 TOPSIDE_IP=""
 ROV_IP=""
 PAIR=""
+CAMERA_H264=""
+CAMERA_GIVEN=0
 RESET_CONFIG=0
 INSTALL_PACKAGES=1
 # The value after an option, or a clear error when there is none.
@@ -82,6 +94,8 @@ while [ $# -gt 0 ]; do
     --rov-ip=*) ROV_IP="${1#*=}"; shift ;;
     --pair) need_value "$@"; PAIR="$2"; shift 2 ;;
     --pair=*) PAIR="${1#*=}"; shift ;;
+    --camera-h264) need_value "$@"; CAMERA_H264="$2"; CAMERA_GIVEN=1; shift 2 ;;
+    --camera-h264=*) CAMERA_H264="${1#*=}"; CAMERA_GIVEN=1; shift ;;
     --reset-config) RESET_CONFIG=1; shift ;;
     --no-packages) INSTALL_PACKAGES=0; shift ;;
     # The whole header comment, however long it grows.
@@ -105,7 +119,9 @@ if [ -r "$STATE_FILE" ]; then
   [ -n "$TOPSIDE_IP" ] || TOPSIDE_IP=$(prev TOPSIDE_IP)
   [ -n "$ROV_IP" ] || ROV_IP=$(prev ROV_IP)
   [ -n "$PAIR" ] || PAIR=$(prev PAIR)
+  [ "$CAMERA_GIVEN" -eq 1 ] || CAMERA_H264=$(prev CAMERA_H264)
 fi
+[ "$CAMERA_H264" = off ] && CAMERA_H264=""
 # "auto" un-pins an address remembered from an earlier run (installs from
 # before discovery all pinned theirs): found by discovery again.
 [ "$TOPSIDE_IP" = auto ] && TOPSIDE_IP=""
@@ -125,6 +141,18 @@ echo "$PAIR" | grep -Eq '^[A-Za-z0-9_-]{1,31}$' ||
 
 case "$ROLE" in rov|topside) ;; *) die "--role must be rov or topside (try --help)" ;; esac
 case "$PLACEMENT" in a|b) ;; *) die "--placement must be a or b (try --help)" ;; esac
+# The camera's own H.264 is the ROV's, with the effects topside (there are
+# no decoded frames on the ROV for eeye to work on).
+if [ -n "$CAMERA_H264" ] && { [ "$ROLE" != rov ] || [ "$PLACEMENT" != a ]; }; then
+  [ "$CAMERA_GIVEN" -eq 1 ] &&
+    die "--camera-h264 is for --role rov --placement a: the ROV sends the \
+camera's stream untouched, so the effects have to run topside."
+  CAMERA_H264="" # remembered from an install as something else
+fi
+if [ -n "$CAMERA_H264" ]; then
+  echo "$CAMERA_H264" | grep -Eq '^/dev/[A-Za-z0-9_./-]{1,100}$' ||
+    die "--camera-h264 needs a device like /dev/video2 (or \"off\")"
+fi
 if [ -n "$TETHER_IF" ] && [ "$ROLE" != topside ]; then
   die "--tether is for the topside machine. On a BlueROV the ROV's network belongs to BlueOS; leave it alone."
 fi
@@ -156,7 +184,12 @@ TARGET_USER="${SUDO_USER:-}"
 
 # --- Packages ------------------------------------------------------------
 
-PKGS="build-essential pkg-config libturbojpeg0-dev ffmpeg"
+# ffmpeg does the H.264 encode, decode and recording. A ROV sending its
+# camera's own H.264 does none of them.
+NEED_FFMPEG=1
+[ -n "$CAMERA_H264" ] && NEED_FFMPEG=0
+PKGS="build-essential pkg-config libturbojpeg0-dev"
+[ "$NEED_FFMPEG" -eq 1 ] && PKGS="$PKGS ffmpeg"
 [ "$NEED_LOOPBACK" -eq 1 ] && PKGS="$PKGS v4l2loopback-dkms"
 
 if [ "$INSTALL_PACKAGES" -eq 1 ]; then
@@ -181,13 +214,14 @@ kernel headers for $(uname -r) are probably missing: \
     fi
   else
     warn "No apt-get here, so packages were not installed. This needs a C \
-compiler, make, pkg-config, libjpeg-turbo (turbojpeg) headers and ffmpeg\
+compiler, make, pkg-config, libjpeg-turbo (turbojpeg) headers\
+$([ "$NEED_FFMPEG" -eq 1 ] && echo " and ffmpeg")\
 $([ "$NEED_LOOPBACK" -eq 1 ] && echo ", plus the v4l2loopback kernel module"). \
 Install them with your package manager, then re-run with --no-packages."
     INSTALL_PACKAGES=0
   fi
 fi
-command -v ffmpeg >/dev/null 2>&1 ||
+[ "$NEED_FFMPEG" -eq 0 ] || command -v ffmpeg >/dev/null 2>&1 ||
   die "ffmpeg is not installed; hellion needs it for H.264 and RTP."
 
 # --- Build ---------------------------------------------------------------
@@ -284,10 +318,22 @@ hellion_json() {
   [ -n "$TOPSIDE_IP" ] && sedargs+=(-e "s/rtp:auto:/rtp:$TOPSIDE_IP:/g")
   [ "$PAIR" != default ] &&
     sedargs+=(-e "s/^\(  \"role\": \"[a-z]*\",\)\$/\1\n  \"pair\": \"$PAIR\",/")
+  local example="$PLACEMENT-$ROLE"
+  if [ -n "$CAMERA_H264" ]; then
+    example="$example-h264"
+    sedargs+=(-e "s|\"source\": \"v4l2:[^\"]*\"|\"source\": \"v4l2:$CAMERA_H264\"|")
+  fi
   sedargs+=(-e "")
-  sed "${sedargs[@]}" "$SCRIPT_DIR/hellion/examples/$PLACEMENT-$ROLE.json"
+  sed "${sedargs[@]}" "$SCRIPT_DIR/hellion/examples/$example.json"
 }
-put_config /etc/hellion/hellion.json "$(hellion_json)" root:root 0644 "$ADDRS_GIVEN"
+# Addresses, a pair or the camera's mode given now rewrite the config.
+REWRITE_CONFIG=$ADDRS_GIVEN
+[ "$CAMERA_GIVEN" -eq 1 ] && REWRITE_CONFIG=1
+put_config /etc/hellion/hellion.json "$(hellion_json)" root:root 0644 "$REWRITE_CONFIG"
+if [ -n "$CAMERA_H264" ] && [ ! -e "$CAMERA_H264" ]; then
+  warn "$CAMERA_H264 is not there right now. hellion waits for it; if the \
+camera is plugged in, its H.264 is on another node (v4l2-ctl --list-devices)."
+fi
 if [ -e /etc/hellion/hellion.json ] &&
    ! grep -q "\"role\": *\"$ROLE\"" /etc/hellion/hellion.json; then
   warn "/etc/hellion/hellion.json is not a $ROLE config. It was kept; \
@@ -333,8 +379,8 @@ elif [ -e /etc/systemd/system/eeye.service ]; then
 fi
 systemctl daemon-reload
 
-printf 'ROLE=%s\nPLACEMENT=%s\nTOPSIDE_IP=%s\nROV_IP=%s\nPAIR=%s\n' "$ROLE" \
-  "$PLACEMENT" "$TOPSIDE_IP" "$ROV_IP" "$PAIR" > "$STATE_FILE"
+printf 'ROLE=%s\nPLACEMENT=%s\nTOPSIDE_IP=%s\nROV_IP=%s\nPAIR=%s\nCAMERA_H264=%s\n' \
+  "$ROLE" "$PLACEMENT" "$TOPSIDE_IP" "$ROV_IP" "$PAIR" "$CAMERA_H264" > "$STATE_FILE"
 
 # --- Tether network (topside, only when asked) -----------------------------------
 #
@@ -416,6 +462,9 @@ if [ "$ROLE" = topside ]; then
     addr="The ROV: found on the network by itself (pair \"$PAIR\"); hellion top shows it."
 else
   where="Control:   port 8091 (the topside page reaches this ROV through it)"
+  [ -n "$CAMERA_H264" ] && where="$where
+  Camera:    its own H.264 from $CAMERA_H264, sent as it is (no ffmpeg here);
+             if hellion top shows no frames, journalctl -u hellion says why"
   [ -n "$TOPSIDE_IP" ] && addr="Topside: pinned at $TOPSIDE_IP." ||
     addr="Topside: found on the network by itself (pair \"$PAIR\"); hellion top shows it."
 fi

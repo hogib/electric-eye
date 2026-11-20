@@ -21,6 +21,7 @@ service by `install.sh`.
 ```sh
 sudo ./install.sh --role rov|topside --placement a|b [--pair NAME]
                   [--topside-ip IP] [--rov-ip IP] [--tether IFACE] [--reset-config]
+                  [--camera-h264 DEVICE]
 ```
 
 Both ends get the same placement and the same `--pair`. No addresses are needed: the
@@ -56,6 +57,12 @@ resolve names. What it sets up:
   Both units use `KillMode=mixed`, so a stop signals the main process alone and
   `hellion` can finish a recording properly instead of having its ffmpeg killed with it.
 - **v4l2loopback** (`/dev/video10`) is loaded at boot topside only.
+- **`--camera-h264 DEVICE`** (ROV, placement A): the camera encodes H.264 itself and
+  `hellion` sends that as it is ([The camera's own H.264](#the-cameras-own-h264)). The
+  config comes from `a-rov-h264.json` with the device put in, replacing the one there
+  (kept as `.bak`); `ffmpeg` is neither installed nor required on that machine; the
+  choice is remembered, and `--camera-h264 off` goes back to MJPEG and the encoder.
+  The topside is installed the same either way.
 - **Packages** (`apt-get`): a compiler, `pkg-config`, `libturbojpeg0-dev`, `ffmpeg`, and
   `v4l2loopback-dkms` topside. Without `apt-get` it lists what to install and you
   re-run with `--no-packages`.
@@ -63,8 +70,9 @@ resolve names. What it sets up:
   `/etc/hellion/install.conf`, and the services are restarted on the new binaries.
 
 The installer was tested in a sandbox (a user namespace with the system directories
-replaced and the system commands stubbed) for every role and placement, a re-run, and
-a switch of placement; not yet on a real Debian or Raspberry Pi OS machine.
+replaced and the system commands stubbed) for every role and placement, a re-run, a
+switch of placement, and `--camera-h264` (with no ffmpeg on the `PATH`, its re-run, and
+`off`); not yet on a real Debian or Raspberry Pi OS machine.
 
 ### The tether's network
 
@@ -231,8 +239,8 @@ Two encodes, one on each side.
 
 **A, with a camera that encodes** (`a-rov-h264.json` in place of `a-rov.json`; the
 topside is the same): the ROV sends the camera's own H.264 and encodes nothing. See
-[The camera's own H.264](#the-cameras-own-h264). `install.sh` does not pick this
-config; copy it to `/etc/hellion/hellion.json` on the ROV and set the device.
+[The camera's own H.264](#the-cameras-own-h264). `install.sh --role rov --placement a
+--camera-h264 /dev/videoN` installs it.
 
 **B — `eeye` on the ROV** (`b-rov.json`, `b-topside.json`): `eeye` runs next to the
 camera and the ROV sends `pilot` up. Topside relays the packets unchanged to QGC on
