@@ -123,7 +123,8 @@ static void try_open(VirtualCam *vc, int64_t now) {
       explain_missing(vc);
       vc->explained_missing = true;
     }
-    vc->next_attempt_ms = now + retry_missing_ms;
+    // Not `now`: explain_missing() runs mokutil, which can take a while.
+    vc->next_attempt_ms = now_ms() + retry_missing_ms;
     return;
   }
 
