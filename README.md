@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img src="assets/logo.svg" alt="Electric Eye" width="480">
+</picture>
+
 # Electric Eye
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24085244.svg)](https://doi.org/10.5281/zenodo.24085244)
