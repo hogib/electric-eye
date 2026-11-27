@@ -90,7 +90,7 @@ def from_yuv422(buf, w, h):
 
 def even(bgr):
     h, w = bgr.shape[:2]
-    return bgr[:h - h % 2, :w - w % 2]
+    return np.ascontiguousarray(bgr[:h - h % 2, :w - w % 2])
 
 
 def ee_run(frames, config, still, repeat=1, fps=30):
