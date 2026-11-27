@@ -25,6 +25,12 @@
 | `h264_rtp` | The H.264 RTP packetizer (RFC 6184) packet by packet: headers, the marker bit on an access unit's last packet only, FU-A fragmentation and its boundary, sequence wrap, SPS/PPS repeated before a keyframe that lacks them, delimiters and malformed NALs dropped, input that is not Annex B; splitting an Annex B stream into access units. Then a stream of it through the topside's relay and decoder command line, every decoded frame byte-identical to ffmpeg decoding the same H.264 from a file (skipped without ffmpeg and libx264) |
 | `fbus` | Frame bus across real processes: whole frames under a writer lapping the ring (and a deterministic lap), several readers, futex wake-up, writer restart, a killed writer detected by its heartbeat, bad files |
 
+## Benchmarks
+
+Not tests, and not run by `make check`: `bench/` holds the comparison bench (effect
+timings and transport cost on the vehicle, latency through the lens, picture quality
+against published methods). See [`bench/README.md`](../bench/README.md).
+
 ## Fuzzing
 
 `make fuzz-http` builds `tests/fuzz_http.c` with clang and libFuzzer under ASan and

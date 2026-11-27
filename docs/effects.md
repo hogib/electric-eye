@@ -273,6 +273,10 @@ Canny per stage:
 | hysteresis | 0.435 | 14.2% | serial by design |
 | chroma memset | 0.036 | 1.2% | — |
 
+`bench/rov/rov.sh effects` regenerates this table on the vehicle's Pi, for every
+effect at 1, 2 and 4 threads, from the camera's own frames (`bench/README.md`); its
+result replaces these figures once it has been run there.
+
 Use a **real frame** for any measurement here. Synthetic noise inflates hysteresis
 several-fold and will mislead you.
 
