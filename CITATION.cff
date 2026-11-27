@@ -21,7 +21,7 @@ authors:
     orcid: "https://orcid.org/0009-0006-0495-6589"
 repository-code: "https://github.com/hogib/electric-eye"
 license: MIT
-version: "0.3.3"
+version: "0.3.4"
 date-released: "2026-11-27"
 doi: 10.5281/zenodo.24085244
 identifiers:

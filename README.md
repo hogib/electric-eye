@@ -40,7 +40,7 @@ and resolves to the latest, and its page lists the DOI of each version.
 > (Department of Electronics and Communications Engineering, Yıldız Technical
 > University; ORCID [0009-0006-0495-6589](https://orcid.org/0009-0006-0495-6589)).
 > *electric-eye: Real-Time Image Enhancement and Low-Latency Video Transport for
-> Remotely Operated Underwater Vehicles.* Software, version 0.3.3, 2026.
+> Remotely Operated Underwater Vehicles.* Software, version 0.3.4, 2026.
 > https://doi.org/10.5281/zenodo.24085244
 
 ```bibtex
@@ -48,7 +48,7 @@ and resolves to the latest, and its page lists the DOI of each version.
   author  = {Bolat, H. O{\u{g}}uz and Ersoy, Hakan},
   title   = {electric-eye: Real-Time Image Enhancement and Low-Latency Video
              Transport for Remotely Operated Underwater Vehicles},
-  version = {0.3.3},
+  version = {0.3.4},
   year    = {2026},
   doi     = {10.5281/zenodo.24085244},
   url     = {https://github.com/hogib/electric-eye},
