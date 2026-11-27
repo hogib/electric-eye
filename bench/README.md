@@ -27,7 +27,7 @@ machine. The vehicle session has been dry-run with a webcam in place of the Pi
 | | State |
 |---|---|
 | Effects timing (`rov.sh effects`) | runs; needs the Pi |
-| Cost of each transport case (`rov.sh run`, `all`) | electric-eye's and ffmpeg's cases run in the dry run; the H.264 cases need a camera that encodes; the GStreamer cases have not run anywhere (the laptop lacks `gst-plugins-good` and `gst-libav`) |
+| Cost of each transport case (`rov.sh run`, `all`) | all seven cases run in the dry run and deliver 30 fps; the three H.264 ones with a v4l2loopback device carrying H.264 as the camera (`CAM_H264=/dev/video10`), not a camera that encodes |
 | Latency through the lens (`g2g.py`) | passes its self-test against a simulated screen and camera; has not yet looked at a real screen through a real camera |
 | Quality on stills and video (`quality.py`) | runs on synthetic pictures; needs a real dataset (below) |
 | Transport under packet loss and delay | **not built**: it needs `tc netem`, so root, and a design for what is compared |
