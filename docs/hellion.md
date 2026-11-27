@@ -369,7 +369,20 @@ this saves on the Pi.
 **Decoder damage.** With packet loss the H.264 decoder complains about every damaged
 macroblock — about ten lines a second at 2% loss. `hellion` counts those instead of
 logging them, shows the count next to the link's loss in `top`, and logs one summary
-line every 10s. Anything else ffmpeg says is logged as is.
+line every 10s. The summary blames lost packets only when the link counted some in
+those 10s; otherwise it says there were none. Anything else ffmpeg says is logged as is.
+
+**A decoder that starts between keyframes** (the topside started, or its decoder
+restarted, while the ROV was already sending) makes the same complaints about every
+picture until the next keyframe, and shows none of them. Nothing was lost, so that is
+not counted as damage: the log says `the decoder started between keyframes; no picture
+until the next one` once, the source's status says so while it lasts, and a second
+line says how long the wait was.
+
+**A source that cannot be set up** — its UDP port held by another program, usually a
+second `hellion` — is tried again every 2s. The reason is in the status and, once per
+reason, in the log: `rtp:5610: cannot bind UDP port 5610: Address already in use;
+trying again every 2s`.
 
 ### Timestamps
 

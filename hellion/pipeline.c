@@ -93,6 +93,14 @@ struct Pipeline {
   uint64_t damage_window;      // since damage_window_ns
   uint64_t damage_last_window; // the previous full window, for status
   uint64_t damage_window_ns;
+  uint64_t damage_lost_start; // the relay's lost count when the window began
+  // A decoder that started between keyframes complains about every
+  // picture until the next one, and shows none. That is a wait, not
+  // damage: said once, shown in the status, and not counted. Under lock.
+  bool dec_joining;
+  // The last reason the RTP source could not be set up, so that a retry
+  // every source_retry_ms says it once. Source thread only.
+  char open_err[160];
 
   // Camera controls (camera sources only), under lock: set by
   // pipeline_set_camera, which bumps cam_gen; the source thread applies a
@@ -425,6 +433,9 @@ typedef struct {
   bool dec_running;
   size_t dec_have;
   uint64_t dec_last_frame_ns;
+  uint64_t dec_frames;    // pictures this decoder has produced
+  uint64_t dec_start_ns;
+  bool dec_join_said;     // its wait for a keyframe is in the log
   char dec_line[256]; // the decoder's stderr line being assembled
   size_t dec_line_len;
   uint32_t width, height;
@@ -435,8 +446,25 @@ typedef struct {
 // prefixes everything it says about the bitstream with "[h264 @": with a
 // lossy link that is damaged frames, expected and already measured as
 // packet loss, so it is counted. Anything else is news and passes through.
-static void decoder_line(Pipeline *p, const char *line) {
+//
+// Before a decoder's first picture the same complaints mean something
+// else: it started between keyframes ("non-existing PPS 0 referenced",
+// "no frame!" for each picture) and can show nothing until the next one.
+// Nothing was lost, so that is not counted as damage.
+static void decoder_line(Pipeline *p, Source *src, const char *line) {
   if (strncmp(line, "[h264 @", 7) == 0) {
+    if (src->dec_frames == 0) {
+      if (!src->dec_join_said) {
+        src->dec_join_said = true;
+        printf("hellion: pipeline \"%s\": the decoder started between "
+               "keyframes; no picture until the next one\n",
+               p->cfg.name);
+        pthread_mutex_lock(&p->lock);
+        p->dec_joining = true;
+        pthread_mutex_unlock(&p->lock);
+      }
+      return;
+    }
     pthread_mutex_lock(&p->lock);
     p->damage_total++;
     p->damage_window++;
@@ -464,7 +492,7 @@ static void drain_decoder_log(Pipeline *p, Source *src) {
     for (ssize_t i = 0; i < n; i++) {
       if (buf[i] == '\n' || buf[i] == '\r') {
         src->dec_line[src->dec_line_len] = '\0';
-        decoder_line(p, src->dec_line);
+        decoder_line(p, src, src->dec_line);
         src->dec_line_len = 0;
       } else if (src->dec_line_len < sizeof src->dec_line - 1) {
         src->dec_line[src->dec_line_len++] = buf[i];
@@ -473,21 +501,33 @@ static void drain_decoder_log(Pipeline *p, Source *src) {
   }
 
   uint64_t now = mono_ns();
+  RelayStats rs;
+  udp_relay_stats(p->rtp_relay, &rs);
   pthread_mutex_lock(&p->lock);
-  if (p->damage_window_ns == 0)
+  if (p->damage_window_ns == 0) {
     p->damage_window_ns = now;
-  uint64_t n = 0;
+    p->damage_lost_start = rs.lost;
+  }
+  uint64_t n = 0, lost = 0;
   if (now - p->damage_window_ns >= damage_summary_ns) {
     n = p->damage_window;
+    lost = rs.lost - p->damage_lost_start;
     p->damage_last_window = n;
     p->damage_window = 0;
     p->damage_window_ns = now;
+    p->damage_lost_start = rs.lost;
   }
   pthread_mutex_unlock(&p->lock);
-  if (n)
+  // The cause is only named when the link's own count agrees with it.
+  if (n && lost)
     printf("hellion: pipeline \"%s\": the decoder reported %llu damaged-"
            "bitstream errors in the last %.0fs (lost packets; see the link's "
            "loss figure)\n",
+           p->cfg.name, (unsigned long long)n, damage_summary_ns / 1e9);
+  else if (n)
+    printf("hellion: pipeline \"%s\": the decoder reported %llu damaged-"
+           "bitstream errors in the last %.0fs, with no packets lost on "
+           "this link: late ones, or a stream damaged before it got here\n",
            p->cfg.name, (unsigned long long)n, damage_summary_ns / 1e9);
 }
 
@@ -644,8 +684,15 @@ static bool source_open(Pipeline *p, Source *src) {
     char err[160];
     if (!rtp_prepare(p, err, sizeof err)) {
       set_source(p, "error", err);
+      // Tried again every source_retry_ms; said once per reason.
+      if (strcmp(p->open_err, err) != 0) {
+        snprintf(p->open_err, sizeof p->open_err, "%s", err);
+        printf("hellion: pipeline \"%s\": %s: %s; trying again every %ds\n",
+               p->cfg.name, p->cfg.source_spec, err, source_retry_ms / 1000);
+      }
       return false;
     }
+    p->open_err[0] = '\0';
     // ffmpeg scales whatever it decodes to the configured size, so every
     // frame on the pipe is exactly w x h I422.
     FfDecoder d = {.sdp_path = p->sdp_path, .width = w, .height = h};
@@ -658,7 +705,10 @@ static bool source_open(Pipeline *p, Source *src) {
     }
     child_set_pipe_size(src->dec.out_fd, 1 << 20);
     src->dec_running = true;
-    src->dec_last_frame_ns = mono_ns();
+    src->dec_last_frame_ns = src->dec_start_ns = mono_ns();
+    pthread_mutex_lock(&p->lock);
+    p->dec_joining = false;
+    pthread_mutex_unlock(&p->lock);
     break;
   }
   }
@@ -725,6 +775,21 @@ static CaptureResult rtp_capture(Pipeline *p, Source *src, VideoFrame *vf) {
   }
   src->dec_have = 0;
   src->dec_last_frame_ns = mono_ns();
+  if (src->dec_frames == 0) {
+    // What it said before this first picture was written before it, but
+    // may not have been read yet: read it while it still counts as the
+    // wait for a keyframe.
+    drain_decoder_log(p, src);
+    if (src->dec_join_said) {
+      printf("hellion: pipeline \"%s\": the decoder has its keyframe, "
+             "%.1fs after it started\n",
+             p->cfg.name, (src->dec_last_frame_ns - src->dec_start_ns) / 1e9);
+      pthread_mutex_lock(&p->lock);
+      p->dec_joining = false;
+      pthread_mutex_unlock(&p->lock);
+    }
+  }
+  src->dec_frames++;
   return CAP_FRAME;
 }
 
@@ -1086,7 +1151,10 @@ void pipeline_status(Pipeline *p, HsPipeline *out) {
     RelayStats rs;
     udp_relay_stats(p->rtp_relay, &rs);
     endpoint_net(&out->source, &rs);
-    if (p->damage_last_window && strcmp(out->source.state, "running") == 0)
+    if (p->dec_joining)
+      snprintf(out->source.detail, sizeof out->source.detail,
+               "the decoder started between keyframes; waiting for the next");
+    else if (p->damage_last_window && strcmp(out->source.state, "running") == 0)
       snprintf(out->source.detail, sizeof out->source.detail,
                "decoder: %llu damaged-bitstream errors in the last %.0fs",
                (unsigned long long)p->damage_last_window,

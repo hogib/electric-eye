@@ -1166,6 +1166,136 @@ static void test_log_capture(void) {
   CHECK(lines[0][2] == ':' && lines[0][5] == ':');
 }
 
+static int log_count(const char *needle) {
+  static char lines[hlog_lines][hlog_line_len];
+  size_t n = hlog_snapshot(lines, hlog_lines, NULL);
+  int count = 0;
+  for (size_t i = 0; i < n; i++)
+    count += strstr(lines[i], needle) != NULL;
+  return count;
+}
+
+// An RTP source whose port something else holds: the reason is in the
+// log, once however often it is retried, and the pipeline starts when the
+// port is free.
+static void test_rtp_port_taken_is_logged(void) {
+  if (!ff_available()) {
+    printf("    (skipped: ffmpeg is not installed)\n");
+    return;
+  }
+  int port = udp_free_port_pair();
+  int held = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_in sa = {.sin_family = AF_INET,
+                           .sin_port = htons((uint16_t)port),
+                           .sin_addr.s_addr = htonl(INADDR_ANY)};
+  CHECK(held >= 0 && bind(held, (struct sockaddr *)&sa, sizeof sa) == 0);
+
+  char json[256];
+  snprintf(json, sizeof json,
+           "{\"pipelines\":[{\"name\":\"taken\",\"source\":\"rtp:%d\","
+           "\"width\":320,\"height\":240,\"sinks\":[\"bus:taken-out\"]}]}",
+           port);
+  HellionConfig c;
+  CHECK(parse(json, &c));
+  CHECK(hlog_start());
+  Pipeline *p = pipeline_start(&c.pipelines[0]);
+  // Long enough for the first attempt and the retry after it.
+  sleep_ms(2300);
+  HsPipeline st;
+  pipeline_status(p, &st);
+  bool error = strcmp(st.source.state, "error") == 0;
+  bool why = strstr(st.source.detail, "cannot bind") != NULL;
+  fflush(stdout);
+  sleep_ms(100);
+  int said = log_count("cannot bind UDP port");
+  bool retry = log_has("trying again every 2s");
+
+  close(held);
+  bool started = false;
+  for (int i = 0; i < 40 && !started; i++) {
+    sleep_ms(100);
+    pipeline_status(p, &st);
+    started = strcmp(st.source.state, "error") != 0;
+  }
+  pipeline_stop(p);
+  hlog_stop();
+  CHECK(error);
+  CHECK(why);
+  CHECK_EQ_INT(said, 1);
+  CHECK(retry);
+  CHECK(started);
+}
+
+// A decoder that starts between keyframes is waiting, not receiving a
+// damaged stream: the log and the status say so, and the picture comes
+// with the next keyframe.
+static void test_decoder_joining_between_keyframes(void) {
+  if (!ff_available()) {
+    printf("    (skipped: ffmpeg is not installed)\n");
+    return;
+  }
+  char clip[128];
+  snprintf(clip, sizeof clip, "%s/join.h264", bus_dir);
+  // A keyframe every second, so a decoder started 0.3s in has most of
+  // that to wait.
+  char *const encode[] = {
+      "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f",
+      "lavfi", "-i", "testsrc2=s=320x240:r=30", "-frames:v", "120", "-c:v",
+      "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt",
+      "yuv420p", "-g", "30", "-f", "h264", "-y", clip, NULL};
+  if (!run_quiet(encode)) {
+    printf("    (skipped: this ffmpeg cannot make the test clip; no "
+           "libx264?)\n");
+    unlink(clip);
+    return;
+  }
+  int port = udp_free_port_pair();
+  char json[1024];
+  snprintf(json, sizeof json,
+           "{\"pipelines\":["
+           "{\"name\":\"join-down\",\"source\":\"rtp:%d\",\"width\":320,"
+           "\"height\":240,\"sinks\":[\"bus:join-out\"]},"
+           "{\"name\":\"join-up\",\"source\":\"h264file:%s\",\"width\":320,"
+           "\"height\":240,\"framerate\":30,"
+           "\"sinks\":[\"rtp:127.0.0.1:%d\"]}]}",
+           port, clip, port);
+  HellionConfig c;
+  CHECK(parse(json, &c));
+  CHECK(hlog_start());
+  Pipeline *up = pipeline_start(&c.pipelines[1]);
+  sleep_ms(300);
+  Pipeline *down = pipeline_start(&c.pipelines[0]);
+
+  HsPipeline st;
+  bool waiting_shown = false, got_frames = false;
+  for (int i = 0; i < 120 && !got_frames; i++) {
+    sleep_ms(50);
+    pipeline_status(down, &st);
+    if (strstr(st.source.detail, "between keyframes"))
+      waiting_shown = true;
+    got_frames = st.source.frames >= 5;
+  }
+  pipeline_status(down, &st);
+  fflush(stdout);
+  sleep_ms(100);
+  bool said = log_count("started between keyframes") == 1;
+  bool ended = log_count("has its keyframe") == 1;
+  bool damage = log_has("damaged-bitstream");
+  pipeline_stop(down);
+  pipeline_stop(up);
+  hlog_stop();
+  unlink(clip);
+  CHECK(got_frames);
+  CHECK(waiting_shown);
+  CHECK(said);
+  CHECK(ended);
+  CHECK(!damage);
+  // With pictures arriving the wait is over, and nothing calls it damage.
+  CHECK(strcmp(st.source.state, "running") == 0);
+  CHECK(st.source.detail[0] == '\0');
+  CHECK_EQ_INT(st.source.lost, 0);
+}
+
 static void remove_dir(const char *dir) {
   DIR *d = opendir(dir);
   if (!d)
@@ -1447,6 +1577,8 @@ int main(void) {
   RUN_TEST(test_h264_passthrough);
   RUN_TEST(test_status_round_trip);
   RUN_TEST(test_log_capture);
+  RUN_TEST(test_rtp_port_taken_is_logged);
+  RUN_TEST(test_decoder_joining_between_keyframes);
 
   remove_dir(bus_dir);
   TEST_MAIN_END();
