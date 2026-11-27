@@ -182,28 +182,40 @@ def _pyr_laplace(x, levels):
 
 def m_fusion(bgr, state=None):
     """Ancuti et al. 2018: white balance with red compensation, then a
-    multiscale fusion of a gamma-corrected and a sharpened version."""
+    multiscale fusion of a gamma-corrected and a sharpened version, by
+    Laplacian contrast, saliency and saturation.
+
+    Where the paper leaves a number open, this takes the one the public
+    MATLAB ports use: gamma 2, and a Gaussian of sigma 20 for the
+    sharpening. The sharpening's normalisation is the paper's linear
+    stretch, taken between the 1st and 99th percentiles of each channel so
+    that one outlying pixel does not set it. (The ports equalise the
+    histogram there instead, which on compressed pictures brings the
+    blocks out at full strength.)"""
     img = bgr.astype(np.float32) / 255.0
     b, g, r = cv2.split(img)
-    r = r + (g.mean() - r.mean()) * (1.0 - r) * g
+    r = r + (g.mean() - r.mean()) * (1.0 - r) * g  # alpha = 1
     wb = np.clip(cv2.merge([b, g, r]), 0, 1)
     means = wb.reshape(-1, 3).mean(axis=0)
     wb = np.clip(wb * (means.mean() / np.maximum(means, 1e-3)), 0, 1)
 
-    in1 = np.power(wb, 2.0)  # gamma: darkens, recovering contrast
-    blur = cv2.GaussianBlur(wb, (0, 0), 3)
-    detail = wb - blur
-    lo, hi = detail.min(), detail.max()
-    detail = (detail - lo) / max(hi - lo, 1e-6)
+    in1 = np.power(wb, 2.0)
+    detail = wb - cv2.GaussianBlur(wb, (0, 0), 20)
+    for c in range(3):
+        lo, hi = np.percentile(detail[:, :, c], [1, 99])
+        detail[:, :, c] = np.clip((detail[:, :, c] - lo) / max(hi - lo, 1e-6),
+                                  0, 1)
     in2 = (wb + detail) / 2.0  # normalised unsharp masking
 
     def weights(x):
         lum = cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
         contrast = np.abs(cv2.Laplacian(lum, cv2.CV_32F))
+        # Achanta's saliency: distance in Lab of the slightly blurred
+        # picture from its mean colour, with L on 0..1 like the rest.
         lab = cv2.cvtColor(x, cv2.COLOR_BGR2LAB)
-        sal = np.sqrt(((cv2.GaussianBlur(lab, (0, 0), 2) -
+        sal = np.sqrt(((cv2.GaussianBlur(lab, (5, 5), 0) -
                         lab.reshape(-1, 3).mean(axis=0)) ** 2).sum(axis=2))
-        sal = sal / max(sal.max(), 1e-6)
+        sal = sal / 100.0
         sat = np.sqrt(((x - lum[:, :, None]) ** 2).mean(axis=2))
         return contrast + sal + sat + 0.1
 
