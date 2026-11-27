@@ -34,13 +34,18 @@ The methods
                     in). For FUnIE-GAN, MLLE and the like; see README.md.
 
 `fusion` and `udcp` are this bench's own implementations from the papers,
-in numpy and OpenCV: there is no official code for either. They are here
-as quality references. Their times are those of unoptimised research
+in numpy and OpenCV: no public code from the authors of either was found.
+They are here as quality references. Their times are those of unoptimised research
 code and say nothing about what a tuned version would cost.
 
 UCIQE and UIQM follow the formulas and constants of the papers (Yang and
-Sowmya 2015; Panetta, Gao and Agaian 2016) as the Python ports in common
-use compute them. Ports differ in details, so compare the figures within
+Sowmya 2015; Panetta, Gao and Agaian 2016). UIQM is computed as the
+FUnIE-GAN repository's evaluation code computes it, with 0.114 where that
+has 0.144 for blue in the sharpness term, and at each picture's own size
+where its script first resizes to 256x256. UCIQE has the same three terms
+as the Python port in common use but on CIELAB scaled to 0..1, which
+gives values of the size the literature reports. Public versions of both
+differ enough to rank pictures differently, so compare the figures within
 this bench, not with a table in someone else's paper. Both are known to
 reward over-saturated and over-contrasted results; they are reported
 because everyone reports them, next to measures that do not have that
@@ -145,17 +150,23 @@ def m_he(bgr, state=None):
 
 
 def m_udcp(bgr, state=None):
-    """Drews et al. 2013: the dark channel over green and blue only."""
+    """Drews et al. 2013: the dark channel over green and blue only.
+
+    As the paper's eq. 10 has it: 15x15 patches, no factor on the dark
+    channel, and for the water's colour the brightest pixel among the top
+    0.1% of the dark channel. The paper names neither a floor for the
+    transmission nor a recovery formula; this uses He et al.'s (0.1, and
+    the image model inverted), and a guided filter where the paper refines
+    by matting, as implementations of it generally do."""
     img = bgr.astype(np.float32) / 255.0
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     dark = cv2.erode(np.minimum(img[:, :, 0], img[:, :, 1]), kernel)
     n = max(1, dark.size // 1000)
     idx = np.argpartition(dark.ravel(), -n)[-n:]
-    a = img.reshape(-1, 3)[idx].mean(axis=0)
-    a = np.maximum(a, 0.05)
+    cand = img.reshape(-1, 3)[idx]
+    a = np.maximum(cand[cand.sum(axis=1).argmax()], 0.05)
     norm = img / a
-    t = 1.0 - 0.95 * cv2.erode(np.minimum(norm[:, :, 0], norm[:, :, 1]),
-                               kernel)
+    t = 1.0 - cv2.erode(np.minimum(norm[:, :, 0], norm[:, :, 1]), kernel)
     grey = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     t = cv2.ximgproc.guidedFilter(grey, t.astype(np.float32), 30, 1e-3)
     t = np.clip(t, 0.1, 1.0)[:, :, None]
@@ -180,18 +191,28 @@ def _pyr_laplace(x, levels):
     return out
 
 
-def m_fusion(bgr, state=None):
-    """Ancuti et al. 2018: white balance with red compensation, then a
-    multiscale fusion of a gamma-corrected and a sharpened version, by
-    Laplacian contrast, saliency and saturation.
+# The paper gives no value for the gamma of its first input; public ports
+# use 1.2, 1.3 and 2. The defaults here are the setting that came closest
+# to UIEB's references on a 60-picture subset (README.md has the sweep), so
+# that the baseline is the method at its best and not at our guess.
+# FUSION_GAMMA and FUSION_NORM in the environment set them.
+FUSION_GAMMA = float(os.environ.get("FUSION_GAMMA", "1.2"))
+FUSION_NORM = os.environ.get("FUSION_NORM", "robust")
 
-    Where the paper leaves a number open, this takes the one the public
-    MATLAB ports use: gamma 2, and a Gaussian of sigma 20 for the
-    sharpening. The sharpening's normalisation is the paper's linear
-    stretch, taken between the 1st and 99th percentiles of each channel so
-    that one outlying pixel does not set it. (The ports equalise the
-    histogram there instead, which on compressed pictures brings the
-    blocks out at full strength.)"""
+
+def m_fusion(bgr, state=None):
+    """Ancuti et al. 2018: white balance with red compensation (eq. 4,
+    alpha 1) and gray world, then a multiscale fusion of a gamma-corrected
+    and a sharpened version (eq. 6), weighted by Laplacian contrast,
+    saliency and saturation (eq. 7, delta 0.1).
+
+    The paper leaves three things open, and they are choices here: the
+    gamma (FUSION_GAMMA above), the Gaussian of the sharpening (sigma 20,
+    as one MATLAB port has it) and the relative scale of the three weights
+    (each on the 0..1 scale of the picture). No code from the authors was
+    found; the public ports read for this each depart from the paper in
+    ways this does not (the red compensation's formula, a contrast weight
+    that is not a Laplacian, histogram equalisation in the sharpening)."""
     img = bgr.astype(np.float32) / 255.0
     b, g, r = cv2.split(img)
     r = r + (g.mean() - r.mean()) * (1.0 - r) * g  # alpha = 1
@@ -199,12 +220,17 @@ def m_fusion(bgr, state=None):
     means = wb.reshape(-1, 3).mean(axis=0)
     wb = np.clip(wb * (means.mean() / np.maximum(means, 1e-3)), 0, 1)
 
-    in1 = np.power(wb, 2.0)
+    in1 = np.power(wb, FUSION_GAMMA)
     detail = wb - cv2.GaussianBlur(wb, (0, 0), 20)
-    for c in range(3):
-        lo, hi = np.percentile(detail[:, :, c], [1, 99])
-        detail[:, :, c] = np.clip((detail[:, :, c] - lo) / max(hi - lo, 1e-6),
-                                  0, 1)
+    # N{} of eq. 6: one shift and scale for all three channels. "minmax"
+    # is the paper's wording, to the full range; "robust" stretches
+    # between the 1st and 99th percentiles instead, so that a few extreme
+    # pixels do not leave the rest of the detail nearly flat.
+    if FUSION_NORM == "minmax":
+        lo, hi = float(detail.min()), float(detail.max())
+    else:
+        lo, hi = (float(v) for v in np.percentile(detail, [1, 99]))
+    detail = np.clip((detail - lo) / max(hi - lo, 1e-6), 0, 1)
     in2 = (wb + detail) / 2.0  # normalised unsharp masking
 
     def weights(x):
@@ -222,7 +248,8 @@ def m_fusion(bgr, state=None):
     w1, w2 = weights(in1), weights(in2)
     total = w1 + w2
     w1, w2 = w1 / total, w2 / total
-    levels = max(2, min(6, int(math.log2(min(img.shape[:2]))) - 3))
+    # By size: 7 levels at 600x800, the paper's example.
+    levels = max(2, int(math.log2(min(img.shape[:2]))) - 2)
     gw1, gw2 = _pyr_gauss(w1, levels), _pyr_gauss(w2, levels)
     l1, l2 = _pyr_laplace(in1, levels), _pyr_laplace(in2, levels)
     fused = [gw1[i][:, :, None] * l1[i] + gw2[i][:, :, None] * l2[i]

@@ -140,9 +140,60 @@ with that said; time a learned model properly with its own loop.
 - **Flicker** is given three ways because the plain figure also rises with contrast
   and with motion in the scene; `flicker_rel_vs_input` is the one that isolates what
   the method adds.
-- **`fusion` and `udcp` are our code**, written from the papers because no official
-  code exists. If a figure for them looks wrong, suspect the implementation before the
-  method.
+- **`fusion` and `udcp` are our code**, written from the papers because no public code
+  from their authors was found. They were audited against the papers and the public
+  ports on 2026-11-27 (below). If a figure for them looks wrong, suspect the
+  implementation before the method.
 - **Times of the Python methods** are of OpenCV's compiled code (`clahe`, `grayworld`,
   `he`) or of unoptimised numpy (`fusion`, `udcp`). The first group is a fair speed
   comparison; the second is not one.
+
+## The audit of `fusion` and `udcp`
+
+Both were read step by step against the papers and against the public ports
+(2026-11-27; four ports of the 2018 fusion, one collection with UDCP). Verdict for
+both: faithful, with deviations that are now either removed or stated in the
+functions' comments.
+
+**UDCP** follows eq. 10 of the 2013 paper as written (15×15 patches, no factor on the
+dark channel, the brightest pixel among the top 0.1% for the water's colour). The paper
+gives no floor for the transmission and no recovery formula; He et al.'s are used, and
+a guided filter in place of matting. An outside check exists for this one: the UIEB
+paper ran the authors' own code on the same 890 pictures and reports 11.03 dB and an
+SSIM of 0.4999 (its Table II).
+
+**Fusion** has no such check. The UIEB paper's "fusion-based" row (18.75 dB, 0.8162)
+is the *2012* fusion method in UIEB's own reimplementation, and a quarter of UIEB's
+references were chosen from that method's outputs; it says nothing about the 2018
+method here. The 2018 paper leaves open the gamma of its first input and the Gaussian
+of its sharpening, and its normalisation of the sharpened detail ("to the full range")
+is sensitive to single pixels. On 60 of the 890 pictures (every 15th), PSNR in dB and
+SSIM against the references:
+
+| gamma | stretch to the full range (the paper's wording) | stretch between the 1st and 99th percentiles |
+|---|---|---|
+| 1.0 | 16.36, 0.772 | 16.81, 0.827 |
+| 1.2 | 16.19, 0.774 | 16.73, 0.828 |
+| 1.5 | 15.56, 0.766 | 16.28, 0.824 |
+| 2.0 | 14.27, 0.740 | 15.24, 0.807 |
+
+(The untouched pictures of that subset: 16.26, 0.724.) The bench runs gamma 1.2 with
+the percentile stretch: the best setting that is still a gamma correction, so that the
+baseline is the method at its best and not at our guess. `FUSION_GAMMA` and
+`FUSION_NORM=minmax` in the environment give the others. Every public port read departs
+from the paper where this implementation does not (the red compensation's formula, a
+contrast weight that is not a Laplacian, histogram equalisation in the sharpening), so
+none was substituted for it.
+
+**UCIQE and UIQM**: UIQM here is the FUnIE-GAN repository's computation, with 0.114
+for 0.144 and at each picture's own size (its script resizes to 256×256 first). Public
+UCIQE versions differ in how CIELAB is scaled and in two of the three terms; this one
+gives values of the size the literature reports. None of them is interchangeable with
+another.
+
+**Other methods through `--external`**: MLLE is distributed as MATLAB p-code, so it
+needs MATLAB itself (Octave cannot run it). FUnIE-GAN's `test.py` writes input and
+output side by side and resizes to 256×256, so it needs a small wrapper that saves the
+output alone; its PyTorch weights are described by the authors as a sample model, the
+TF-Keras ones as the official ones.
+
